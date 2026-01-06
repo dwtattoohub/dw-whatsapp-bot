@@ -1,34 +1,27 @@
 import express from "express";
-import twilio from "twilio";
 import OpenAI from "openai";
+import twilio from "twilio";
 
 const app = express();
 
-// ESSENCIAL para Twilio (Webhook)
+// Twilio manda x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Twilio client
-const client = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-
-// Webhook WhatsApp
 app.post("/whatsapp", async (req, res) => {
+  const MessagingResponse = twilio.twiml.MessagingResponse;
+  const twiml = new MessagingResponse();
+
   try {
     console.log("CHEGOU DA TWILIO");
     console.log(req.body);
 
-    const incomingMsg = req.body.Body;
-    const from = req.body.From;
+    const incomingMsg = req.body.Body || "";
 
-    // Chamada OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -36,31 +29,24 @@ app.post("/whatsapp", async (req, res) => {
           role: "system",
           content: process.env.SYSTEM_PROMPT || "Você é um assistente útil.",
         },
-        {
-          role: "user",
-          content: incomingMsg,
-        },
+        { role: "user", content: incomingMsg },
       ],
     });
 
-    const reply = completion.choices[0].message.content;
+    const reply = completion.choices?.[0]?.message?.content?.trim() || "Ok.";
+    console.log("RESPOSTA GPT:", reply);
 
-    // Resposta via WhatsApp
-    await client.messages.create({
-      from: "whatsapp:" + process.env.TWILIO_WHATSAPP_NUMBER,
-      to: from,
-      body: reply,
-    });
+    // Responde pro WhatsApp via TwiML (Sandbox funciona 100% assim)
+    twiml.message(reply);
 
-    res.status(200).send("ok");
+    res.status(200).type("text/xml").send(twiml.toString());
   } catch (err) {
     console.error("ERRO NO WEBHOOK:", err);
-    res.status(200).send("ok"); // NUNCA retornar erro pra Twilio
+    twiml.message("Deu um erro aqui. Tenta de novo em 10s.");
+    res.status(200).type("text/xml").send(twiml.toString());
   }
 });
 
-// Porta (Render usa 10000)
+// Render geralmente usa 10000
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT);
-});
+app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
