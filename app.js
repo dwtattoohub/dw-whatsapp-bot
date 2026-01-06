@@ -11,7 +11,7 @@ app.use(express.json());
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-
+console.log("OPENAI KEY EXISTS:", !!process.env.OPENAI_API_KEY);
 app.post("/whatsapp", async (req, res) => {
   try {
     const incomingMsg = req.body.Body;
