@@ -1,80 +1,66 @@
 import express from "express";
-import bodyParser from "body-parser";
-import OpenAI from "openai";
 import twilio from "twilio";
+import OpenAI from "openai";
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
 
-/* =========================
-   OPENAI
-========================= */
+// ESSENCIAL para Twilio (Webhook)
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+// OpenAI client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-/* =========================
-   TWILIO
-========================= */
-const MessagingResponse = twilio.twiml.MessagingResponse;
+// Twilio client
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
-/* =========================
-   WEBHOOK WHATSAPP
-========================= */
+// Webhook WhatsApp
 app.post("/whatsapp", async (req, res) => {
-  const twiml = new MessagingResponse();
-
   try {
-    const userMessage = req.body.Body;
+    console.log("CHEGOU DA TWILIO");
+    console.log(req.body);
 
-    if (!userMessage) {
-      twiml.message("Mensagem vazia recebida.");
-      res.type("text/xml").status(200).send(twiml.toString());
-      return;
-    }
+    const incomingMsg = req.body.Body;
+    const from = req.body.From;
 
+    // Chamada OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content:
-            "Você é um assistente profissional que responde mensagens de WhatsApp de forma clara, educada e objetiva.",
+          content: process.env.SYSTEM_PROMPT || "Você é um assistente útil.",
         },
         {
           role: "user",
-          content: userMessage,
+          content: incomingMsg,
         },
       ],
     });
 
-    const resposta =
-      completion.choices[0]?.message?.content ||
-      "Não consegui gerar uma resposta agora.";
+    const reply = completion.choices[0].message.content;
 
-    twiml.message(resposta);
-    res.type("text/xml").status(200).send(twiml.toString());
-  } catch (error) {
-    console.error("ERRO OPENAI:", error);
+    // Resposta via WhatsApp
+    await client.messages.create({
+      from: "whatsapp:" + process.env.TWILIO_WHATSAPP_NUMBER,
+      to: from,
+      body: reply,
+    });
 
-    twiml.message(
-      "Erro ao processar sua mensagem. Tente novamente em instantes."
-    );
-    res.type("text/xml").status(200).send(twiml.toString());
+    res.status(200).send("ok");
+  } catch (err) {
+    console.error("ERRO NO WEBHOOK:", err);
+    res.status(200).send("ok"); // NUNCA retornar erro pra Twilio
   }
 });
 
-/* =========================
-   HEALTH CHECK
-========================= */
-app.get("/", (req, res) => {
-  res.send("DW WhatsApp Bot ONLINE");
-});
-
-/* =========================
-   SERVER
-========================= */
+// Porta (Render usa 10000)
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log("Servidor rodando na porta", PORT);
 });
