@@ -20,25 +20,49 @@ app.post("/whatsapp", async (req, res) => {
     console.log("CHEGOU DA TWILIO");
     console.log(req.body);
 
-    const incomingMsg = req.body.Body || "";
+    const incomingMsg = (req.body.Body || "").trim();
+
+    // Detecta mídia (foto) enviada pelo WhatsApp/Twilio
+    const numMedia = parseInt(req.body.NumMedia || "0", 10);
+    const mediaUrl0 = numMedia > 0 ? req.body.MediaUrl0 : null;
+    const mediaType0 = numMedia > 0 ? req.body.MediaContentType0 : null;
+
+    // Força “modo orçamento direto” quando o cliente manda foto/referência
+    let userContent = incomingMsg;
+
+    if (numMedia > 0) {
+      userContent =
+        `O cliente enviou uma REFERÊNCIA (imagem). ` +
+        `Trate como arte definida ("igual à referência"). ` +
+        `Seja direto e vá para ORÇAMENTO com base em R$150/h. ` +
+        `Faça no máximo 2 perguntas (ideal 1): tamanho (cm) e local do corpo. ` +
+        `NÃO peça tema/elementos.\n\n` +
+        `Mensagem do cliente: ${incomingMsg || "(sem texto)"}\n` +
+        `Imagem URL: ${mediaUrl0}\n` +
+        `Tipo: ${mediaType0 || "desconhecido"}`;
+    }
+
+    const systemPrompt =
+      process.env.SYSTEM_PROMPT ||
+      "Você é um assistente útil. Seja direto e objetivo.";
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
+      temperature: 0.4,
       messages: [
-        {
-          role: "system",
-          content: process.env.SYSTEM_PROMPT || "Você é um assistente útil.",
-        },
-        { role: "user", content: incomingMsg },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
       ],
     });
 
-    const reply = completion.choices?.[0]?.message?.content?.trim() || "Ok.";
+    const reply =
+      completion.choices?.[0]?.message?.content?.trim() ||
+      "Perfeito. Me diz o tamanho (cm) e o local do corpo pra eu te passar o valor certinho.";
+
     console.log("RESPOSTA GPT:", reply);
 
-    // Responde pro WhatsApp via TwiML (Sandbox funciona 100% assim)
+    // Responde pro WhatsApp via TwiML
     twiml.message(reply);
-
     res.status(200).type("text/xml").send(twiml.toString());
   } catch (err) {
     console.error("ERRO NO WEBHOOK:", err);
