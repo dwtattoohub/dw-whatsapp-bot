@@ -1,43 +1,77 @@
 import express from "express";
-import twilio from "twilio";
 import OpenAI from "openai";
+import twilio from "twilio";
 
 const app = express();
 
-// ESSENCIAL para Twilio
-app.use(express.urlencoded({ extended: false }));
+/**
+ * ESSENCIAL para Twilio (Webhook WhatsApp)
+ */
+app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+/**
+ * OpenAI
+ */
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// 🔴 LOG CRÍTICO — NÃO REMOVA AGORA
 console.log("OPENAI KEY EXISTS:", !!process.env.OPENAI_API_KEY);
+
+/**
+ * Twilio client
+ */
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+/**
+ * Webhook WhatsApp
+ */
 app.post("/whatsapp", async (req, res) => {
   try {
+    console.log("CHEGOU DA TWILIO");
+    console.log(req.body);
+
     const incomingMsg = req.body.Body;
     const from = req.body.From;
 
-    console.log("MSG:", incomingMsg);
-
-    const ai = await openai.responses.create({
+    const aiResponse = await openai.responses.create({
       model: "gpt-4.1-mini",
-      input: incomingMsg,
+      input: [
+        {
+          role: "system",
+          content: "Você é um assistente profissional e educado.",
+        },
+        {
+          role: "user",
+          content: incomingMsg,
+        },
+      ],
     });
 
-    const reply = ai.output_text || "Não consegui responder agora.";
+    const reply =
+      aiResponse.output_text || "Não consegui gerar uma resposta agora.";
 
-    const twiml = new twilio.twiml.MessagingResponse();
-    twiml.message(reply);
+    await client.messages.create({
+      from: "whatsapp:" + process.env.TWILIO_WHATSAPP_NUMBER,
+      to: from,
+      body: reply,
+    });
 
-    res.type("text/xml");
-    res.status(200).send(twiml.toString());
-
-  } catch (err) {
-    console.error("ERRO:", err);
-    res.status(200).send("OK");
+    res.status(200).send("ok");
+  } catch (error) {
+    console.error("ERRO NO WEBHOOK:", error);
+    res.status(200).send("ok");
   }
 });
 
+/**
+ * Porta (Render)
+ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
