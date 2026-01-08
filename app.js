@@ -21,6 +21,8 @@ app.post("/whatsapp", async (req, res) => {
     console.log(req.body);
 
     const incomingMsg = (req.body.Body || "").trim();
+    const hasImage = Number(req.body.NumMedia || 0) > 0;
+const mediaUrl = hasImage ? req.body.MediaUrl0 : null;
 
     // Detecta mídia (foto) enviada pelo WhatsApp/Twilio
     const numMedia = parseInt(req.body.NumMedia || "0", 10);
