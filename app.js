@@ -4,7 +4,7 @@ import twilio from "twilio";
 
 const app = express();
 
-// Twilio manda x-www-form-urlencoded
+// Twilio envia form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
@@ -12,67 +12,79 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const MessagingResponse = twilio.twiml.MessagingResponse;
+
 app.post("/whatsapp", async (req, res) => {
-  const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
   try {
-    console.log("CHEGOU DA TWILIO");
+    console.log("==== MENSAGEM RECEBIDA ====");
     console.log(req.body);
 
     const incomingMsg = (req.body.Body || "").trim();
-    const hasImage = Number(req.body.NumMedia || 0) > 0;
-const mediaUrl = hasImage ? req.body.MediaUrl0 : null;
+    const from = req.body.From || "unknown";
 
-    // Detecta mídia (foto) enviada pelo WhatsApp/Twilio
-    const numMedia = parseInt(req.body.NumMedia || "0", 10);
-    const mediaUrl0 = numMedia > 0 ? req.body.MediaUrl0 : null;
-    const mediaType0 = numMedia > 0 ? req.body.MediaContentType0 : null;
+    const numMedia = Number(req.body.NumMedia || 0);
+    const hasImage = numMedia > 0;
+    const mediaUrl = hasImage ? req.body.MediaUrl0 : null;
 
-    // Força “modo orçamento direto” quando o cliente manda foto/referência
-    let userContent = incomingMsg;
+    const normalized = incomingMsg.toLowerCase();
+    const greetings = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite"];
+    const isGreetingOnly = greetings.includes(normalized);
 
-    if (numMedia > 0) {
-      userContent =
-        `O cliente enviou uma REFERÊNCIA (imagem). ` +
-        `Trate como arte definida ("igual à referência"). ` +
-        `Seja direto e vá para ORÇAMENTO com base em R$150/h. ` +
-        `Faça no máximo 2 perguntas (ideal 1): tamanho (cm) e local do corpo. ` +
-        `NÃO peça tema/elementos.\n\n` +
-        `Mensagem do cliente: ${incomingMsg || "(sem texto)"}\n` +
-        `Imagem URL: ${mediaUrl0}\n` +
-        `Tipo: ${mediaType0 || "desconhecido"}`;
+    // 👉 Saudação APENAS se for a primeira mensagem simples
+    if (isGreetingOnly && !hasImage) {
+      twiml.message(
+        "Oi! Aqui é o Dhyeikow (DW Tattooer). Obrigado por me chamar e confiar no meu trabalho 🙏\n\nMe manda uma referência em imagem do que você tem em mente, junto com o tamanho em cm e o local do corpo, que eu já te passo uma ideia bem certeira."
+      );
+      return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    const systemPrompt =
-      process.env.SYSTEM_PROMPT ||
-      "Você é um assistente útil. Seja direto e objetivo.";
+    // 👉 Monta contexto técnico invisível pro GPT
+    const systemContext = `
+${process.env.SYSTEM_PROMPT}
+
+CONTEXTO TÉCNICO (NÃO MOSTRAR AO CLIENTE):
+- Cliente: ${from}
+- Já enviou imagem: ${hasImage ? "SIM" : "NÃO"}
+- URL da imagem (se houver): ${mediaUrl || "null"}
+
+REGRAS TÉCNICAS:
+- Se já houver imagem, NUNCA pedir imagem novamente.
+- Nunca se reapresentar.
+- Nunca repetir perguntas já respondidas.
+- Responder como tatuador humano, direto e profissional.
+`.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.4,
+      temperature: 0.6,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userContent },
+        { role: "system", content: systemContext },
+        { role: "user", content: incomingMsg },
       ],
     });
 
     const reply =
       completion.choices?.[0]?.message?.content?.trim() ||
-      "Perfeito. Me diz o tamanho (cm) e o local do corpo pra eu te passar o valor certinho.";
+      "Perfeito! Me conta só mais um detalhe pra eu te orientar melhor.";
 
-    console.log("RESPOSTA GPT:", reply);
+    console.log("==== RESPOSTA GPT ====");
+    console.log(reply);
 
-    // Responde pro WhatsApp via TwiML
     twiml.message(reply);
     res.status(200).type("text/xml").send(twiml.toString());
   } catch (err) {
     console.error("ERRO NO WEBHOOK:", err);
-    twiml.message("Deu um erro aqui. Tenta de novo em 10s.");
+    twiml.message(
+      "Tive um erro técnico aqui agora 😅 Pode me chamar de novo em alguns segundos?"
+    );
     res.status(200).type("text/xml").send(twiml.toString());
   }
 });
 
-// Render geralmente usa 10000
+// Porta padrão Render
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
+app.listen(PORT, () =>
+  console.log("Servidor WhatsApp rodando na porta", PORT)
+);
