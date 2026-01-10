@@ -3,238 +3,219 @@ import OpenAI from "openai";
 import twilio from "twilio";
 
 const app = express();
-
-// Twilio manda x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// MEMÓRIA SIMPLES (reseta quando reinicia/deploya)
+// Memória simples por número (em RAM)
 const sessions = {};
 
-// Helpers
+// ---------- Helpers ----------
 function getSession(from) {
   if (!sessions[from]) {
     sessions[from] = {
       stage: "inicio",
-      greeted: false,
-      referencia: false,
-      tamanhoLocal: null,
-      horarioPref: null, // "comercial" | "pos"
-      lastQuoteText: null,
+      imageDataUrl: null,       // data:image/jpeg;base64,...
+      imageMime: null,
+      gotReference: false,
+      sizeLocationText: null,
     };
   }
   return sessions[from];
 }
 
-function detectImage(reqBody) {
-  const numMedia = parseInt(reqBody.NumMedia || "0", 10);
-  const ct0 = (reqBody.MediaContentType0 || "").toLowerCase();
-  return numMedia > 0 && ct0.startsWith("image/");
+function twilioBasicAuthHeader() {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) return null;
+  const b64 = Buffer.from(`${sid}:${token}`).toString("base64");
+  return `Basic ${b64}`;
 }
 
-function looksLikePaymentProof(text) {
-  const t = (text || "").toLowerCase();
-  return (
-    t.includes("comprovante") ||
-    t.includes("paguei") ||
-    t.includes("pix feito") ||
-    t.includes("pago") ||
-    t.includes("transferi") ||
-    t.includes("transferência")
-  );
+async function downloadTwilioMediaAsDataUrl(mediaUrl) {
+  const auth = twilioBasicAuthHeader();
+  if (!auth) throw new Error("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN");
+
+  // Twilio MediaUrl precisa de autenticação
+  const resp = await fetch(mediaUrl, {
+    headers: { Authorization: auth },
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Failed to fetch Twilio media: ${resp.status} ${t}`);
+  }
+
+  const contentType = resp.headers.get("content-type") || "image/jpeg";
+  const arrayBuffer = await resp.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString("base64");
+  return { dataUrl: `data:${contentType};base64,${base64}`, mime: contentType };
 }
 
+function extractSizeLocation(text) {
+  // Mantém simples: você quer “25cm no ombro”, “5 cm no antebraço”, etc.
+  // Se vier vazio, retorna null pra perguntar de novo.
+  const t = (text || "").trim();
+  if (!t) return null;
+  // Heurística mínima: tem número + "cm" OU tem número e local
+  const hasNumber = /\d/.test(t);
+  if (!hasNumber) return null;
+  return t;
+}
+
+// ---------- Webhook ----------
 app.post("/whatsapp", async (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
   const from = req.body.From || "unknown";
   const text = (req.body.Body || "").trim();
-  const hasImage = detectImage(req.body);
+  const numMedia = Number(req.body.NumMedia || 0);
 
   const session = getSession(from);
 
   try {
-    let reply = "";
-
-    // 0) Se já está em fase de sinal e cliente menciona pagamento
-    if (session.stage === "aguardando_sinal" && looksLikePaymentProof(text)) {
-      reply =
-        "Perfeito! Comprovante recebido ✅\n\nSeu agendamento está confirmado. " +
-        "Me diz se você prefere *horário comercial* ou *pós horário comercial* pra eu te passar as opções certinhas 🙂";
-      session.stage = "definir_horario";
-      twiml.message(reply);
-      return res.status(200).type("text/xml").send(twiml.toString());
+    // 0) Se chegou imagem, baixa e guarda (SEM calcular ainda, só guarda)
+    if (numMedia > 0) {
+      const mediaUrl = req.body.MediaUrl0; // primeira imagem
+      if (mediaUrl) {
+        const { dataUrl, mime } = await downloadTwilioMediaAsDataUrl(mediaUrl);
+        session.imageDataUrl = dataUrl;
+        session.imageMime = mime;
+        session.gotReference = true;
+      }
     }
 
-    // 1) INÍCIO (saúda 1x e pede referência)
+    let reply = "";
+
+    // 1) INÍCIO (saudação só UMA vez)
     if (session.stage === "inicio") {
       reply =
         "Oi! Eu sou o Dhyeikow, tatuador. Obrigado por me procurar e confiar no meu trabalho.\n\n" +
-        "Pra eu te passar um orçamento bem certeiro, me manda *uma referência em imagem* do que você tem em mente.";
+        "Me manda uma referência em *imagem* do que você quer tatuar (pode ser foto/print).";
       session.stage = "aguardando_referencia";
       twiml.message(reply);
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    // 2) AGUARDANDO REFERÊNCIA (só avança se tiver imagem)
+    // 2) AGUARDANDO REFERÊNCIA
     if (session.stage === "aguardando_referencia") {
-      if (hasImage) {
-        session.referencia = true;
-        session.stage = "aguardando_tamanho_local";
-        reply =
-          "Boa! Referência recebida ✅\n\nAgora me diz:\n" +
-          "• *tamanho* (em cm)\n" +
-          "• *local do corpo*\n" +
-          "Ex: “25cm no ombro”";
-      } else {
-        reply =
-          "Pra eu avaliar certinho, preciso que você envie *uma referência em imagem* (foto/print) 🙂";
-      }
-
-      twiml.message(reply);
-      return res.status(200).type("text/xml").send(twiml.toString());
-    }
-
-    // 3) AGUARDANDO TAMANHO E LOCAL
-    if (session.stage === "aguardando_tamanho_local") {
-      // evita avançar se o cliente mandar vazio
-      if (!text) {
-        reply = "Me manda o tamanho e o local, por favor 🙂 Ex: “25cm no ombro”.";
+      if (!session.gotReference) {
+        reply = "Pra eu avaliar certinho, me envia a *referência em imagem* 😊";
         twiml.message(reply);
         return res.status(200).type("text/xml").send(twiml.toString());
       }
 
-      session.tamanhoLocal = text;
-      session.stage = "orcamento";
+      // Já tem imagem -> pede tamanho/local (curto, sem repetir saudação)
+      reply =
+        "Boa! Referência recebida ✅\n\n" +
+        "Agora me diz *tamanho (cm)* e *local do corpo*.\n" +
+        "Ex: “25cm no ombro”";
+      session.stage = "aguardando_tamanho_local";
+      twiml.message(reply);
+      return res.status(200).type("text/xml").send(twiml.toString());
+    }
 
-      // GPT: texto do orçamento com suas regras
+    // 3) AGUARDANDO TAMANHO/LOCAL
+    if (session.stage === "aguardando_tamanho_local") {
+      const sizeLoc = extractSizeLocation(text);
+
+      if (!sizeLoc) {
+        reply =
+          "Me fala só assim pra eu fechar certinho:\n" +
+          "Ex: “25cm no ombro” ou “15cm antebraço interno”.";
+        twiml.message(reply);
+        return res.status(200).type("text/xml").send(twiml.toString());
+      }
+
+      session.sizeLocationText = sizeLoc;
+      session.stage = "orcamento";
+    }
+
+    // 4) ORÇAMENTO (analisando a imagem de verdade)
+    if (session.stage === "orcamento") {
+      if (!session.gotReference || !session.imageDataUrl) {
+        // Segurança: se perder a imagem, volta a pedir
+        session.stage = "aguardando_referencia";
+        reply = "Consigo sim — só me manda a referência em *imagem* de novo, por favor.";
+        twiml.message(reply);
+        return res.status(200).type("text/xml").send(twiml.toString());
+      }
+
+      const systemPrompt =
+        process.env.SYSTEM_PROMPT ||
+        "Você é Dhyeikow, tatuador. Seja humano, objetivo e profissional.";
+
+      const userMsg = `Tamanho e local: ${session.sizeLocationText}.
+Regras: você deve analisar a imagem, descrever e classificar o estilo, e então calcular um valor fechado seguindo as regras.`;
+
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
-          {
-            role: "system",
-            content: `
-Você é o Dhyeikow, tatuador profissional (anos de experiência), estilo whip shading (mais demorado).
-Objetivo: responder de forma humana, amigável e profissional, sem texto gigante.
-
-REGRAS IMPORTANTES:
-- Só gerar orçamento porque a referência em imagem já foi recebida.
-- NÃO repetir saudação.
-- Não fazer muitas perguntas: no máximo 1 pergunta curta, só se for indispensável.
-- Explicar rapidamente (2 a 4 linhas) por que é um trabalho mais complexo (tamanho, área, whip shading, nível de detalhe).
-- Estimar tempo em FAIXA, mas SEM falar "média". Use: "estimativa de X a Y horas".
-- Sempre adicionar +1 hora de segurança usando o MAIOR valor da faixa (ex: se estimou 4–6h, considerar 7h no cálculo).
-- Cálculo interno:
-  * 1ª hora = R$150
-  * Demais horas = R$130
-  * NÃO mostrar conta, NÃO falar valor/hora. Apenas valor final (ou faixa final se necessário).
-- Depois do valor, usar gatilhos suaves (segurança, exclusividade, qualidade, encaixe, pós/retorno).
-- Final: convite claro para agendar + pedir preferência de horário (comercial ou pós comercial).
-
-PAGAMENTO (citar de forma curta):
-- Pix, débito ou crédito em até 12x (com acréscimo da maquininha).
-- Sinal: 10% para reservar.
-- Pix: dwtattooshop@gmail.com
-`,
-          },
+          { role: "system", content: systemPrompt },
           {
             role: "user",
-            content: `Tamanho e local informado pelo cliente: ${session.tamanhoLocal}`,
+            content: [
+              { type: "text", text: userMsg },
+              {
+                type: "image_url",
+                image_url: { url: session.imageDataUrl },
+              },
+            ],
           },
         ],
       });
 
-      reply = completion.choices?.[0]?.message?.content?.trim() || "Perfeito! Me passa mais um detalhe do tamanho e local.";
-      session.lastQuoteText = reply;
+      reply =
+        completion?.choices?.[0]?.message?.content?.trim() ||
+        "Consigo sim — me manda de novo o tamanho e local pra eu fechar certinho.";
 
-      // após orçamento, já vai pra etapa de definir horário/sinal
+      // Depois de mandar orçamento, já entra em “pós-orçamento”
       session.stage = "pos_orcamento";
 
       twiml.message(reply);
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    // 4) PÓS-ORÇAMENTO: organizar agenda e sinal
+    // 5) PÓS-ORÇAMENTO (sem ficar repetindo fluxo)
     if (session.stage === "pos_orcamento") {
-      const t = text.toLowerCase();
-
-      // se cliente escolher horário aqui
-      if (t.includes("comercial")) {
-        session.horarioPref = "comercial";
-        session.stage = "aguardando_sinal";
+      // Aqui você pode só responder natural e, se vier nova imagem, reinicia o fluxo
+      if (session.gotReference && numMedia > 0) {
+        // Nova referência => reinicia
+        session.stage = "aguardando_tamanho_local";
         reply =
-          "Fechado 🙌\n\nMe passa *2 ou 3 dias* que você consegue (ex: “quarta ou sexta”) que eu te encaixo no horário comercial.\n\n" +
-          "Pra reservar a data, o sinal é *10%* via Pix: *dwtattooshop@gmail.com*.\n" +
-          "Depois que enviar o comprovante, eu já confirmo aqui ✅";
-      } else if (t.includes("pós") || t.includes("pos") || t.includes("noite") || t.includes("após")) {
-        session.horarioPref = "pos";
-        session.stage = "aguardando_sinal";
-        reply =
-          "Boa 🙌\n\nMe passa *2 ou 3 dias* que você consegue (ex: “quarta ou sexta”) que eu te encaixo pós horário comercial.\n\n" +
-          "Pra reservar a data, o sinal é *10%* via Pix: *dwtattooshop@gmail.com*.\n" +
-          "Depois que enviar o comprovante, eu já confirmo aqui ✅";
-      } else {
-        // se ele mandar outra coisa, só pergunta a preferência
-        reply =
-          "Perfeito. Você prefere fazer em *horário comercial* ou *pós horário comercial*? 🙂";
+          "Fechado — referência nova recebida ✅\n\n" +
+          "Agora me diz *tamanho (cm)* e *local do corpo* pra eu fechar o valor.";
+        twiml.message(reply);
+        return res.status(200).type("text/xml").send(twiml.toString());
       }
 
+      // Se perguntarem “e se for 25cm?” etc:
+      const quick = text.toLowerCase();
+      if (quick.includes("cm")) {
+        session.sizeLocationText = text;
+        session.stage = "orcamento";
+        reply = "Perfeito — só um segundo que vou recalcular certinho com esse tamanho.";
+        twiml.message(reply);
+        return res.status(200).type("text/xml").send(twiml.toString());
+      }
+
+      reply =
+        "Perfeito. Se quiser, me confirma:\n" +
+        "1) tamanho e local certinhos\n" +
+        "2) horário comercial ou pós-comercial\n\n" +
+        "Aí eu já te passo as próximas datas e como fica o sinal pra reservar.";
       twiml.message(reply);
       return res.status(200).type("text/xml").send(twiml.toString());
     }
 
-    // 5) DEFINIR HORÁRIO (caso caia aqui)
-    if (session.stage === "definir_horario") {
-      const t = text.toLowerCase();
-      if (t.includes("comercial")) {
-        session.horarioPref = "comercial";
-        session.stage = "aguardando_sinal";
-        reply =
-          "Fechado! Me passa *2 ou 3 dias* que você consegue.\n\n" +
-          "Pra reservar a data, o sinal é *10%* via Pix: *dwtattooshop@gmail.com*.\n" +
-          "Assim que mandar o comprovante, eu confirmo ✅";
-      } else if (t.includes("pós") || t.includes("pos") || t.includes("noite") || t.includes("após")) {
-        session.horarioPref = "pos";
-        session.stage = "aguardando_sinal";
-        reply =
-          "Fechado! Me passa *2 ou 3 dias* que você consegue.\n\n" +
-          "Pra reservar a data, o sinal é *10%* via Pix: *dwtattooshop@gmail.com*.\n" +
-          "Assim que mandar o comprovante, eu confirmo ✅";
-      } else {
-        reply = "Você prefere *horário comercial* ou *pós horário comercial*? 🙂";
-      }
-
-      twiml.message(reply);
-      return res.status(200).type("text/xml").send(twiml.toString());
-    }
-
-    // 6) AGUARDANDO SINAL
-    if (session.stage === "aguardando_sinal") {
-      if (looksLikePaymentProof(text)) {
-        reply =
-          "Perfeito! Comprovante recebido ✅\n\nSeu horário está reservado. " +
-          "Se quiser, já me confirma: *horário comercial* ou *pós horário comercial*?";
-        session.stage = "definir_horario";
-      } else {
-        reply =
-          "Show. Pra reservar a data, o sinal é *10%* via Pix: *dwtattooshop@gmail.com*.\n" +
-          "Quando enviar o comprovante, eu confirmo aqui ✅";
-      }
-
-      twiml.message(reply);
-      return res.status(200).type("text/xml").send(twiml.toString());
-    }
-
-    // fallback (se cair em stage desconhecido)
-    session.stage = "inicio";
-    twiml.message("Me manda uma referência em imagem pra eu te atender certinho 🙂");
+    // fallback
+    twiml.message("Me manda a referência em imagem e o tamanho/local pra eu te atender certinho.");
     return res.status(200).type("text/xml").send(twiml.toString());
   } catch (err) {
-    console.error("ERRO NO WEBHOOK:", err);
-    twiml.message("Tive um problema agora. Me chama de novo em alguns segundos.");
+    console.error("ERRO:", err);
+    twiml.message("Tive um problema aqui agora. Me chama de novo em alguns segundos.");
     return res.status(200).type("text/xml").send(twiml.toString());
   }
 });
