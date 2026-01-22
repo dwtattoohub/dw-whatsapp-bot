@@ -10,12 +10,11 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Memória simples por número (em RAM)
 const sessions = {};
 
-// ---------- Helpers ----------
 function getSession(from) {
   if (!sessions[from]) {
     sessions[from] = {
       stage: "inicio",
-      imageDataUrl: null, // pode ser URL ou base64 (dataUrl)
+      imageDataUrl: null,
       imageMime: null,
       gotReference: false,
       sizeLocationText: null,
@@ -31,11 +30,6 @@ function extractSizeLocation(text) {
   return t;
 }
 
-/**
- * Normaliza o payload que chega do Z-API.
- * No teu log, chega algo tipo:
- * { phone: '5544...', message: { text: 'Oi' }, fromMe: false, ... }
- */
 function parseZapiInbound(body) {
   const phone =
     body?.phone ||
@@ -47,49 +41,45 @@ function parseZapiInbound(body) {
 
   const message =
     body?.message ||
-    body?.message?.text ||
     body?.text?.message ||
     body?.text ||
     body?.Body ||
     "";
 
-  // Imagem (pode variar conforme evento/assinatura)
   const image =
     body?.image ||
     body?.imageUrl ||
     body?.message?.image?.url ||
     body?.media?.url ||
-    body?.message?.imageUrl ||
     null;
-
-  const fromMe = Boolean(body?.fromMe);
 
   return {
     phone: phone ? String(phone) : null,
     message: String(message || "").trim(),
     image: image ? String(image) : null,
-    fromMe,
     raw: body,
   };
 }
 
 // ------------------------------------------------------------------------
-// ENVIO PARA Z-API (ATUALIZADO: sem client-token; usa token na URL)
+// ENVIO PARA Z-API (CORRETO: client-token = ZAPI_CLIENT_TOKEN)
 // ------------------------------------------------------------------------
 async function sendZapiMessage(phone, message) {
   const instance = process.env.ZAPI_INSTANCE_ID;
-  const token = process.env.ZAPI_TOKEN;
+  const token = process.env.ZAPI_TOKEN; // token da instância
+  const clientToken = process.env.ZAPI_CLIENT_TOKEN; // token de segurança (conta)
 
   if (!instance || !token) {
     throw new Error("Missing ZAPI_INSTANCE_ID / ZAPI_TOKEN");
   }
+  if (!clientToken) {
+    throw new Error("Missing ZAPI_CLIENT_TOKEN (client-token)");
+  }
 
-  // ✅ Endpoint do teu plano (o que você mesmo testou):
-  // https://api.z-api.io/instances/{instance}/token/{token}/send-text
   const url = `https://api.z-api.io/instances/${instance}/token/${token}/send-text`;
 
   const payload = {
-    phone: String(phone).replace(/\D/g, ""), // só números
+    phone: String(phone).replace(/\D/g, ""),
     message: String(message || ""),
   };
 
@@ -97,7 +87,10 @@ async function sendZapiMessage(phone, message) {
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "client-token": clientToken, // <<< AQUI é o segredo
+    },
     body: JSON.stringify(payload),
   });
 
@@ -107,8 +100,6 @@ async function sendZapiMessage(phone, message) {
   if (!resp.ok) {
     throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${body}`);
   }
-
-  // Às vezes vem erro em JSON mesmo com 200 (depende do plano)
   if (body && body.includes('"error"')) {
     throw new Error(`[ZAPI SEND ERROR BODY] ${body}`);
   }
@@ -117,35 +108,27 @@ async function sendZapiMessage(phone, message) {
 }
 
 // ------------------------------------------------------------------------
-//  ENDPOINT DO WEBHOOK (APONTAR NO "Ao receber" do Z-API)
-//  URL: https://dw-whatsapp-bot.onrender.com/zapi
+// WEBHOOK (Z-API "Ao receber")
+// URL: https://dw-whatsapp-bot.onrender.com/zapi
 // ------------------------------------------------------------------------
 app.post("/zapi", async (req, res) => {
   try {
     console.log("[ZAPI IN] body:", req.body);
 
-    const { phone, message, image, fromMe } = parseZapiInbound(req.body);
+    const { phone, message, image } = parseZapiInbound(req.body);
 
-    // Evita loop: se o evento for de mensagem enviada por você/instância
-    if (fromMe) return res.status(200).json({ ok: true });
-
-    if (!phone) {
-      console.log("[ZAPI ERROR] missing phone");
-      return res.status(400).json({ error: "missing phone" });
-    }
+    if (!phone) return res.status(400).json({ error: "missing phone" });
 
     const session = getSession(phone);
 
-    // 0) Se chegou imagem, guarda
     if (image) {
-      session.imageDataUrl = image; // pode ser URL (ou base64 se vier assim)
+      session.imageDataUrl = image;
       session.imageMime = "image/jpeg";
       session.gotReference = true;
     }
 
     let reply = "";
 
-    // 1) INÍCIO
     if (session.stage === "inicio") {
       reply =
         "Oi! Eu sou o Dhyeikow, tatuador. Obrigado por me procurar e confiar no meu trabalho.\n\n" +
@@ -156,7 +139,6 @@ app.post("/zapi", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 2) AGUARDANDO REFERÊNCIA
     if (session.stage === "aguardando_referencia") {
       if (!session.gotReference) {
         reply = "Pra eu avaliar certinho, me envia a *referência em imagem*.";
@@ -174,7 +156,6 @@ app.post("/zapi", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 3) AGUARDANDO TAMANHO/LOCAL
     if (session.stage === "aguardando_tamanho_local") {
       const size = extractSizeLocation(message);
 
@@ -189,7 +170,6 @@ app.post("/zapi", async (req, res) => {
       session.stage = "orcamento";
     }
 
-    // 4) ORÇAMENTO (OpenAI)
     if (session.stage === "orcamento") {
       if (!session.gotReference || !session.imageDataUrl) {
         session.stage = "aguardando_referencia";
@@ -228,7 +208,6 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       return res.json({ ok: true });
     }
 
-    // 5) PÓS-ORÇAMENTO
     if (session.stage === "pos_orcamento") {
       if (image) {
         session.stage = "aguardando_tamanho_local";
@@ -243,10 +222,7 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       if (lower.includes("cm")) {
         session.sizeLocationText = message;
         session.stage = "orcamento";
-        await sendZapiMessage(
-          phone,
-          "Perfeito — vou recalcular certinho com esse tamanho."
-        );
+        await sendZapiMessage(phone, "Perfeito — vou recalcular certinho com esse tamanho.");
         return res.json({ ok: true });
       }
 
@@ -257,7 +233,6 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       return res.json({ ok: true });
     }
 
-    // fallback
     await sendZapiMessage(
       phone,
       "Me manda a referência em imagem e o tamanho/local pra eu te atender certinho."
@@ -265,20 +240,9 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
     return res.json({ ok: true });
   } catch (err) {
     console.error("[ZAPI ERROR]:", err);
-    // responde 200 pra não ficar reenviando
     return res.status(200).json({ ok: false });
   }
 });
 
-// ------------------------------------------------------------------------
-// ROTA DE SAÚDE (pra testar no navegador)
-// ------------------------------------------------------------------------
-app.get("/", (req, res) => {
-  res.status(200).send("OK - dw-whatsapp-bot rodando");
-});
-
-// ------------------------------------------------------
-//  Porta Render
-// ------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
