@@ -3,7 +3,18 @@ import OpenAI from "openai";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+
+// ---- rotas de teste (IMPORTANTE pro Render) ----
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
+process.on("unhandledRejection", (err) => {
+  console.error("[UNHANDLED REJECTION]", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err);
+});
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -71,14 +82,13 @@ function parseZapiInbound(body) {
 // ENVIO PARA Z-API (COM client-token NO HEADER)
 // ------------------------------------------------------------------------
 async function sendZapiMessage(phone, message) {
-  const instance = process.env.ZAPI_INSTANCE_ID;
-  const token = process.env.ZAPI_TOKEN;
+  const instance = process.env.ZAPI_INSTANCE_ID; // ID da instância (ex: 3ED9....)
+  const token = process.env.ZAPI_TOKEN;          // Token da instância (ex: B5BB....)
 
   if (!instance || !token) {
     throw new Error("Missing ZAPI_INSTANCE_ID / ZAPI_TOKEN");
   }
 
-  // Mantém o teu endpoint send-text (funciona na maioria dos planos)
   const url = `https://api.z-api.io/instances/${instance}/token/${token}/send-text`;
 
   const payload = {
@@ -92,7 +102,7 @@ async function sendZapiMessage(phone, message) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "client-token": token, // <<< ISSO resolve o erro "client-token is not configured"
+      "client-token": token,
     },
     body: JSON.stringify(payload),
   });
@@ -111,8 +121,8 @@ async function sendZapiMessage(phone, message) {
 }
 
 // ------------------------------------------------------------------------
-//  ENDPOINT DO WEBHOOK (APONTAR NO "Ao receber" do Z-API)
-//  URL: https://SEU-SERVICO.onrender.com/zapi
+//  ENDPOINT DO WEBHOOK (COLOCAR NO "Ao receber" do Z-API)
+//  URL: https://dw-whatsapp-bot.onrender.com/zapi
 // ------------------------------------------------------------------------
 app.post("/zapi", async (req, res) => {
   try {
@@ -127,16 +137,16 @@ app.post("/zapi", async (req, res) => {
 
     const session = getSession(phone);
 
-    // 0) Se chegou imagem, guarda
+    // Se chegou imagem, guarda
     if (image) {
-      session.imageDataUrl = image; // pode ser URL
+      session.imageDataUrl = image;
       session.imageMime = "image/jpeg";
       session.gotReference = true;
     }
 
     let reply = "";
 
-    // 1) INÍCIO
+    // INÍCIO
     if (session.stage === "inicio") {
       reply =
         "Oi! Eu sou o Dhyeikow, tatuador. Obrigado por me procurar e confiar no meu trabalho.\n\n" +
@@ -147,7 +157,7 @@ app.post("/zapi", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 2) AGUARDANDO REFERÊNCIA
+    // AGUARDANDO REFERÊNCIA
     if (session.stage === "aguardando_referencia") {
       if (!session.gotReference) {
         reply = "Pra eu avaliar certinho, me envia a *referência em imagem*.";
@@ -165,7 +175,7 @@ app.post("/zapi", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 3) AGUARDANDO TAMANHO/LOCAL
+    // AGUARDANDO TAMANHO/LOCAL
     if (session.stage === "aguardando_tamanho_local") {
       const size = extractSizeLocation(message);
 
@@ -180,7 +190,7 @@ app.post("/zapi", async (req, res) => {
       session.stage = "orcamento";
     }
 
-    // 4) ORÇAMENTO (OpenAI)
+    // ORÇAMENTO (OpenAI)
     if (session.stage === "orcamento") {
       if (!session.gotReference || !session.imageDataUrl) {
         session.stage = "aguardando_referencia";
@@ -219,7 +229,7 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       return res.json({ ok: true });
     }
 
-    // 5) PÓS-ORÇAMENTO
+    // PÓS-ORÇAMENTO
     if (session.stage === "pos_orcamento") {
       if (image) {
         session.stage = "aguardando_tamanho_local";
@@ -256,7 +266,6 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
     return res.json({ ok: true });
   } catch (err) {
     console.error("[ZAPI ERROR]:", err);
-    // responde 200 pra não ficar reenviando
     return res.status(200).json({ ok: false });
   }
 });
