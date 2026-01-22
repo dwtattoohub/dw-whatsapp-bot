@@ -1,731 +1,714 @@
 /**
- * app.js — WhatsApp bot (Z-API webhook) com:
- * - Respostas mais humanas/profissionais (sem “assinar”)
- * - Não fala de horas pro cliente (horas são só internas)
- * - Estimativa de preço coerente por região/tamanho/complexidade
- * - Sessões (máx. 7h por sessão) + retoque 40–50 dias
- * - Pagamento (Pix/Débito/Crédito até 12x) + sinal (R$100 ou 10%)
- * - Pix key configurável por ENV
- * - Anti-repetição (dedupe por messageId + cooldown)
- * - Notificação pro seu Whats pessoal quando detectar “paguei / comprovante”
+ * DW WhatsApp Bot (Z-API + OpenAI)
+ * Fluxo: atendimento humano/profissional + orçamento + sinal + confirmação de agenda (manual)
  *
- * ENV no Render (Environment -> Add):
- *   OPENAI_API_KEY              (opcional, se quiser visão/descrição mais forte)
- *   ZAPI_INSTANCE_ID            (ID da instância)
- *   ZAPI_INSTANCE_TOKEN         (Token da instância)
- *   ZAPI_CLIENT_TOKEN           (Client token / token de integração)
- *   PIX_KEY                     (sua chave pix)
- *   PERSONAL_PHONE_NOTIFY       (seu whats pessoal no formato 55DDDNUMERO)
- *   PORT                        (Render já injeta, mas pode setar)
+ * ✅ NÃO integra Google Agenda (opção 1). Em vez disso:
+ *    - Quando detectar comprovante/sinal → pergunta preferência de datas/horários
+ *    - Envia NOTIFICAÇÃO pro seu WhatsApp pessoal com resumo + o que falta
+ *
+ * ✅ Evita repetição:
+ *    - Mantém estado por contato (memória simples em RAM)
+ *    - Só pergunta o que ainda falta
+ *
+ * ✅ Regras de preço (interno, não mostra por hora):
+ *    - Regiões especiais: mão, pescoço, pé, costela → 150 1ª hora + 120 demais
+ *    - Outras (antebraço, braço, perna, costas etc.) → 150 1ª hora + 100 demais
+ *    - Sessão máxima: 7h. Se passar, divide em 2+ sessões.
+ *
+ * ✅ Pagamento:
+ *    - Pix / Débito / Crédito até 12x
+ *    - 1 sessão de retoque inclusa (se necessário) entre 40–50 dias
+ *    - Sinal: R$100 (se total > R$1000 pode ser 10% OU R$100 — aqui usei: R$100 padrão, e 10% se quiser ativar)
+ *
+ * ✅ Cobertura:
+ *    - Pede foto pra avaliar, mas já avisa que normalmente não pega cobertura (rip/whip shading é delicado)
+ *
+ * 🔧 ENV VARS (Render):
+ *   ZAPI_INSTANCE_ID         (ex: 3ED9....)
+ *   ZAPI_INSTANCE_TOKEN      (token da instância, ex: B5BBE....)
+ *   ZAPI_CLIENT_TOKEN        (token de segurança da conta, se habilitado; se não tiver, deixe vazio e o bot não usa)
+ *   OPENAI_API_KEY
+ *   PIX_KEY                  (chave pix)
+ *   OWNER_PHONE              (seu whats pessoal com DDI+DDD+numero, ex: 5544999999999)
+ *   PUBLIC_BASE_URL          (opcional; ex: https://dw-whatsapp-bot.onrender.com)
  */
 
 import express from "express";
+import axios from "axios";
+import crypto from "crypto";
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-/* =======================
-   ENV / Config
-======================= */
-const PORT = process.env.PORT || 10000;
-
-const ZAPI_INSTANCE_ID = requireEnv("ZAPI_INSTANCE_ID");
-const ZAPI_INSTANCE_TOKEN = requireEnv("ZAPI_INSTANCE_TOKEN");
-const ZAPI_CLIENT_TOKEN = requireEnv("ZAPI_CLIENT_TOKEN");
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const PIX_KEY = process.env.PIX_KEY || "CHAVE_PIX_AQUI";
-const PERSONAL_PHONE_NOTIFY = process.env.PERSONAL_PHONE_NOTIFY || ""; // ex: 5544999999999
-
-// Preço por região:
-const PRICE = {
-  normal: { firstHour: 150, nextHour: 100 }, // antebraço/costa/perna/etc
-  sensitive: { firstHour: 150, nextHour: 120 }, // mão/pé/pescoço/costela
-};
-
-const MAX_SESSION_HOURS = 7;
-
-// Anti-spam/repetição:
-const MSG_COOLDOWN_MS = 3500;
-
-/* =======================
-   Estado em memória
-======================= */
-const seenMessageIds = new Map(); // messageId -> timestamp
-const lastBotReplyAt = new Map(); // phone -> timestamp
-const convo = new Map(); // phone -> state
-
-function getState(phone) {
-  if (!convo.has(phone)) {
-    convo.set(phone, {
-      stage: "new", // new -> asked_ref -> got_ref -> asked_style -> asked_area -> quote_sent -> deposit_wait
-      lastImageSeen: false,
-      hasReference: false,
-      wantFidelity: "", // "fiel" | "adaptar"
-      area: "", // "mão", "antebraço", etc.
-      sizeHint: "", // pequeno|medio|grande|fechado
-      notes: "",
-      lastQuote: null,
-    });
-  }
-  return convo.get(phone);
+// ------------------ ENV ------------------
+function getEnv(name, optional = false) {
+  const v = process.env[name];
+  if (!v && !optional) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-/* =======================
-   Rotas básicas
-======================= */
-app.get("/", (_, res) => res.status(200).send("ok"));
-app.get("/health", (_, res) => res.status(200).json({ ok: true }));
+const ZAPI_INSTANCE_ID = getEnv("ZAPI_INSTANCE_ID");
+const ZAPI_INSTANCE_TOKEN = getEnv("ZAPI_INSTANCE_TOKEN");
+const ZAPI_CLIENT_TOKEN = getEnv("ZAPI_CLIENT_TOKEN", true) || ""; // pode estar vazio
+const OPENAI_API_KEY = getEnv("OPENAI_API_KEY");
+const PIX_KEY = getEnv("PIX_KEY");
+const OWNER_PHONE = getEnv("OWNER_PHONE");
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 
+// Z-API base
+const ZAPI_BASE = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_INSTANCE_TOKEN}`;
+
+// ------------------ SIMPLE MEMORY (RAM) ------------------
 /**
- * Webhook principal (configurar no Z-API: Ao receber -> https://SEU_RENDER_URL/zapi )
+ * state per phone:
+ * {
+ *   stage: 'start'|'collecting'|'quoted'|'awaiting_deposit'|'awaiting_schedule'|'done',
+ *   name?: string,
+ *   region?: string,
+ *   sizeCm?: string,
+ *   fidelity?: 'fiel'|'adaptar'|null,
+ *   references: { hasImage: boolean, lastImageUrl?: string },
+ *   lastUserMsgAt?: number,
+ *   lastBotMsgHash?: string,
+ *   quotedValue?: number,
+ *   hoursEstimate?: number,
+ *   sessions?: number,
+ *   depositReceived?: boolean,
+ *   schedulePrefs?: { period?: 'comercial'|'pos'|'tanto_faz', dates?: string },
+ * }
  */
-app.post("/zapi", async (req, res) => {
-  try {
-    const incoming = normalizeIncoming(req.body);
-    console.log("[ZAPI IN] raw:", safeJson(req.body));
+const memory = new Map();
 
-    if (!incoming.phone) return res.status(200).json({ ok: true });
-
-    // Dedupe por messageId (se tiver)
-    if (incoming.messageId) {
-      if (seenMessageIds.has(incoming.messageId)) {
-        return res.status(200).json({ ok: true, deduped: true });
-      }
-      seenMessageIds.set(incoming.messageId, Date.now());
-      cleanupSeenIds();
-    }
-
-    // Cooldown por número (evita repetir por múltiplos eventos)
-    const last = lastBotReplyAt.get(incoming.phone) || 0;
-    if (Date.now() - last < MSG_COOLDOWN_MS) {
-      return res.status(200).json({ ok: true, throttled: true });
-    }
-
-    // Ignorar mensagens enviadas por você (se Z-API estiver notificando as suas)
-    if (incoming.fromMe) {
-      return res.status(200).json({ ok: true, fromMe: true });
-    }
-
-    const state = getState(incoming.phone);
-
-    console.log("[ZAPI IN] phone:", incoming.phone);
-    console.log("[ZAPI IN] text:", incoming.text);
-    console.log("[ZAPI IN] isImage:", incoming.isImage);
-    console.log("[ZAPI IN] imageUrl:", incoming.imageUrl || null);
-
-    // Se detectar pagamento/comprovante -> notifica seu Whats pessoal
-    if (shouldNotifyDeposit(incoming)) {
-      await notifyPersonal(incoming);
-    }
-
-    // Fluxo principal
-    const reply = await buildReply(incoming, state);
-
-    if (reply) {
-      await sendText(incoming.phone, reply);
-      lastBotReplyAt.set(incoming.phone, Date.now());
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error("[WEBHOOK ERROR]", err?.message || err);
-    return res.status(200).json({ ok: true });
+// anti-spam: prevent double-processing same incoming message id
+const seenMessageIds = new Set();
+function rememberMessageId(id) {
+  if (!id) return false;
+  if (seenMessageIds.has(id)) return true;
+  seenMessageIds.add(id);
+  // prevent unbounded growth
+  if (seenMessageIds.size > 5000) {
+    const arr = Array.from(seenMessageIds);
+    arr.slice(0, 2000).forEach((x) => seenMessageIds.delete(x));
   }
-});
+  return false;
+}
 
-/* =======================
-   Lógica de conversa
-======================= */
-async function buildReply(incoming, state) {
-  const text = (incoming.text || "").trim();
+// ------------------ HELPERS ------------------
+function normPhone(phone) {
+  return String(phone || "").replace(/\D/g, "");
+}
 
-  // Se recebeu imagem: marca referência recebida
-  if (incoming.isImage) {
-    state.hasReference = true;
-    state.lastImageSeen = true;
-
-    // tenta extrair “onde no corpo” do texto/caption se houver
-    const area = extractArea(text);
-    if (area) state.area = area;
-
-    // pergunta de fidelidade se ainda não tem
-    if (!state.wantFidelity) {
-      state.stage = "asked_style";
-      return [
-        "Perfeito, recebi a referência.",
-        "",
-        "Me diz só: você quer essa ideia bem fiel à referência, ou prefere que eu adapte pro seu corpo (encaixe e composição) mantendo o estilo?",
-      ].join("\n");
-    }
+function getState(phone) {
+  const p = normPhone(phone);
+  if (!memory.has(p)) {
+    memory.set(p, {
+      stage: "start",
+      references: { hasImage: false },
+      depositReceived: false,
+    });
   }
+  return memory.get(p);
+}
 
-  // Se respondeu fidelidade
-  if (!incoming.isImage && state.stage === "asked_style") {
-    const fidelity = extractFidelity(text);
-    if (fidelity) state.wantFidelity = fidelity;
+function setState(phone, patch) {
+  const st = getState(phone);
+  Object.assign(st, patch);
+  return st;
+}
 
-    // pede área se ainda não tem
-    if (!state.area) {
-      state.stage = "asked_area";
-      return "Show. E em qual região do corpo você quer fazer? (ex: mão, antebraço, costela, perna, costas)";
-    }
+function hashText(t) {
+  return crypto.createHash("sha1").update(String(t)).digest("hex");
+}
 
-    // se já tem área, pede tamanho (sem cm)
-    if (!state.sizeHint) {
-      state.stage = "asked_size";
-      return "E você imagina mais pequeno e discreto, médio (pegando bem a região) ou maior/fechando a área?";
-    }
-  }
+function shouldSend(phone, text) {
+  const st = getState(phone);
+  const h = hashText(text);
+  if (st.lastBotMsgHash === h) return false;
+  st.lastBotMsgHash = h;
+  return true;
+}
 
-  // Se respondeu área
-  if (!incoming.isImage && state.stage === "asked_area") {
-    const area = extractArea(text);
-    if (area) state.area = area;
+function isGreeting(text) {
+  const t = (text || "").toLowerCase().trim();
+  return ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite"].some((x) =>
+    t.startsWith(x)
+  );
+}
 
-    if (!state.area) {
-      return "Entendi. Só me fala a região certinha do corpo pra eu fechar certinho (mão, antebraço, costela, pescoço, perna, costas…).";
-    }
+function looksLikeDepositProof(text) {
+  const t = (text || "").toLowerCase();
+  return (
+    t.includes("comprovante") ||
+    t.includes("paguei") ||
+    t.includes("pago") ||
+    t.includes("pix feito") ||
+    t.includes("enviei o pix") ||
+    t.includes("transferi") ||
+    t.includes("sinal") ||
+    t.includes("pgto") ||
+    t.includes("pagamento")
+  );
+}
 
-    // pede tamanho (sem cm)
-    state.stage = "asked_size";
-    return "Boa. E você imagina mais pequeno e discreto, médio (pegando bem a região) ou maior/fechando a área?";
-  }
+function isCoverageQuestion(text) {
+  const t = (text || "").toLowerCase();
+  return t.includes("cobertura") || t.includes("cover") || t.includes("tapar");
+}
 
-  // Se respondeu tamanho
-  if (!incoming.isImage && state.stage === "asked_size") {
-    state.sizeHint = extractSizeHint(text) || "medio";
+function extractRegion(text) {
+  const t = (text || "").toLowerCase();
+  const regions = [
+    "mão",
+    "mao",
+    "pé",
+    "pe",
+    "pescoço",
+    "pescoco",
+    "costela",
+    "antebraço",
+    "antebraco",
+    "braço",
+    "braco",
+    "costas",
+    "perna",
+    "panturrilha",
+    "coxa",
+    "ombro",
+    "peito",
+    "barriga",
+    "clavícula",
+    "clavicula",
+    "nuca",
+  ];
+  const found = regions.find((r) => t.includes(r));
+  if (!found) return null;
 
-    // se ainda não tem fidelidade, pede
-    if (!state.wantFidelity) {
-      state.stage = "asked_style";
-      return "Fechou. Você prefere bem fiel à referência ou adaptar pro encaixe do seu corpo mantendo o estilo?";
-    }
+  // normalize
+  const map = {
+    mao: "mão",
+    pe: "pé",
+    pescoco: "pescoço",
+    antebraco: "antebraço",
+    braco: "braço",
+    clavicula: "clavícula",
+  };
+  return map[found] || found;
+}
 
-    // Se não tem referência ainda, pede imagem
-    if (!state.hasReference) {
-      state.stage = "asked_ref";
-      return "Perfeito. Pra eu te passar um orçamento justo, me manda uma referência em imagem do que você quer fazer.";
-    }
-
-    // Agora fecha orçamento
-    return await buildQuoteMessage(incoming, state);
-  }
-
-  // Se é novo e ainda não tem referência
-  if (state.stage === "new") {
-    // Se o texto já indica pedido de orçamento
-    if (looksLikeBudgetRequest(text)) {
-      state.stage = "asked_ref";
-      return [
-        "Opa! Tudo certo?",
-        "Obrigado por me chamar e confiar no meu trampo.",
-        "",
-        "Pra eu te passar um orçamento bem justo, me manda uma referência em imagem do que você quer fazer e me diz em qual região do corpo você pretende tatuar.",
-      ].join("\n");
-    }
-
-    // Qualquer abertura
-    return [
-      "Opa! Tudo certo?",
-      "Me conta a ideia do que você quer tatuar e em qual região do corpo — se já tiver referência em imagem, pode mandar também.",
-    ].join("\n");
-  }
-
-  // Se estava esperando referência e o cliente não mandou imagem ainda
-  if (!state.hasReference && (state.stage === "asked_ref" || state.stage === "new")) {
-    if (text) {
-      // tenta pegar região e tamanho já pelo texto
-      const area = extractArea(text);
-      if (area) state.area = area;
-      const size = extractSizeHint(text);
-      if (size) state.sizeHint = size;
-
-      return "Fechou. Agora me manda uma referência em imagem pra eu avaliar certinho (aí eu te explico os detalhes e fecho o orçamento).";
-    }
-  }
-
-  // Se já mandou imagem, mas não respondeu fidelidade/tamanho/área
-  if (state.hasReference) {
-    // Se respondeu algo que define fidelidade
-    const fidelity = extractFidelity(text);
-    if (fidelity) state.wantFidelity = fidelity;
-
-    // Se respondeu área
-    const area = extractArea(text);
-    if (area) state.area = area;
-
-    // Se respondeu tamanho
-    const size = extractSizeHint(text);
-    if (size) state.sizeHint = size;
-
-    // Se já tem o mínimo, fecha
-    if (state.wantFidelity && state.area && state.sizeHint) {
-      return await buildQuoteMessage(incoming, state);
-    }
-
-    // Senão, pergunta o que falta sem repetir em loop
-    if (!state.wantFidelity) {
-      state.stage = "asked_style";
-      return "Me diz só: você quer bem fiel à referência, ou prefere que eu adapte pro encaixe do seu corpo mantendo o estilo?";
-    }
-    if (!state.area) {
-      state.stage = "asked_area";
-      return "E em qual região do corpo você quer fazer?";
-    }
-    if (!state.sizeHint) {
-      state.stage = "asked_size";
-      return "E você imagina mais pequeno e discreto, médio (pegando bem a região) ou maior/fechando a área?";
-    }
-  }
-
+function extractSize(text) {
+  // match "10cm", "10 cm", "10x15", "10 x 15 cm"
+  const t = (text || "").toLowerCase();
+  const m1 = t.match(/(\d{1,2})\s*(x|×)\s*(\d{1,2})\s*(cm)?/);
+  if (m1) return `${m1[1]}x${m1[3]} cm`;
+  const m2 = t.match(/(\d{1,2})\s*(cm)\b/);
+  if (m2) return `${m2[1]} cm`;
   return null;
 }
 
-async function buildQuoteMessage(incoming, state) {
-  // 1) Analisa/explica a peça (sem falar de horas)
-  const analysisText = await describeReference(incoming, state);
-
-  // 2) Estima horas INTERNAS e calcula preço
-  const areaType = isSensitiveArea(state.area) ? "sensitive" : "normal";
-  const hours = estimateHoursInternal(state, analysisText);
-  const price = calcPrice(hours, PRICE[areaType]);
-
-  // 3) Sessões (máx 7h)
-  const sessions = Math.max(1, Math.ceil(hours / MAX_SESSION_HOURS));
-
-  // 4) Sinal: R$100 se >= 1000, senão 10%
-  const deposit = price >= 1000 ? 100 : Math.max(100, Math.round(price * 0.1)); // mantém mínimo 100
-
-  state.lastQuote = { hours, price, sessions, areaType, deposit };
-  state.stage = "quote_sent";
-
-  const paymentsBlock = [
-    "Pagamento:",
-    "• Pix",
-    "• Débito",
-    "• Crédito em até 12x",
-  ].join("\n");
-
-  const sessionsLine =
-    sessions === 1
-      ? "Eu trabalho com sessão de até 7 horas pra manter qualidade e acabamento."
-      : `Pela complexidade, o ideal é dividir em ${sessions} sessões (cada uma com até 7 horas) pra garantir um resultado bem feito e confortável.`;
-
-  const retouchLine =
-    "E o orçamento já inclui 1 sessão de retoque (se necessário) entre 40 e 50 dias após cicatrização.";
-
-  const installmentLine =
-    "Se preferir, dá pra fazer em sessões mensais (com ajuste no total), pra ficar mais leve no planejamento.";
-
-  // Mensagem final (profissional, humana, sem “assinar”)
-  return [
-    "Perfeito. Dei uma olhada com carinho na tua referência e te explico certinho antes do valor:",
-    "",
-    analysisText,
-    "",
-    sessionsLine,
-    paymentsBlock ? "\n" + paymentsBlock : "",
-    "",
-    retouchLine,
-    installmentLine,
-    "",
-    `Pelo tamanho e complexidade do projeto, o investimento fica em R$ ${formatBRL(price)}.`,
-    "",
-    `Pra reservar seu horário, eu peço um sinal de R$ ${formatBRL(deposit)}.`,
-    `Chave Pix: ${PIX_KEY}`,
-    "Assim que confirmar o Pix, me manda o comprovante aqui que eu já te passo as opções de agenda certinhas.",
-  ]
-    .filter(Boolean)
-    .join("\n");
+function regionIsSpecial(region) {
+  if (!region) return false;
+  const r = region.toLowerCase();
+  return ["mão", "pescoço", "pé", "costela"].includes(r);
 }
 
-/* =======================
-   Análise da referência
-======================= */
-async function describeReference(incoming, state) {
-  // Se tiver OpenAI e uma URL válida de imagem pública, tenta enriquecer a descrição.
-  // Se não der (URL inválida), faz descrição “manual” baseada em palavras/estado.
-  const base = buildBaseDescription(state);
-
-  if (!OPENAI_API_KEY) return base;
-
-  const url = incoming.imageUrl;
-  if (!url || !isHttpUrl(url)) return base;
-
-  try {
-    // Observação: se a URL não for pública, o modelo vai retornar invalid_image_url.
-    // Nesse caso, caímos no fallback.
-    const vision = await openaiVisionDescribe(url, state);
-    if (vision) return vision;
-    return base;
-  } catch (e) {
-    console.log("[VISION FALLBACK]", e?.message || e);
-    return base;
-  }
+function defaultHoursByRegion(region) {
+  // heurística base (ajustável)
+  if (!region) return 5;
+  const r = region.toLowerCase();
+  if (r === "mão") return 3;
+  if (r === "pescoço") return 3;
+  if (r === "pé") return 3;
+  if (r === "costela") return 5;
+  if (r === "antebraço") return 5;
+  if (r === "braço") return 6;
+  if (r === "perna" || r === "coxa" || r === "panturrilha") return 6;
+  if (r === "costas") return 7;
+  return 5;
 }
 
-function buildBaseDescription(state) {
-  const fidelityText =
-    state.wantFidelity === "fiel"
-      ? "A proposta é manter a ideia bem fiel à referência, respeitando o encaixe e o fluxo do corpo."
-      : "A proposta é adaptar o encaixe e a composição pro teu corpo mantendo o estilo da referência.";
-
-  // Texto “vendedor” e técnico, mas sem revelar horas/por hora
-  return [
-    `Pelo que você pediu (${state.area || "região"}), esse tipo de peça exige construção de contraste, transição de sombras bem controlada e acabamento limpo pra não “estourar” com o tempo.`,
-    "O ponto que mais pesa aqui é: definição de volumes (luz/sombra), textura e profundidade (principalmente em áreas de pele com mais movimento).",
-    "Eu faço a leitura da referência e reorganizo a composição pra ficar harmoniosa na anatomia, mantendo o visual forte e bem profissional.",
-    fidelityText,
-  ].join("\n");
+function sessionsFromHours(hours) {
+  // max 7h por sessão
+  if (!hours || hours <= 7) return 1;
+  return Math.ceil(hours / 7);
 }
 
-async function openaiVisionDescribe(imageUrl, state) {
-  const prompt = [
-    "Você é um tatuador profissional. Descreva de forma objetiva e convincente a complexidade da tatuagem na imagem para um cliente,",
-    "sem falar de horas e sem falar de preço. Foque em: sombras, contraste, volumes, textura, profundidade, acabamento e encaixe anatômico.",
-    "Tom: humano e profissional (WhatsApp). 6 a 10 linhas.",
-    "",
-    `Região: ${state.area || "não informado"}`,
-    `Preferência: ${state.wantFidelity || "não informado"}`,
-  ].join("\n");
+function calcPriceInternal(region, hours) {
+  const h = Math.max(1, Math.round(hours || 1));
+  const first = 150;
+  const extraRate = regionIsSpecial(region) ? 120 : 100;
+  if (h === 1) return first;
+  return first + (h - 1) * extraRate;
+}
+
+// ------------------ Z-API SEND ------------------
+async function zapiSendText(phone, message) {
+  const url = `${ZAPI_BASE}/send-text`;
+  const headers = {};
+  if (ZAPI_CLIENT_TOKEN) headers["Client-Token"] = ZAPI_CLIENT_TOKEN;
+
+  const payload = { phone, message };
+
+  const res = await axios.post(url, payload, { headers }).catch((e) => {
+    const status = e?.response?.status;
+    const data = e?.response?.data;
+    console.error("[ZAPI SEND FAIL]", status, data || e.message);
+    throw e;
+  });
+  return res.data;
+}
+
+async function notifyOwner(summary) {
+  const msg =
+    `📌 *DW BOT — AÇÃO PRA VOCÊ*\n\n` +
+    summary +
+    `\n\n(Agenda é manual. Se quiser, responda o cliente direto.)`;
+
+  await zapiSendText(OWNER_PHONE, msg);
+}
+
+// ------------------ OPENAI (TEXT) ------------------
+async function openaiChat(system, user) {
+  const url = "https://api.openai.com/v1/chat/completions";
+  const headers = {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+  };
 
   const body = {
-    model: "gpt-4.1-mini",
-    input: [
-      {
-        role: "user",
-        content: [
-          { type: "input_text", text: prompt },
-          { type: "input_image", image_url: imageUrl },
-        ],
-      },
+    model: "gpt-4o-mini",
+    temperature: 0.4,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
     ],
   };
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const data = await resp.json();
-
-  // Extrai texto
-  const text = extractResponseText(data);
-  if (!text) return "";
-  return text.trim();
+  const res = await axios.post(url, body, { headers });
+  return res.data.choices?.[0]?.message?.content?.trim() || "";
 }
 
-function extractResponseText(data) {
-  try {
-    // responses API: output -> [ { content: [ { type:'output_text', text:'...' } ] } ]
-    const out = data?.output?.[0]?.content || [];
-    for (const c of out) {
-      if (c?.type === "output_text" && c?.text) return c.text;
-    }
-    return "";
-  } catch {
-    return "";
-  }
+// ------------------ IMAGE NORMALIZATION (Z-API incoming) ------------------
+function extractImageUrlFromWebhook(payload) {
+  // Z-API webhooks variam. Tentamos vários caminhos comuns.
+  // Você mostrou log: imageType:'unknown' imageMime:null e "could not normalize image".
+  // Então aqui a gente tenta pegar qualquer URL que venha no payload.
+  const p = payload || {};
+  const possible = [
+    p?.message?.image?.imageUrl,
+    p?.message?.image?.url,
+    p?.message?.imageUrl,
+    p?.message?.url,
+    p?.media?.url,
+    p?.image?.url,
+    p?.image?.imageUrl,
+    p?.data?.url,
+  ].filter(Boolean);
+
+  if (possible.length) return String(possible[0]);
+
+  // às vezes vem base64 ou id
+  const possibleId = [
+    p?.message?.image?.id,
+    p?.message?.media?.id,
+    p?.media?.id,
+    p?.image?.id,
+  ].filter(Boolean);
+
+  if (possibleId.length) return `id:${possibleId[0]}`;
+  return null;
 }
 
-/* =======================
-   Estimativa (interno)
-======================= */
-function estimateHoursInternal(state, analysisText) {
-  const area = (state.area || "").toLowerCase();
-  const isSensitive = isSensitiveArea(area);
-
-  // A) Base por região
-  let baseHours = 3.5; // padrão
-  if (isSensitive) baseHours = 2.5;
-  if (/(costas|peito|coxa|panturrilha grande|fechar a perna)/i.test(area)) baseHours = 5.0;
-
-  // B) Multiplicador por tamanho
-  const size = (state.sizeHint || "medio").toLowerCase();
-  let mult = 1.0;
-  if (size === "pequeno") mult = 0.85;
-  if (size === "medio") mult = 1.0;
-  if (size === "grande") mult = 1.35;
-  if (size === "fechado") mult = 1.6;
-
-  // C) Complexidade por palavras (texto do cliente + análise)
-  const blob = `${analysisText} ${state.notes || ""}`.toLowerCase();
-
-  let points = 0;
-  // Realismo / retrato / animal
-  if (/(realismo|retrato|rosto|leão|tigre|lobo|olhos|pele|textura)/i.test(blob)) points += 2;
-  // Elementos adicionais
-  if (/(caveira|relógio|mão|sant|anjo|catedral|fumaça|fundo|cenário|ornamento|detalhe)/i.test(blob)) points += 1;
-  // Fundo/ambiente pesado
-  if (/(fundo trabalhado|cenário|muita fumaça|muita textura|muito detalhe|catedral)/i.test(blob)) points += 1;
-
-  // Converte pontos em horas extras
-  let hours = baseHours * mult + points * 1.0;
-
-  // Travas por região (pra não “viajar”)
-  if (isSensitive) hours = clamp(hours, 2.5, 4.0);
-  // Rosto/realismo médio em antebraço costuma 6–8h
-  if (!isSensitive && /(rosto|retrato|realismo)/i.test(blob) && mult >= 1.0) {
-    hours = clamp(hours, 5.5, 9.0);
-  }
-
-  // Arredonda para 0.5
-  hours = Math.ceil(hours * 2) / 2;
-
-  return hours;
-}
-
-function calcPrice(hours, cfg) {
-  if (hours <= 1) return cfg.firstHour;
-  const extra = hours - 1;
-  return Math.round(cfg.firstHour + extra * cfg.nextHour);
-}
-
-/* =======================
-   Notificação de “pago/comprovante”
-======================= */
-function shouldNotifyDeposit(incoming) {
-  const t = (incoming.text || "").toLowerCase();
-
-  const keywords = [
-    "paguei",
-    "pix feito",
-    "pix realizado",
-    "transferi",
-    "comprovante",
-    "pagamento",
-    "sinal",
-    "enviei o comprovante",
-  ];
-
-  const hit = keywords.some((k) => t.includes(k));
-
-  // Se vier imagem sem texto, também pode ser comprovante
-  const imagePossibleReceipt = incoming.isImage && (!incoming.text || incoming.text.trim() === "");
-
-  return (hit || imagePossibleReceipt) && !!PERSONAL_PHONE_NOTIFY;
-}
-
-async function notifyPersonal(incoming) {
-  const msg = [
-    "⚠️ Possível sinal/comprovante recebido",
-    `Cliente: ${incoming.phone}`,
-    incoming.isImage ? "Tipo: imagem (possível comprovante)" : `Mensagem: "${incoming.text || ""}"`,
-  ].join("\n");
-
-  await sendText(PERSONAL_PHONE_NOTIFY, msg);
-}
-
-/* =======================
-   Z-API send text
-======================= */
-async function sendText(phone, message) {
-  const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_INSTANCE_TOKEN}/send-text`;
-
-  const payload = {
-    phone,
-    message,
-  };
-
-  console.log("[ZAPI OUT] sending:", { phone, message: message?.slice(0, 120) + "..." });
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "client-token": ZAPI_CLIENT_TOKEN,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-
-  if (!resp.ok) {
-    console.log("[ZAPI SEND] status:", resp.status, "body:", safeJson(data));
-    throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${safeJson(data)}`);
-  }
-  return data;
-}
-
-/* =======================
-   Normalização do webhook
-   (tenta suportar formatos diferentes da Z-API)
-======================= */
-function normalizeIncoming(body) {
-  const phone =
-    body?.phone ||
-    body?.from ||
-    body?.senderPhone ||
-    body?.data?.phone ||
-    body?.data?.from ||
+function isImageWebhook(payload) {
+  const p = payload || {};
+  // tenta sinais comuns
+  const t =
+    p?.type ||
+    p?.message?.type ||
+    p?.messageType ||
+    p?.message?.messageType ||
     "";
+  const type = String(t).toLowerCase();
+  if (type.includes("image") || type.includes("photo")) return true;
 
-  const messageId =
-    body?.messageId ||
-    body?.id ||
-    body?.data?.messageId ||
-    body?.data?.id ||
-    body?.data?.key?.id ||
-    "";
+  // fallback: se tiver URL de imagem
+  const img = extractImageUrlFromWebhook(payload);
+  return !!img && !String(img).startsWith("id:");
+}
 
-  const fromMe = Boolean(
-    body?.fromMe ??
-      body?.data?.fromMe ??
-      body?.data?.key?.fromMe ??
-      false
+// ------------------ PROMPT & COPY (BOT VOICE) ------------------
+function professionalIntro() {
+  return (
+    `Opa! Tudo certo?\n` +
+    `Obrigado por me chamar e confiar no meu trabalho.\n\n` +
+    `Pra eu te passar um orçamento justo e alinhado com o que você quer, eu gosto de entender bem a ideia antes de falar de valor.`
   );
-
-  // Texto:
-  const text =
-    body?.text?.message ||
-    body?.message ||
-    body?.body ||
-    body?.data?.text ||
-    body?.data?.message ||
-    body?.data?.body ||
-    "";
-
-  // Detecção de imagem:
-  const isImage =
-    Boolean(body?.image) ||
-    Boolean(body?.data?.image) ||
-    Boolean(body?.data?.media) ||
-    Boolean(body?.data?.imageMessage) ||
-    Boolean(body?.data?.message?.imageMessage) ||
-    Boolean(body?.data?.message?.image) ||
-    body?.type === "image" ||
-    body?.data?.type === "image" ||
-    false;
-
-  // URL da imagem (se vier):
-  const imageUrl =
-    body?.image?.url ||
-    body?.imageUrl ||
-    body?.data?.image?.url ||
-    body?.data?.media?.url ||
-    body?.data?.imageUrl ||
-    body?.data?.message?.image?.url ||
-    body?.data?.message?.imageMessage?.url ||
-    "";
-
-  return {
-    phone: normalizePhone(phone),
-    messageId,
-    fromMe,
-    text: typeof text === "string" ? text : "",
-    isImage: !!isImage,
-    imageUrl: typeof imageUrl === "string" ? imageUrl : "",
-  };
 }
 
-function normalizePhone(p) {
-  if (!p) return "";
-  const digits = String(p).replace(/\D/g, "");
-  // garante com DDI 55 (se vier sem)
-  if (digits.length === 11 || digits.length === 10) return "55" + digits;
-  return digits;
+function askReferenceIfMissing() {
+  return `Me manda a referência em *imagem* (pode ser print também) pra eu avaliar certinho.`;
 }
 
-/* =======================
-   Extração de intenção (fidelidade/área/tamanho)
-======================= */
-function extractFidelity(text) {
-  const t = (text || "").toLowerCase();
-  if (/(fiel|igual|bem fiel|na referência|idêntic)/i.test(t)) return "fiel";
-  if (/(adapt|encaixe|composição|melhorar encaixe|ajust)/i.test(t)) return "adaptar";
-  return "";
+function askRegionIfMissing() {
+  return `E em qual região do corpo você pretende fazer? (ex: mão, antebraço, costela, perna, costas)`;
 }
 
-function extractArea(text) {
-  const t = (text || "").toLowerCase();
+function askSizeIfMissing() {
+  return `Você tem uma noção de tamanho aproximado em cm? Se não souber, sem problema — me diz só a região que eu consigo te orientar pelo encaixe.`;
+}
 
-  const map = [
-    { k: ["mão", "mao"], v: "mão" },
-    { k: ["pé", "pe"], v: "pé" },
-    { k: ["pescoço", "pescoco"], v: "pescoço" },
-    { k: ["costela", "costelas"], v: "costela" },
-    { k: ["antebraço", "antebraco"], v: "antebraço" },
-    { k: ["braço", "braco"], v: "braço" },
-    { k: ["perna", "panturrilha"], v: "perna" },
-    { k: ["coxa"], v: "coxa" },
-    { k: ["costas"], v: "costas" },
-    { k: ["peito"], v: "peito" },
-    { k: ["ombro"], v: "ombro" },
-    { k: ["nuca"], v: "nuca" },
-  ];
+function askFidelityIfMissing() {
+  return `Você quer essa ideia bem fiel à referência, ou prefere que eu adapte pro seu corpo (encaixe e composição) mantendo o estilo?`;
+}
 
-  for (const it of map) {
-    if (it.k.some((w) => t.includes(w))) return it.v;
+function describeProcessAndPayment() {
+  return (
+    `Como eu trabalho:\n` +
+    `• Eu desenvolvo o projeto pensando em encaixe e leitura na pele, pra ficar forte e bem executado.\n` +
+    `• Sessões com no máximo *7 horas* (passando disso eu separo em 2+ sessões pra manter qualidade).\n\n` +
+    `Pagamento:\n` +
+    `• Pix\n` +
+    `• Débito\n` +
+    `• Crédito em até 12x\n\n` +
+    `O orçamento já inclui *1 sessão de retoque* (se necessário) entre *40 e 50 dias* após cicatrização.`
+  );
+}
+
+function depositMessage(value) {
+  // regra do sinal: R$100 padrão (como você pediu)
+  const deposit = 100;
+
+  return (
+    `Pelo tamanho e complexidade do que você me pediu, o investimento fica em *R$ ${value}*.\n\n` +
+    `Pra reservar seu horário, eu peço um sinal de *R$ ${deposit}*.\n` +
+    `Chave Pix: ${PIX_KEY}\n\n` +
+    `Assim que confirmar o Pix, me manda o comprovante aqui que eu já sigo com as datas.`
+  );
+}
+
+function scheduleQuestions() {
+  return (
+    `Perfeito — recebendo o sinal eu já separo um horário pra você.\n\n` +
+    `Me diz só:\n` +
+    `1) Você prefere *horário comercial* ou *pós-horário comercial*?\n` +
+    `2) Você tem alguma data em mente? (ou semana melhor pra você)\n` +
+    `Se preferir, eu posso te passar a *data mais próxima disponível* também.`
+  );
+}
+
+function coverageReply() {
+  return (
+    `Cobertura eu preciso avaliar caso a caso.\n` +
+    `Como eu trabalho com *whip/rip shading* (bem delicado e com transição suave), eu evito pegar coberturas — na maioria das vezes não compensa pro resultado ficar no meu padrão.\n\n` +
+    `Se você quiser, me manda uma foto bem nítida do local (de frente, boa luz) que eu te digo com sinceridade se dá ou se é melhor outro caminho.`
+  );
+}
+
+// ------------------ CORE LOGIC ------------------
+async function handleIncoming({ phone, text, isImage, imageUrl, messageId }) {
+  phone = normPhone(phone);
+  const st = getState(phone);
+
+  if (rememberMessageId(messageId)) {
+    console.log("[SKIP] duplicate messageId:", messageId);
+    return;
   }
-  return "";
-}
 
-function extractSizeHint(text) {
+  // basic parsing
+  const region = extractRegion(text);
+  const size = extractSize(text);
+
+  if (region && !st.region) st.region = region;
+  if (size && !st.sizeCm) st.sizeCm = size;
+
+  if (isImage) {
+    st.references.hasImage = true;
+    if (imageUrl) st.references.lastImageUrl = imageUrl;
+  }
+
+  // COVERAGE
+  if (isCoverageQuestion(text)) {
+    const msg = coverageReply();
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+    return;
+  }
+
+  // DEPOSIT / PROOF
+  // Se o cliente manda comprovante OU manda imagem depois que já foi pedido sinal.
+  const depositSignal =
+    looksLikeDepositProof(text) ||
+    (isImage && st.stage === "awaiting_deposit");
+
+  if (depositSignal && st.stage !== "done") {
+    st.depositReceived = true;
+    st.stage = "awaiting_schedule";
+
+    const msg = scheduleQuestions();
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+
+    // notifica você com resumo do que tem
+    const summary =
+      `Cliente: +${phone}\n` +
+      `Status: *Sinal/Comprovante recebido*\n` +
+      `Projeto: ${st.references.hasImage ? "✅ tem referência" : "⚠️ sem referência"}\n` +
+      `Região: ${st.region || "não informado"}\n` +
+      `Tamanho: ${st.sizeCm || "não informado"}\n` +
+      `Preferência (fidelidade): ${st.fidelity || "não informado"}\n` +
+      `Ação: *Definir data/horário e anotar na agenda*`;
+
+    await notifyOwner(summary);
+    return;
+  }
+
+  // SCHEDULE PREFS HANDLING
+  if (st.stage === "awaiting_schedule") {
+    // tenta capturar preferência comercial/pós e datas
+    const t = (text || "").toLowerCase();
+
+    let period = st.schedulePrefs?.period;
+    if (!period) {
+      if (t.includes("comercial")) period = "comercial";
+      if (t.includes("pós") || t.includes("pos") || t.includes("noite"))
+        period = "pos";
+      if (t.includes("tanto faz") || t.includes("qualquer"))
+        period = "tanto_faz";
+    }
+
+    const dates = st.schedulePrefs?.dates || (text && text.length > 2 ? text : "");
+
+    st.schedulePrefs = { period: period || st.schedulePrefs?.period, dates };
+
+    // resposta pro cliente confirmando que você vai sugerir datas
+    const msg =
+      `Fechado. Vou organizar aqui e te mando as opções de horário certinhas.\n` +
+      `Se eu precisar confirmar algum detalhe rapidinho, eu te chamo por aqui.`;
+
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+
+    // notifica você com o que o cliente respondeu
+    const summary =
+      `Cliente: +${phone}\n` +
+      `Status: *Definindo agenda*\n` +
+      `Preferência: ${st.schedulePrefs.period || "não claro"}\n` +
+      `Datas/observações: ${st.schedulePrefs.dates || "não informado"}\n` +
+      `Ação: *Responder com 2–3 horários e lançar na Google Agenda*`;
+
+    await notifyOwner(summary);
+
+    st.stage = "done";
+    return;
+  }
+
+  // FIRST CONTACT / COLLECT INFO
+  const missing = [];
+  if (!st.references.hasImage) missing.push("ref");
+  if (!st.region) missing.push("region");
+  // tamanho é opcional
+  if (!st.fidelity) missing.push("fidelity");
+
+  // greeting
+  if (st.stage === "start") {
+    st.stage = "collecting";
+    const intro = professionalIntro();
+    if (shouldSend(phone, intro)) await zapiSendText(phone, intro);
+  }
+
+  // ask next missing (one at a time, to avoid spam)
+  if (missing.includes("ref")) {
+    const msg = askReferenceIfMissing();
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+    return;
+  }
+
+  if (missing.includes("region")) {
+    const msg = askRegionIfMissing();
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+    return;
+  }
+
+  if (missing.includes("fidelity")) {
+    // detect fidelity from text
+    const t = (text || "").toLowerCase();
+    if (t.includes("fiel")) st.fidelity = "fiel";
+    if (t.includes("adapt") || t.includes("encaixe")) st.fidelity = "adaptar";
+
+    if (!st.fidelity) {
+      const msg = askFidelityIfMissing();
+      if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+      return;
+    }
+  }
+
+  // If client asked size explicitly, we can ask. Otherwise skip.
+  if (!st.sizeCm && (text || "").toLowerCase().includes("tamanho")) {
+    const msg = askSizeIfMissing();
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+    return;
+  }
+
+  // READY TO QUOTE:
+  // 1) explicar complexidade antes de preço
+  // 2) calcular internamente horas e valor
+  // 3) mandar forma de sessão/pagamento/retoke
+  // 4) mandar preço e sinal (pix)
+  if (st.stage !== "awaiting_deposit" && st.stage !== "quoted") {
+    // Heurística de horas:
+    // - Base por região
+    // - Se tiver tamanho 2D maior, sobe
+    let hours = defaultHoursByRegion(st.region);
+
+    if (st.sizeCm) {
+      const m = st.sizeCm.match(/(\d{1,2})x(\d{1,2})/);
+      if (m) {
+        const a = Number(m[1]);
+        const b = Number(m[2]);
+        const area = a * b;
+        if (area >= 180) hours += 2; // ex: 12x15+
+        else if (area >= 120) hours += 1; // ex: 10x12
+      } else {
+        const m1 = st.sizeCm.match(/(\d{1,2})/);
+        if (m1 && Number(m1[1]) >= 15) hours += 1;
+      }
+    }
+
+    // Sessões
+    const sessions = sessionsFromHours(hours);
+
+    // Valor
+    const value = calcPriceInternal(st.region, hours);
+
+    st.hoursEstimate = hours;
+    st.sessions = sessions;
+    st.quotedValue = value;
+    st.stage = "awaiting_deposit";
+
+    // descrição técnica (sem falar horas nem valor por hora)
+    const system =
+      `Você é um tatuador profissional, linguagem humana e objetiva, sem emojis em excesso. ` +
+      `Antes de falar preço, descreva rapidamente por que o projeto é complexo (sombras, transições, profundidade, detalhes, contraste, encaixe). ` +
+      `NÃO fale horas e NÃO fale valor por hora. ` +
+      `Fale que sessões passam no máximo 7h e pode dividir. ` +
+      `Depois, informe as formas de pagamento e retoque incluso. ` +
+      `Seja direto e profissional.`;
+
+    const user =
+      `Cliente mandou referência (tem imagem), região: ${st.region}, tamanho: ${
+        st.sizeCm || "não informado"
+      }, preferência: ${st.fidelity}. ` +
+      `Escreva a explicação do trabalho (complexidade) + processo (max 7h/sessão; pode dividir em ${sessions} sessão(ões) se precisar) + pagamento (pix/débito/crédito 12x) + retoque 40-50 dias.`;
+
+    const preface = await openaiChat(system, user);
+
+    const block = describeProcessAndPayment();
+    const price = depositMessage(value);
+
+    const finalMsg = `${preface}\n\n${block}\n\n${price}`;
+
+    if (shouldSend(phone, finalMsg)) await zapiSendText(phone, finalMsg);
+
+    // Notifica você com resumo do orçamento
+    const summary =
+      `Cliente: +${phone}\n` +
+      `Status: *Orçamento enviado (aguardando sinal)*\n` +
+      `Região: ${st.region || "não informado"}\n` +
+      `Tamanho: ${st.sizeCm || "não informado"}\n` +
+      `Fidelidade: ${st.fidelity || "não informado"}\n` +
+      `Estimativa interna: ${st.hoursEstimate}h / ${st.sessions} sessão(ões)\n` +
+      `Valor enviado: R$ ${st.quotedValue}\n` +
+      `Ação: Aguardar comprovante`;
+
+    await notifyOwner(summary);
+
+    return;
+  }
+
+  // If already quoted and client keeps talking, be helpful but don't repeat the same asks.
+  // If they ask "valor?" and we already quoted → remind deposit flow briefly.
   const t = (text || "").toLowerCase();
-  if (/(pequen|discret|pequeno)/i.test(t)) return "pequeno";
-  if (/(m[eé]dio|normal|palma|pegando bem)/i.test(t)) return "medio";
-  if (/(grand|maior|bem grande)/i.test(t)) return "grande";
-  if (/(fechar|fechado|fechando|inteiro|todo|completo)/i.test(t)) return "fechado";
-  return "";
+  if (st.stage === "awaiting_deposit") {
+    if (t.includes("valor") || t.includes("preço") || t.includes("orc") || t.includes("orç")) {
+      const msg =
+        `Pra reservar, é só fazer o sinal de *R$ 100* no Pix (${PIX_KEY}) e me mandar o comprovante aqui. Aí eu já te passo as opções de data/horário.`;
+      if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+      return;
+    }
+  }
+
+  // fallback: short helpful
+  if (isGreeting(text)) {
+    const msg = `Tudo certo! Me diz como você quer seguir que eu te ajudo por aqui.`;
+    if (shouldSend(phone, msg)) await zapiSendText(phone, msg);
+  }
 }
 
-function looksLikeBudgetRequest(text) {
-  const t = (text || "").toLowerCase();
-  return /(valor|preço|preco|orçamento|orcamento|quanto fica|quanto custa)/i.test(t);
-}
-
-function isSensitiveArea(area) {
-  const a = (area || "").toLowerCase();
-  return /(mão|mao|pé|pe|pescoço|pescoco|costela)/i.test(a);
-}
-
-/* =======================
-   Utilitários
-======================= */
-function formatBRL(n) {
+// ------------------ WEBHOOK ENDPOINT ------------------
+app.post("/zapi", async (req, res) => {
   try {
-    return Number(n).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  } catch {
-    return String(n);
+    const payload = req.body;
+
+    // Ajuste conforme o webhook real da Z-API (pode variar):
+    const phone =
+      payload?.phone ||
+      payload?.from ||
+      payload?.data?.phone ||
+      payload?.data?.from ||
+      payload?.message?.phone ||
+      payload?.message?.from;
+
+    const text =
+      payload?.text?.message ||
+      payload?.message?.text ||
+      payload?.message ||
+      payload?.data?.text ||
+      payload?.data?.message ||
+      "";
+
+    const messageId =
+      payload?.messageId ||
+      payload?.data?.messageId ||
+      payload?.id ||
+      payload?.data?.id ||
+      payload?.message?.id ||
+      null;
+
+    const isImage = isImageWebhook(payload);
+    const imageUrl = isImage ? extractImageUrlFromWebhook(payload) : null;
+
+    console.log("[ZAPI IN] phone:", phone);
+    console.log("[ZAPI IN] text:", typeof text === "string" ? { message: text } : text);
+    console.log("[ZAPI IN] isImage:", isImage);
+    if (isImage) console.log("[ZAPI IN] imageUrl:", imageUrl);
+
+    if (!phone) {
+      res.status(200).json({ ok: true, ignored: "no phone" });
+      return;
+    }
+
+    await handleIncoming({
+      phone,
+      text: typeof text === "string" ? text : JSON.stringify(text),
+      isImage,
+      imageUrl,
+      messageId,
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("[WEBHOOK ERROR]", err?.message);
+    res.status(200).json({ ok: false, error: err?.message });
   }
-}
+});
 
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
-}
+// health
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
+});
 
-function isHttpUrl(url) {
-  return /^https?:\/\//i.test(url);
-}
-
-function cleanupSeenIds() {
-  const now = Date.now();
-  for (const [id, ts] of seenMessageIds.entries()) {
-    if (now - ts > 1000 * 60 * 30) seenMessageIds.delete(id); // 30min
-  }
-}
-
-function requireEnv(name) {
-  if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
-  return process.env[name];
-}
-
-function safeJson(obj) {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    return "[unstringifiable]";
-  }
-}
-
-/* =======================
-   Start
-======================= */
+// ------------------ START ------------------
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Webhook: ${PUBLIC_BASE_URL ? PUBLIC_BASE_URL : ""}/zapi`);
 });
