@@ -3,18 +3,19 @@ import OpenAI from "openai";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.json({ limit: "25mb" }));
 
+// -------------------- OpenAI --------------------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Memória simples por número (em RAM)
+// -------------------- Memória simples (RAM) --------------------
 const sessions = {};
 
 function getSession(from) {
   if (!sessions[from]) {
     sessions[from] = {
       stage: "inicio",
-      imageDataUrl: null,
+      imageDataUrl: null, // SEMPRE vamos tentar guardar como dataUrl base64 aqui
       imageMime: null,
       gotReference: false,
       sizeLocationText: null,
@@ -30,6 +31,10 @@ function extractSizeLocation(text) {
   return t;
 }
 
+/**
+ * Normaliza o payload que chega do Z-API.
+ * (varia por evento/plano/config)
+ */
 function parseZapiInbound(body) {
   const phone =
     body?.phone ||
@@ -44,36 +49,117 @@ function parseZapiInbound(body) {
     body?.text?.message ||
     body?.text ||
     body?.Body ||
+    body?.body ||
     "";
 
+  // possíveis lugares de mídia
   const image =
     body?.image ||
     body?.imageUrl ||
     body?.message?.image?.url ||
+    body?.message?.image?.base64 ||
     body?.media?.url ||
+    body?.media?.base64 ||
+    null;
+
+  const imageMime =
+    body?.message?.image?.mimetype ||
+    body?.message?.image?.mimeType ||
+    body?.media?.mimetype ||
+    body?.media?.mimeType ||
     null;
 
   return {
     phone: phone ? String(phone) : null,
     message: String(message || "").trim(),
-    image: image ? String(image) : null,
+    image: image ? String(image) : null, // pode ser URL, dataUrl, ou base64 cru
+    imageMime: imageMime ? String(imageMime) : null,
     raw: body,
   };
 }
 
+// -------------------- Helpers mídia --------------------
+function looksLikeDataUrl(s) {
+  return typeof s === "string" && s.startsWith("data:image/");
+}
+
+function looksLikeHttpUrl(s) {
+  return typeof s === "string" && /^https?:\/\//i.test(s);
+}
+
+function looksLikeBase64(s) {
+  if (typeof s !== "string") return false;
+  const trimmed = s.trim();
+  if (trimmed.length < 100) return false; // base64 de imagem costuma ser grande
+  // não é perfeito, mas funciona
+  return /^[A-Za-z0-9+/=\s]+$/.test(trimmed) && !looksLikeHttpUrl(trimmed) && !looksLikeDataUrl(trimmed);
+}
+
+function guessMimeFromContentType(ct) {
+  if (!ct) return "image/jpeg";
+  const lower = String(ct).toLowerCase();
+  if (lower.includes("png")) return "image/png";
+  if (lower.includes("webp")) return "image/webp";
+  if (lower.includes("gif")) return "image/gif";
+  return "image/jpeg";
+}
+
+async function fetchAsDataUrl(url) {
+  // tenta baixar a URL do Z-API (muitas vezes precisa do client-token)
+  const clientToken = process.env.ZAPI_CLIENT_TOKEN || process.env.ZAPI_TOKEN || "";
+  const headers = clientToken ? { "client-token": clientToken } : {};
+
+  const resp = await fetch(url, { method: "GET", headers });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`Failed to download image. status=${resp.status} body=${txt}`);
+  }
+  const ct = resp.headers.get("content-type");
+  const mime = guessMimeFromContentType(ct);
+  const arr = await resp.arrayBuffer();
+  const b64 = Buffer.from(arr).toString("base64");
+  return { dataUrl: `data:${mime};base64,${b64}`, mime };
+}
+
+async function normalizeIncomingImageToDataUrl(imageValue, imageMimeHint) {
+  if (!imageValue) return { dataUrl: null, mime: null };
+
+  // 1) já é dataUrl
+  if (looksLikeDataUrl(imageValue)) {
+    const mime = imageValue.slice(5, imageValue.indexOf(";")) || "image/jpeg";
+    return { dataUrl: imageValue, mime };
+  }
+
+  // 2) é URL -> baixa e converte pra dataUrl
+  if (looksLikeHttpUrl(imageValue)) {
+    return await fetchAsDataUrl(imageValue);
+  }
+
+  // 3) é base64 cru -> vira dataUrl
+  if (looksLikeBase64(imageValue)) {
+    const mime = imageMimeHint || "image/jpeg";
+    const clean = imageValue.replace(/\s/g, "");
+    return { dataUrl: `data:${mime};base64,${clean}`, mime };
+  }
+
+  // 4) fallback: tenta tratar como URL mesmo sem http (raro)
+  return { dataUrl: null, mime: null };
+}
+
 // ------------------------------------------------------------------------
-// ENVIO PARA Z-API (CORRETO: client-token = ZAPI_CLIENT_TOKEN)
+// ENVIO PARA Z-API (SEND TEXT) - com client-token obrigatório no header
 // ------------------------------------------------------------------------
 async function sendZapiMessage(phone, message) {
   const instance = process.env.ZAPI_INSTANCE_ID;
-  const token = process.env.ZAPI_TOKEN; // token da instância
-  const clientToken = process.env.ZAPI_CLIENT_TOKEN; // token de segurança (conta)
+  const token = process.env.ZAPI_TOKEN;
+  const clientToken = process.env.ZAPI_CLIENT_TOKEN; // <<< ESTE É O “TOKEN DO SAPO” (segurança da conta)
 
   if (!instance || !token) {
     throw new Error("Missing ZAPI_INSTANCE_ID / ZAPI_TOKEN");
   }
   if (!clientToken) {
-    throw new Error("Missing ZAPI_CLIENT_TOKEN (client-token)");
+    // sem isso você volta pro erro "your client-token is not configured"
+    throw new Error("Missing ZAPI_CLIENT_TOKEN");
   }
 
   const url = `https://api.z-api.io/instances/${instance}/token/${token}/send-text`;
@@ -89,7 +175,7 @@ async function sendZapiMessage(phone, message) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "client-token": clientToken, // <<< AQUI é o segredo
+      "client-token": clientToken, // <<< obrigatório
     },
     body: JSON.stringify(payload),
   });
@@ -108,27 +194,66 @@ async function sendZapiMessage(phone, message) {
 }
 
 // ------------------------------------------------------------------------
-// WEBHOOK (Z-API "Ao receber")
-// URL: https://dw-whatsapp-bot.onrender.com/zapi
+// Rotas utilitárias
+// ------------------------------------------------------------------------
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+app.get("/zapi", (req, res) =>
+  res.status(200).send("OK (use POST /zapi for webhook)")
+);
+
+// ------------------------------------------------------------------------
+// WEBHOOK (apontar no Z-API em “Ao receber”):
+// https://SEU-SERVICO.onrender.com/zapi
 // ------------------------------------------------------------------------
 app.post("/zapi", async (req, res) => {
   try {
-    console.log("[ZAPI IN] body:", req.body);
+    console.log("[ZAPI IN] body keys:", Object.keys(req.body || {}));
 
-    const { phone, message, image } = parseZapiInbound(req.body);
+    const { phone, message, image, imageMime } = parseZapiInbound(req.body);
 
-    if (!phone) return res.status(400).json({ error: "missing phone" });
+    console.log("[ZAPI IN parsed]", {
+      phone,
+      messagePreview: (message || "").slice(0, 80),
+      imageType: image
+        ? looksLikeDataUrl(image)
+          ? "dataUrl"
+          : looksLikeHttpUrl(image)
+          ? "url"
+          : looksLikeBase64(image)
+          ? "base64"
+          : "unknown"
+        : null,
+      imageMime,
+    });
+
+    if (!phone) {
+      console.log("[ZAPI ERROR] missing phone");
+      return res.status(400).json({ error: "missing phone" });
+    }
 
     const session = getSession(phone);
 
+    // 0) Se chegou imagem, normaliza para dataUrl (evita invalid_image_url no OpenAI)
     if (image) {
-      session.imageDataUrl = image;
-      session.imageMime = "image/jpeg";
-      session.gotReference = true;
+      try {
+        const norm = await normalizeIncomingImageToDataUrl(image, imageMime);
+        if (norm?.dataUrl) {
+          session.imageDataUrl = norm.dataUrl;
+          session.imageMime = norm.mime || "image/jpeg";
+          session.gotReference = true;
+          console.log("[ZAPI IMG] stored as dataUrl:", session.imageMime);
+        } else {
+          console.log("[ZAPI IMG] could not normalize image.");
+        }
+      } catch (e) {
+        console.log("[ZAPI IMG] normalize failed:", e?.message || e);
+      }
     }
 
     let reply = "";
 
+    // 1) INÍCIO
     if (session.stage === "inicio") {
       reply =
         "Oi! Eu sou o Dhyeikow, tatuador. Obrigado por me procurar e confiar no meu trabalho.\n\n" +
@@ -139,6 +264,7 @@ app.post("/zapi", async (req, res) => {
       return res.json({ ok: true });
     }
 
+    // 2) AGUARDANDO REFERÊNCIA
     if (session.stage === "aguardando_referencia") {
       if (!session.gotReference) {
         reply = "Pra eu avaliar certinho, me envia a *referência em imagem*.";
@@ -156,6 +282,7 @@ app.post("/zapi", async (req, res) => {
       return res.json({ ok: true });
     }
 
+    // 3) AGUARDANDO TAMANHO/LOCAL
     if (session.stage === "aguardando_tamanho_local") {
       const size = extractSizeLocation(message);
 
@@ -170,6 +297,7 @@ app.post("/zapi", async (req, res) => {
       session.stage = "orcamento";
     }
 
+    // 4) ORÇAMENTO (OpenAI)
     if (session.stage === "orcamento") {
       if (!session.gotReference || !session.imageDataUrl) {
         session.stage = "aguardando_referencia";
@@ -183,7 +311,7 @@ app.post("/zapi", async (req, res) => {
         "Você é Dhyeikow, tatuador. Seja humano, direto e profissional.";
 
       const userMsg = `Tamanho/local: ${session.sizeLocationText}.
-Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.`;
+Regras: analise a imagem, descreva o que será feito e então gere um valor fechado de orçamento.`;
 
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -208,6 +336,7 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       return res.json({ ok: true });
     }
 
+    // 5) PÓS-ORÇAMENTO
     if (session.stage === "pos_orcamento") {
       if (image) {
         session.stage = "aguardando_tamanho_local";
@@ -222,7 +351,10 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       if (lower.includes("cm")) {
         session.sizeLocationText = message;
         session.stage = "orcamento";
-        await sendZapiMessage(phone, "Perfeito — vou recalcular certinho com esse tamanho.");
+        await sendZapiMessage(
+          phone,
+          "Perfeito — vou recalcular certinho com esse tamanho."
+        );
         return res.json({ ok: true });
       }
 
@@ -233,6 +365,7 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
       return res.json({ ok: true });
     }
 
+    // fallback
     await sendZapiMessage(
       phone,
       "Me manda a referência em imagem e o tamanho/local pra eu te atender certinho."
@@ -240,9 +373,13 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
     return res.json({ ok: true });
   } catch (err) {
     console.error("[ZAPI ERROR]:", err);
+    // responde 200 pra não ficar reenviando
     return res.status(200).json({ ok: false });
   }
 });
 
+// ------------------------------------------------------
+// Porta Render
+// ------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
