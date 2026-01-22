@@ -52,12 +52,6 @@ function parseZapiInbound(body) {
     body?.Body ||
     "";
 
-  // Imagem (varia MUITO conforme evento)
-  // Aceita:
-  // - body.image (string url/base64)
-  // - body.imageUrl
-  // - body.message?.image?.url
-  // - body.media?.url
   const image =
     body?.image ||
     body?.imageUrl ||
@@ -74,7 +68,7 @@ function parseZapiInbound(body) {
 }
 
 // ------------------------------------------------------------------------
-// ENVIO PARA Z-API (CORRIGIDO: send-text)
+// ENVIO PARA Z-API (COM client-token NO HEADER)
 // ------------------------------------------------------------------------
 async function sendZapiMessage(phone, message) {
   const instance = process.env.ZAPI_INSTANCE_ID;
@@ -84,8 +78,7 @@ async function sendZapiMessage(phone, message) {
     throw new Error("Missing ZAPI_INSTANCE_ID / ZAPI_TOKEN");
   }
 
-  // ✅ Endpoint correto:
-  // POST https://api.z-api.io/instances/{id}/token/{token}/send-text
+  // Mantém o teu endpoint send-text (funciona na maioria dos planos)
   const url = `https://api.z-api.io/instances/${instance}/token/${token}/send-text`;
 
   const payload = {
@@ -97,20 +90,20 @@ async function sendZapiMessage(phone, message) {
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "client-token": token, // <<< ISSO resolve o erro "client-token is not configured"
+    },
     body: JSON.stringify(payload),
   });
 
   const body = await resp.text().catch(() => "");
   console.log("[ZAPI SEND] status:", resp.status, "body:", body);
 
-  // A Z-API às vezes retorna 200 com JSON de erro.
-  // Então checa também o body.
   if (!resp.ok) {
     throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${body}`);
   }
   if (body && body.includes('"error"')) {
-    // se vier {"error":...}
     throw new Error(`[ZAPI SEND ERROR BODY] ${body}`);
   }
 
@@ -118,7 +111,8 @@ async function sendZapiMessage(phone, message) {
 }
 
 // ------------------------------------------------------------------------
-//  ⚡ ENDPOINT DO WEBHOOK (APONTAR NO "Ao receber" do Z-API)
+//  ENDPOINT DO WEBHOOK (APONTAR NO "Ao receber" do Z-API)
+//  URL: https://SEU-SERVICO.onrender.com/zapi
 // ------------------------------------------------------------------------
 app.post("/zapi", async (req, res) => {
   try {
@@ -262,7 +256,7 @@ Regras: analise a imagem, descreva e então gere um valor fechado de orçamento.
     return res.json({ ok: true });
   } catch (err) {
     console.error("[ZAPI ERROR]:", err);
-    // sempre responde 200 pro Z-API não ficar reenviando loucamente
+    // responde 200 pra não ficar reenviando
     return res.status(200).json({ ok: false });
   }
 });
