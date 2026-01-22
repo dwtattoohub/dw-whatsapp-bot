@@ -1,9 +1,11 @@
 // app.js (ESM)
-// Requisitos ENV no Render:
+// ENV no Render (obrigatórias):
 // OPENAI_API_KEY
 // ZAPI_INSTANCE_ID
 // ZAPI_INSTANCE_TOKEN
 // ZAPI_CLIENT_TOKEN
+// OWNER_PHONE            (seu WhatsApp pessoal com DDI+DDD, ex: 5544999999999)
+// PIX_KEY                (sua chave Pix - telefone/cpf/email/chave aleatória)
 // (opcional) SYSTEM_PROMPT
 
 import express from "express";
@@ -18,12 +20,21 @@ const ENV = {
   ZAPI_INSTANCE_ID: process.env.ZAPI_INSTANCE_ID || "",
   ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN || "",
   ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || "",
+  OWNER_PHONE: process.env.OWNER_PHONE || "",
+  PIX_KEY: process.env.PIX_KEY || "",
   SYSTEM_PROMPT: process.env.SYSTEM_PROMPT || "",
   PORT: process.env.PORT || "10000",
 };
 
 function missingEnvs() {
-  const req = ["OPENAI_API_KEY", "ZAPI_INSTANCE_ID", "ZAPI_INSTANCE_TOKEN", "ZAPI_CLIENT_TOKEN"];
+  const req = [
+    "OPENAI_API_KEY",
+    "ZAPI_INSTANCE_ID",
+    "ZAPI_INSTANCE_TOKEN",
+    "ZAPI_CLIENT_TOKEN",
+    "OWNER_PHONE",
+    "PIX_KEY",
+  ];
   return req.filter((k) => !ENV[k] || String(ENV[k]).trim() === "");
 }
 
@@ -35,10 +46,22 @@ function getSession(phone) {
   if (!sessions[phone]) {
     sessions[phone] = {
       stage: "inicio",
-      imageDataUrl: null, // data:image/...;base64,...
-      imageSummary: null, // descrição técnica (curta, pro cliente)
-      sizeLocation: null, // "25cm no antebraço"
+      imageDataUrl: null,
+      imageSummary: null,
+      sizeLocation: null, // opcional
+      bodyRegion: null, // opcional
       isCoverup: false,
+
+      // status interno
+      status: "NOVO", // NOVO | ORCADO | AGUARDANDO_SINAL | SINAL_PAGO
+      lastQuoteValue: null,
+
+      // FLAGS (não repetir)
+      sentSummary: false,
+      sentPayments: false,
+      sentQuote: false,
+
+      // anti loop
       lastReply: null,
       lastReplyAt: 0,
     };
@@ -48,10 +71,22 @@ function getSession(phone) {
 
 function antiRepeat(session, reply) {
   const now = Date.now();
-  if (session.lastReply === reply && now - session.lastReplyAt < 60_000) return true; // 60s
+  if (session.lastReply === reply && now - session.lastReplyAt < 90_000) return true;
   session.lastReply = reply;
   session.lastReplyAt = now;
   return false;
+}
+
+// -------------------- Time / Owner notify --------------------
+function nowBR() {
+  return new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+}
+
+function looksLikeProofText(msg) {
+  const t = (msg || "").toLowerCase();
+  return /paguei|pago|pix|comprovante|transfer|enviei|sinal|dep(ó|o)sito|ted|doc|receipt|paid/i.test(
+    t
+  );
 }
 
 // -------------------- Z-API Send --------------------
@@ -66,7 +101,7 @@ async function zapiSendText(phone, message) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "client-token": ENV.ZAPI_CLIENT_TOKEN, // obrigatório no teu caso
+      "client-token": ENV.ZAPI_CLIENT_TOKEN,
     },
     body: JSON.stringify({
       phone: String(phone).replace(/\D/g, ""),
@@ -77,6 +112,15 @@ async function zapiSendText(phone, message) {
   const body = await resp.text().catch(() => "");
   if (!resp.ok) throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${body}`);
   return body;
+}
+
+async function notifyOwner(text) {
+  if (!ENV.OWNER_PHONE) return;
+  try {
+    await zapiSendText(ENV.OWNER_PHONE, text);
+  } catch (e) {
+    console.error("[OWNER NOTIFY FAIL]", e?.message || e);
+  }
 }
 
 // -------------------- Inbound normalize --------------------
@@ -101,7 +145,6 @@ function parseZapiInbound(body) {
     body?.data?.text ||
     "";
 
-  // Z-API costuma mandar imagem aqui:
   const imageUrl =
     body?.image?.imageUrl ||
     body?.image?.url ||
@@ -135,7 +178,7 @@ function parseZapiInbound(body) {
     imageUrl: imageUrl ? String(imageUrl) : null,
     imageMime: String(imageMime || "image/jpeg"),
     fromMe,
-    messageType: String(messageType || ""),
+    messageType,
     raw: body,
   };
 }
@@ -149,7 +192,6 @@ async function fetchImageAsDataUrl(url, mimeHint = "image/jpeg") {
     const resp = await fetch(url, {
       method: "GET",
       headers: {
-        // alguns links exigem o client-token
         "client-token": ENV.ZAPI_CLIENT_TOKEN,
         Accept: "image/*,*/*;q=0.8",
         "User-Agent": "Mozilla/5.0",
@@ -186,18 +228,68 @@ function extractSizeLocation(text) {
   const t = (text || "").trim();
   if (!t) return null;
   if (!/\d/.test(t)) return null;
-  // Ex: "25cm no antebraço", "15 cm ombro"
   return t;
 }
 
-function calcPriceFromHours(hours) {
-  const h = Math.max(1, Math.round(Number(hours) || 1));
-  return 150 + Math.max(0, h - 1) * 100;
+function extractBodyRegion(text) {
+  const t = (text || "").toLowerCase();
+  const regions = [
+    "mão",
+    "mao",
+    "dedo",
+    "punho",
+    "antebraço",
+    "antebraco",
+    "braço",
+    "braco",
+    "ombro",
+    "peito",
+    "costela",
+    "pescoço",
+    "pescoco",
+    "nuca",
+    "pé",
+    "pe",
+    "tornozelo",
+    "panturrilha",
+    "canela",
+    "coxa",
+    "joelho",
+    "virilha",
+    "costas",
+    "escápula",
+    "escapula",
+    "coluna",
+    "rosto",
+    "cabeça",
+    "cabeca",
+  ];
+
+  for (const r of regions) {
+    if (t.includes(r)) {
+      if (r === "mao") return "mão";
+      if (r === "pescoco") return "pescoço";
+      if (r === "pe") return "pé";
+      if (r === "antebraco") return "antebraço";
+      if (r === "braco") return "braço";
+      if (r === "escapula") return "escápula";
+      if (r === "cabeca") return "cabeça";
+      return r;
+    }
+  }
+  return null;
 }
 
+// Preço interno: 1ª hora 150, demais 120
+function calcPriceFromHours(hours) {
+  const h = Math.max(1, Math.round(Number(hours) || 1));
+  return 150 + Math.max(0, h - 1) * 120;
+}
+
+// Sessões internas: max 7h por sessão
 function sessionsFromHours(hours) {
   const h = Math.max(1, Number(hours) || 1);
-  return Math.ceil(h / 7); // regra: nunca passa de 7h por sessão
+  return Math.ceil(h / 7);
 }
 
 // -------------------- OpenAI prompts --------------------
@@ -212,13 +304,12 @@ Regras:
 - Você não faz sessões acima de 7 horas; se passar disso, divide em 2+ sessões (sem falar horas).
 - Pagamento: Pix, débito, crédito até 12x.
 - Inclui 1 retoque se necessário em 40–50 dias.
-- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais, com ajuste no total (exemplo: 1500 em 3 meses vira ~1700–1800).
+- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais, com ajuste no total.
 - Cobertura: peça foto da tattoo atual, mas deixe claro que raramente aceita cobertura por causa do seu estilo (whip shading), e que vai analisar antes de confirmar.
 - Criação: você faz criações exclusivas baseadas na referência e adapta ao corpo do cliente.
 `).trim();
 
 async function describeImageForClient(imageDataUrl) {
-  // descrição curta, profissional e “vendedora”, sem preço
   const resp = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.5,
@@ -230,7 +321,7 @@ async function describeImageForClient(imageDataUrl) {
           {
             type: "text",
             text:
-              "Analise a referência e gere uma explicação curta e profissional do que o projeto exige (sombras, transições, volume, contraste, acabamento). NÃO fale de preço, NÃO fale de horas. 6 a 10 linhas no máximo.",
+              "Analise a referência e gere uma explicação curta e profissional do que o projeto exige (sombras, transições, volume, contraste, acabamento, encaixe). NÃO fale de preço, NÃO fale de horas. 6 a 10 linhas no máximo.",
           },
           { type: "image_url", image_url: { url: imageDataUrl } },
         ],
@@ -241,8 +332,7 @@ async function describeImageForClient(imageDataUrl) {
   return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-async function estimateHoursInternal(imageDataUrl, sizeLocation, isCoverup) {
-  // retorna um número de horas (interno) para cálculo
+async function estimateHoursInternal(imageDataUrl, info, isCoverup) {
   const resp = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.2,
@@ -250,14 +340,16 @@ async function estimateHoursInternal(imageDataUrl, sizeLocation, isCoverup) {
       {
         role: "system",
         content:
-          "Você é um tatuador experiente. Estime SOMENTE um número de horas (inteiro) para execução, considerando complexidade e tamanho/local informados. Responda APENAS com um número. Sem texto.",
+          "Você é um tatuador experiente. Estime SOMENTE um número de horas (inteiro) para execução, considerando complexidade e as informações (tamanho/local OU apenas região). Responda APENAS com um número. Sem texto.",
       },
       {
         role: "user",
         content: [
           {
             type: "text",
-            text: `Tamanho/local: ${sizeLocation}. Cobertura: ${isCoverup ? "sim" : "não"}. Estime horas inteiras.`,
+            text: `Info do cliente: ${info || "não informado"}.
+Cobertura: ${isCoverup ? "sim" : "não"}.
+Estime horas inteiras.`,
           },
           { type: "image_url", image_url: { url: imageDataUrl } },
         ],
@@ -267,18 +359,17 @@ async function estimateHoursInternal(imageDataUrl, sizeLocation, isCoverup) {
 
   const raw = (resp.choices?.[0]?.message?.content || "").trim();
   const n = parseInt(raw.replace(/[^\d]/g, ""), 10);
-  if (!Number.isFinite(n) || n <= 0) return 4; // fallback seguro
-  return Math.min(30, n); // trava pra não sair absurdo
+  if (!Number.isFinite(n) || n <= 0) return 4;
+  return Math.min(30, n);
 }
 
-// -------------------- Replies templates --------------------
+// -------------------- Replies --------------------
 function msgInicio() {
   return (
     "Opa, tudo certo?\n" +
     "Obrigado por me chamar e confiar no meu trabalho.\n\n" +
-    "Pra eu te passar um orçamento justo, me manda a referência em *imagem* e me diz:\n" +
-    "• local no corpo\n" +
-    "• tamanho aproximado (se souber, em cm)"
+    "Pra eu te passar um orçamento justo, me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.\n" +
+    "Se souber o tamanho aproximado, melhor — mas se não souber, sem problema."
   );
 }
 
@@ -292,24 +383,22 @@ function msgCriacao() {
 function msgCoberturaPedirFoto() {
   return (
     "Sobre *cobertura*: me manda uma foto bem nítida da tattoo atual (de perto e de um pouco mais longe).\n\n" +
-    "Só pra ser transparente com você: eu *raramente* pego cobertura, porque meu estilo (whip shading) é bem limpo e delicado e, na maioria dos casos, cobertura não entrega o resultado que eu gosto de entregar.\n" +
+    "Só pra ser transparente: eu *raramente* pego cobertura, porque meu estilo (whip shading) é bem limpo e delicado e, na maioria dos casos, cobertura não entrega o resultado que eu gosto de entregar.\n" +
     "Mas me manda a foto que eu analiso e te falo com sinceridade se dá pra fazer ou não."
   );
 }
 
-function msgPedirTamanhoLocal() {
+function msgPedirLocalOuTamanho() {
   return (
     "Perfeito.\n" +
-    "Agora me confirma só *tamanho* e *local do corpo* pra eu fechar certinho.\n" +
-    'Ex: "25cm no antebraço"'
+    "Me confirma só *o local no corpo* (ex: costela, pescoço, mão, antebraço) e, se souber, o *tamanho aproximado*.\n" +
+    "Se não souber em cm, pode falar do jeito que você imagina que eu consigo estimar por aqui."
   );
 }
 
 function msgPagamentosESessoes(sessoes) {
   return (
-    "Pra ficar com um resultado bem limpo e cicatrização correta, eu organizo esse projeto em *" +
-    sessoes +
-    " sessão(ões)*.\n" +
+    `Pra ficar com um resultado bem limpo e cicatrização correta, eu organizo esse projeto em *${sessoes} sessão(ões)*.\n` +
     "Eu não passo de 7 horas por sessão — quando o projeto pede mais, eu divido pra manter qualidade.\n\n" +
     "Pagamento:\n" +
     "• Pix\n" +
@@ -323,13 +412,23 @@ function msgPagamentosESessoes(sessoes) {
 function msgFechamentoValor(valor) {
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
-    "Se fizer sentido pra você, pra reservar o horário eu peço um *sinal de R$ 100*.\n" +
-    "Aí eu já te mando as opções de agenda certinhas."
+    "Pra reservar seu horário, eu peço um *sinal de R$ 100*.\n" +
+    `Chave Pix: *${ENV.PIX_KEY}*\n\n` +
+    "Assim que confirmar o Pix, me manda o comprovante aqui e eu já te passo as opções de agenda certinhas."
+  );
+}
+
+function msgSinalPix() {
+  return (
+    "Perfeito! Pra reservar teu horário, o sinal é de *R$ 100*.\n" +
+    `Chave Pix: *${ENV.PIX_KEY}*\n\n` +
+    "Assim que fizer o Pix, me manda o comprovante aqui e eu já te envio as opções de agenda."
   );
 }
 
 // -------------------- Routes --------------------
 app.get("/", (_req, res) => res.status(200).send("OK"));
+
 app.get("/health", (_req, res) => {
   const miss = missingEnvs();
   res.status(miss.length ? 500 : 200).json({
@@ -340,19 +439,20 @@ app.get("/health", (_req, res) => {
       ZAPI_INSTANCE_ID: !!ENV.ZAPI_INSTANCE_ID,
       ZAPI_INSTANCE_TOKEN: !!ENV.ZAPI_INSTANCE_TOKEN,
       ZAPI_CLIENT_TOKEN: !!ENV.ZAPI_CLIENT_TOKEN,
+      OWNER_PHONE: !!ENV.OWNER_PHONE,
+      PIX_KEY: !!ENV.PIX_KEY,
     },
   });
 });
 
-// Webhook principal
+// Webhook
 app.post("/zapi", async (req, res) => {
-  // Responde rápido pro Z-API não reenviar
   res.status(200).json({ ok: true });
 
   try {
     const miss = missingEnvs();
     if (miss.length) {
-      console.warn("[BOOT/ENV] Missing:", miss.join(", "));
+      console.warn("[ENV Missing]", miss.join(", "));
       return;
     }
 
@@ -364,42 +464,50 @@ app.post("/zapi", async (req, res) => {
       fromMe,
       messageType,
       hasImageUrl: !!imageUrl,
-      messagePreview: (message || "").slice(0, 80),
+      messagePreview: (message || "").slice(0, 120),
     });
 
     if (!phone) return;
-    if (fromMe) return; // evita loop
+    if (fromMe) return;
 
     const session = getSession(phone);
-
-    // Intenção: cobertura/criação
-    const askedCoverup = detectCoverup(message);
-    if (askedCoverup) session.isCoverup = true;
-
     const lower = (message || "").toLowerCase();
+
+    // intents
+    if (detectCoverup(message)) session.isCoverup = true;
     const askedCreation = /cria|criação|desenho|autor|exclusiv/i.test(lower);
 
-    // 0) Se chegou imagem, tenta baixar e guardar como dataUrl
+    // captura região/tamanho (sem exigir cm)
+    const maybeRegion = extractBodyRegion(message);
+    if (!session.bodyRegion && maybeRegion) session.bodyRegion = maybeRegion;
+
+    const maybeSizeLoc = extractSizeLocation(message);
+    if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
+
+    // 0) Chegou imagem -> salva, gera resumo, reseta flags (nova referência)
     if (imageUrl) {
       try {
         const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
         session.imageDataUrl = dataUrl;
-        session.stage = "aguardando_tamanho_local"; // depois de imagem, pede tamanho/local
-        // Gera descrição “valor do trabalho” (antes do preço)
         session.imageSummary = await describeImageForClient(dataUrl);
+
+        session.sentSummary = false;
+        session.sentPayments = false;
+        session.sentQuote = false;
+
+        session.stage = "aguardando_info";
       } catch (e) {
-        console.error("[IMG] download/normalize failed:", e?.message || e);
+        console.error("[IMG] failed:", e?.message || e);
       }
     }
 
-    // 1) Se cliente perguntou sobre criação
+    // 1) Criação
     if (askedCreation) {
       const reply = msgCriacao();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      // não retorna: ele pode ter pedido preço junto
     }
 
-    // 2) Se cliente perguntou cobertura (mesmo sem imagem ainda)
+    // 2) Cobertura (se ainda não tem imagem)
     if (session.isCoverup && !session.imageDataUrl) {
       const reply = msgCoberturaPedirFoto();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -415,98 +523,128 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // 4) Aguardando referência (imagem)
+    // 4) Aguardando referência
     if (session.stage === "aguardando_referencia") {
       if (!session.imageDataUrl) {
-        // Se não veio imagem ainda, mas cliente mandou texto pedindo valor:
         const wantsPrice = /valor|preço|orc|orç|quanto/i.test(lower);
         const reply = wantsPrice ? msgInicio() : "Me manda a referência em *imagem* pra eu avaliar certinho 🙏";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
-
-      // Se agora já tem imagem (caiu de algum jeito), segue
-      session.stage = "aguardando_tamanho_local";
+      session.stage = "aguardando_info";
     }
 
-    // 5) Se temos imagem, sempre explicamos o valor do trabalho ANTES do preço
-    if (session.imageDataUrl && session.stage === "aguardando_tamanho_local") {
-      // Se ainda não tem tamanho/local, pede
-      const sizeLoc = extractSizeLocation(message);
-      if (!session.sizeLocation && sizeLoc) session.sizeLocation = sizeLoc;
+    // 5) Detectar sinal/comprovante e NOTIFICAR você
+    const proofByText = looksLikeProofText(message);
+    const sentImageNow = Boolean(imageUrl);
 
-      // Primeiro: manda explicação técnica curta (se ainda não mandou)
-      if (session.imageSummary) {
+    if (session.status === "AGUARDANDO_SINAL" && (proofByText || sentImageNow)) {
+      session.status = "SINAL_PAGO";
+
+      const clientMsg =
+        "Perfeito — recebendo aqui ✅\n" +
+        "Vou conferir e já te respondo com as opções de data/horário pra deixar tudo certinho.";
+
+      if (!antiRepeat(session, clientMsg)) await zapiSendText(phone, clientMsg);
+
+      const ownerMsg =
+        `✅ SINAL / COMPROVANTE RECEBIDO\n` +
+        `Cliente: ${phone}\n` +
+        `Quando: ${nowBR()}\n` +
+        `Orçamento (último): ${session.lastQuoteValue ? "R$ " + session.lastQuoteValue : "não registrado"}\n` +
+        `Ação: colocar na agenda e confirmar horário.`;
+
+      await notifyOwner(ownerMsg);
+      return;
+    }
+
+    // 6) Com imagem, mas faltam infos mínimas: pelo menos local/região OU tamanho
+    if (session.imageDataUrl && session.stage === "aguardando_info") {
+      if (!session.bodyRegion && !session.sizeLocation) {
+        const reply = msgPedirLocalOuTamanho();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
+      // 6.1) Explica o valor do trabalho (UMA VEZ)
+      if (!session.sentSummary && session.imageSummary) {
         const intro =
           "Perfeito, recebi a referência.\n" +
           "Antes de falar de valor, deixa eu te explicar o que esse projeto exige pra ficar bem feito:\n\n" +
           session.imageSummary;
 
         if (!antiRepeat(session, intro)) await zapiSendText(phone, intro);
+        session.sentSummary = true;
       }
 
-      if (!session.sizeLocation) {
-        const reply = msgPedirTamanhoLocal();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
+      // 6.2) Calcula com tamanho OU só região
+      const infoParaCalculo =
+        session.sizeLocation ||
+        (session.bodyRegion ? `Região do corpo: ${session.bodyRegion} (tamanho não informado)` : "não informado");
 
-      // Agora já temos: imagem + tamanho/local => calcula sessões + valor
-      const hours = await estimateHoursInternal(session.imageDataUrl, session.sizeLocation, session.isCoverup);
+      const hours = await estimateHoursInternal(session.imageDataUrl, infoParaCalculo, session.isCoverup);
       const sessoes = sessionsFromHours(hours);
       const valor = calcPriceFromHours(hours);
 
-      const bloco = msgPagamentosESessoes(sessoes);
-      if (!antiRepeat(session, bloco)) await zapiSendText(phone, bloco);
+      // 6.3) Pagamentos e sessões (UMA VEZ)
+      if (!session.sentPayments) {
+        const bloco = msgPagamentosESessoes(sessoes);
+        if (!antiRepeat(session, bloco)) await zapiSendText(phone, bloco);
+        session.sentPayments = true;
+      }
 
-      const final = msgFechamentoValor(valor);
-      if (!antiRepeat(session, final)) await zapiSendText(phone, final);
+      // 6.4) Valor (UMA VEZ) + Pix
+      if (!session.sentQuote) {
+        const final = msgFechamentoValor(valor);
+        if (!antiRepeat(session, final)) await zapiSendText(phone, final);
+        session.sentQuote = true;
 
-      session.stage = "pos_orcamento";
+        session.lastQuoteValue = valor;
+        session.status = "AGUARDANDO_SINAL";
+        session.stage = "pos_orcamento";
+      }
+
       return;
     }
 
-    // 6) Pós orçamento (continuidade sem ficar repetindo)
+    // 7) Pós orçamento
     if (session.stage === "pos_orcamento") {
-      // Se cliente mandar nova imagem, reinicia sem bagunçar
-      if (session.imageDataUrl && imageUrl) {
-        session.sizeLocation = null;
-        session.stage = "aguardando_tamanho_local";
-        const reply = "Fechado — recebi uma referência nova. Me confirma só *tamanho* e *local do corpo* pra eu fechar certinho.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      // Se cliente pergunta sobre parcelamento mensal
       if (/mensal|por mês|dividir|parcelar por mês/i.test(lower)) {
         const reply =
           "Dá sim.\n" +
-          "Quando o projeto fica pesado pagar de uma vez, eu consigo organizar em *sessões mensais*.\n" +
-          "Exemplo: um projeto de R$ 1.500, dividido em 3 meses, pode ficar por volta de R$ 1.700 a R$ 1.800 no total (pra diluir em sessões), ficando algo perto de R$ 600 por mês.\n" +
-          "Me diz quantos meses você prefere que eu já te proponho o melhor formato.";
+          "Quando fica pesado pagar tudo de uma vez, eu consigo organizar em *sessões mensais*.\n" +
+          "Aí o total ajusta um pouco por ficar parcelado por sessão.\n" +
+          "Me diz em quantos meses você prefere que eu já te proponho o formato certinho.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      // Se cliente diz “fechou”
-      if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
-        const reply =
-          "Fechado.\n" +
-          "Pra reservar teu horário eu peço um *sinal de R$ 100*.\n" +
-          "Assim que cair, eu já te mando as opções de agenda certinhas.";
+      // Cliente quer fechar -> manda Pix e muda status
+      if (/fech|vamos|bora|quero|topo|ok|fechar/i.test(lower)) {
+        const reply = msgSinalPix();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        session.status = "AGUARDANDO_SINAL";
+        return;
+      }
+
+      // Se o cliente manda mais info de local/tamanho depois, recalcula uma vez
+      if (maybeRegion || maybeSizeLoc) {
+        session.sentPayments = false;
+        session.sentQuote = false;
+        session.stage = "aguardando_info";
+        const reply = "Perfeito — com essa informação eu consigo ajustar o orçamento certinho. Só um instante.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      // Fallback profissional
       const reply =
         "Perfeito.\n" +
-        "Se você me confirmar *tamanho/local* certinhos (ou mandar a referência novamente, se quiser ajustar a ideia), eu fecho tudo certinho pra você.";
+        "Se você quiser, me confirma só o *local no corpo* (e o tamanho, se souber) pra eu ajustar tudo certinho — ou me diz se prefere seguir com esse formato mesmo.";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
-    // fallback geral
+    // fallback
     const fallback = msgInicio();
     if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
   } catch (err) {
