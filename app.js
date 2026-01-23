@@ -6,6 +6,7 @@
 // ZAPI_CLIENT_TOKEN
 // (opcional) SYSTEM_PROMPT
 // (opcional) PIX_KEY
+// (opcional) OWNER_PHONE   // ex: 5544999999999
 
 import express from "express";
 import OpenAI from "openai";
@@ -21,6 +22,7 @@ const ENV = {
   ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || "",
   SYSTEM_PROMPT: process.env.SYSTEM_PROMPT || "",
   PIX_KEY: process.env.PIX_KEY || "",
+  OWNER_PHONE: process.env.OWNER_PHONE || "",
   PORT: process.env.PORT || "10000",
 };
 
@@ -49,17 +51,14 @@ function getSession(phone) {
       sentQuote: false,
 
       // etapa de sinal/agenda
-      depositConfirmed: false,
+      depositConfirmed: false,      // confirmado SOMENTE por foto do comprovante
       askedSchedule: false,
+      scheduleCaptured: false,      // cliente já respondeu (comercial/pós e/ou data)
+      manualHandoff: false,         // daqui pra frente você assume manualmente
 
-      // (ADICIONADO) preferências de agenda
-      schedulePref: {
-        shift: null,  // "comercial" | "pos"
-        dateText: null, // texto livre / "próxima data disponível"
-      },
-
-      // ✅ (ADICIONADO) pós-orçamento: dúvidas
-      askedDoubts: false,
+      // controle de estilo/encerramento
+      awaitingBWAnswer: false,
+      finished: false,
 
       // anti loop básico
       lastReply: null,
@@ -67,6 +66,10 @@ function getSession(phone) {
     };
   }
   return sessions[phone];
+}
+
+function resetSession(phone) {
+  delete sessions[phone];
 }
 
 function antiRepeat(session, reply) {
@@ -100,6 +103,16 @@ async function zapiSendText(phone, message) {
   const body = await resp.text().catch(() => "");
   if (!resp.ok) throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${body}`);
   return body;
+}
+
+// ✅ Notificação no seu Whats (OWNER_PHONE)
+async function notifyOwner(text) {
+  if (!ENV.OWNER_PHONE) return;
+  try {
+    await zapiSendText(ENV.OWNER_PHONE, text);
+  } catch (e) {
+    console.log("[OWNER NOTIFY FAIL]", e?.message || e);
+  }
 }
 
 // -------------------- Inbound normalize --------------------
@@ -237,68 +250,67 @@ function extractBodyRegion(text) {
   return null;
 }
 
-function detectDepositConfirmation(text) {
+// ✅ IMPORTANTE: comprovante confirmado só com FOTO (imageUrl) após orçamento
+function detectDepositTextOnly(text) {
   const t = (text || "").toLowerCase();
   return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(t);
 }
 
-// ✅ AJUSTE: pergunta de agenda completa
-function msgPerguntaAgenda() {
-  return (
-    "Perfeito — sinal confirmado.\n\n" +
-    "Pra eu agendar do melhor jeito pra você:\n" +
-    "1) Você prefere horário *comercial* ou *pós-comercial*?\n" +
-    "2) Você tem alguma data específica livre?\n\n" +
-    "Se você não tiver uma data em mente, eu posso te passar a *próxima data livre* que eu tenho e já deixar reservado."
-  );
+function askedPix(text) {
+  const t = (text || "").toLowerCase();
+  return /qual\s*o\s*pix|chave\s*pix|me\s*passa\s*o\s*pix|pix\?/i.test(t);
 }
 
-// ✅ (ADICIONADO) detectar comandos de reset
-function isResetCommand(text = "") {
-  const t = String(text || "").trim().toLowerCase();
-  return /^(reset|reiniciar|começar novamente|comecar novamente|recomeçar|recomecar)$/i.test(t);
+function askedAddress(text) {
+  const t = (text || "").toLowerCase();
+  return /onde\s*fica|endereço|endereco|localização|localizacao|como\s*chego|qual\s*o\s*endereço|qual\s*o\s*endereco/i.test(t);
 }
 
-// ✅ (ADICIONADO) extrair preferência de horário e data na etapa de agenda
-function parseSchedulePref(text = "") {
-  const t = String(text || "").toLowerCase();
-
-  let shift = null;
-  if (/(p[oó]s|pos)[-\s]?comercial|noite|depois do trabalho|ap[oó]s o trabalho|p[oó]s[-\s]?hor[aá]rio/i.test(t)) {
-    shift = "pos";
-  } else if (/comercial|hor[aá]rio comercial|manh[aã]|tarde/i.test(t)) {
-    shift = "comercial";
-  }
-
-  let dateText = null;
-  if (/pr[oó]xima|proxima|sem prefer[eê]ncia|sem preferencia|qualquer dia|tanto faz/i.test(t)) {
-    dateText = "próxima data disponível";
-  } else if (/\d{1,2}\/\d{1,2}|\d{1,2}-\d{1,2}|segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo/i.test(t)) {
-    dateText = String(text || "").trim();
-  }
-
-  return { shift, dateText };
+function detectThanks(text) {
+  const t = (text || "").toLowerCase();
+  return /obrigad|valeu|tmj|agradeço|fechou|show|top|blz|beleza/i.test(t);
 }
 
-// ✅ (ADICIONADO) detectar pedido de pix
-function isAskingPix(text = "") {
-  const t = String(text || "").toLowerCase();
-  return /qual\s*o\s*pix|chave\s*pix|me\s*passa\s*o\s*pix|pix\??$/i.test(t);
+// ✅ Black & Grey only: detect cor no texto
+function detectColorIntentByText(text) {
+  const t = (text || "").toLowerCase();
+  return /colorid|color|cores|vermelh|azul|amarel|verde|roxo|rosa|laranj|aquarel|new\s*school/i.test(t);
 }
 
-// ✅ (ADICIONADO) detectar resposta “sem dúvida”
-function isNoDoubt(text = "") {
-  const t = String(text || "").toLowerCase().trim();
-  return /^(n[aã]o|nao)\s*(tenho|tem)\s*(d[uú]vida|duvidas)\b|sem\s*d[uú]vida|sem\s*duvidas|tudo\s*certo|tranquilo|ok|de boa|show|fechado|beleza|perfeito$/i.test(t);
+// ✅ tenta inferir "colorida" pela descrição (se a IA mencionar)
+function detectColorIntentBySummary(summary) {
+  const s = (summary || "").toLowerCase();
+  return /colorid|cores|color|tinta\s*colorida/i.test(s);
 }
 
-// ✅ (ADICIONADO) detectar resposta “tenho dúvida”
-function isHasDoubt(text = "") {
-  const t = String(text || "").toLowerCase();
-  return /(tenho|com)\s*d[uú]vida|d[uú]vida|duvida/i.test(t);
+// ✅ detecta resposta do cliente sobre aceitar black&grey
+function detectBWAccept(text) {
+  const t = (text || "").toLowerCase();
+  if (/sim|aceito|pode|fechado|bora|ok|topo|manda|vamo/i.test(t)) return "yes";
+  if (/não|nao|prefiro\s*color|quero\s*color|não\s*quero\s*preto|nao\s*quero\s*preto/i.test(t)) return "no";
+  return "";
 }
 
-// Nova regra de preço:
+// ✅ extrai preferências de agenda
+function detectCommercialPref(text) {
+  const t = (text || "").toLowerCase();
+  if (/(p[oó]s|pos)[ -]?comercial|noite|ap[oó]s\s*o\s*trabalho|depois\s*do\s*trabalho/i.test(t)) return "pos";
+  if (/comercial|manh[aã]|tarde|hor[aá]rio\s*comercial/i.test(t)) return "comercial";
+  return "";
+}
+
+function detectNoSpecificDate(text) {
+  const t = (text || "").toLowerCase();
+  return /pr[oó]xim[ao]\s*(hor[aá]rio|data)\s*(livre|dispon[ií]vel)|qualquer\s*data|pr[oó]xima\s*data|pode\s*marcar\s*no\s*pr[oó]ximo|o\s*que\s*voc[eê]\s*tiver/i.test(t);
+}
+
+function detectHasSpecificDate(text) {
+  const t = (text || "").toLowerCase();
+  // simples: tem número e mês/dia ou formato 12/02, 12-02, dia 12, sexta, etc.
+  return /(\d{1,2}\/\d{1,2})|(\d{1,2}\-\d{1,2})|dia\s*\d{1,2}|(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)/i.test(t);
+}
+
+// -------------------- Regras de preço --------------------
 function calcPriceFromHours(hours) {
   const h = Math.max(1, Math.round(Number(hours) || 1));
   return 150 + Math.max(0, h - 1) * 120;
@@ -385,7 +397,7 @@ function msgInicio() {
   return (
     "Opa, tudo certo?\n" +
     "Obrigado por me chamar e confiar no meu trabalho.\n\n" +
-    "Pra eu te passar um orçamento justo, me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.\n" +
+    "• Pra eu te passar um orçamento justo, me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.\n" +
     "Se souber o tamanho aproximado, melhor — mas se não souber, sem problema."
   );
 }
@@ -400,15 +412,15 @@ function msgCriacao() {
 function msgCoberturaPedirFoto() {
   return (
     "Sobre *cobertura*: me manda uma foto bem nítida da tattoo atual (de perto e de um pouco mais longe).\n\n" +
-    "Só pra ser transparente: eu *raramente* pego cobertura, porque meu estilo (whip shading) é bem limpo e delicado e, na maioria dos casos, cobertura não entrega o resultado que eu gosto de entregar.\n" +
-    "Mas me manda a foto que eu analiso e te falo com sinceridade se dá pra fazer ou não."
+    "• Só pra ser transparente: eu *raramente* pego cobertura, porque meu estilo (whip shading) é bem limpo e delicado e, na maioria dos casos, cobertura não entrega o resultado que eu gosto de entregar.\n\n" +
+    "Me manda a foto que eu analiso e te falo com sinceridade se dá pra fazer ou não."
   );
 }
 
 function msgPedirLocalOuTamanho() {
   return (
     "Perfeito.\n" +
-    "Me confirma só *o local no corpo* (ex: costela, pescoço, mão, antebraço) e, se souber, o *tamanho aproximado*.\n" +
+    "• Me confirma só *o local no corpo* (ex: costela, pescoço, mão, antebraço) e, se souber, o *tamanho aproximado*.\n" +
     "Se não souber em cm, pode falar do jeito que você imagina que eu consigo estimar por aqui."
   );
 }
@@ -417,44 +429,139 @@ function msgPagamentosESessoes(sessoes) {
   return (
     `Pra ficar com um resultado bem limpo e cicatrização correta, eu organizo esse projeto em *${sessoes} sessão(ões)*.\n` +
     "Eu não passo de 7 horas por sessão — quando o projeto pede mais, eu divido pra manter qualidade.\n\n" +
-    "Pagamento:\n" +
+    "• Pagamento:\n" +
     "• Pix\n" +
     "• Débito\n" +
     "• Crédito em até 12x\n\n" +
-    "E o orçamento já inclui *1 sessão de retoque* (se necessário) entre 40 e 50 dias após cicatrização.\n\n" +
+    "• O orçamento já inclui *1 sessão de retoque* (se necessário) entre 40 e 50 dias após cicatrização.\n\n" +
     "Se ficar pesado pagar tudo de uma vez, dá pra fazer em *sessões mensais* (com ajuste no total)."
   );
 }
 
-// ✅ AJUSTE: sinal é R$ 50 + mostra chave Pix
+// ✅ sinal R$ 50 + chave pix
 function msgFechamentoValor(valor) {
-  const pixLine = ENV.PIX_KEY ? `Chave Pix: ${ENV.PIX_KEY}\n` : "";
+  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
-    "Se fizer sentido pra você, pra reservar o horário eu peço um *sinal de R$ 50*.\n" +
+    "• Pra reservar o horário eu peço um *sinal de R$ 50*.\n" +
     pixLine +
-    "Assim que confirmar e me mandar o comprovante aqui, eu já te passo as opções de agenda certinhas."
+    "• Assim que você *enviar a foto do comprovante* aqui, eu confirmo o agendamento e já te passo as opções de agenda certinhas."
   );
 }
 
-// ✅ (ADICIONADO) pós-orçamento: pergunta de dúvidas
-function msgDuvidasAtendimento() {
-  return "Ficou alguma dúvida sobre o atendimento?";
-}
-
-function msgSemDuvidas() {
+// ✅ se cliente pedir pix a qualquer momento
+function msgPixDireto() {
+  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "(chave pix não configurada no momento)";
   return (
-    "Perfeito — obrigado.\n" +
-    "Qualquer coisa que você precisar, é só me chamar por aqui. Fico à disposição."
+    "Perfeito.\n\n" +
+    `• Chave Pix: ${pixLine}\n` +
+    "• Sinal para reserva: *R$ 50*\n\n" +
+    "Assim que você enviar a *foto do comprovante* aqui, eu confirmo e seguimos pra agenda."
   );
 }
 
-function msgPedirDuvida() {
-  return "Pode me falar qual é a tua dúvida que eu te explico certinho por aqui.";
+// ✅ só confirma “sinal ok” quando vier FOTO do comprovante (image)
+function msgAguardandoComprovante() {
+  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+  return (
+    "Perfeito.\n\n" +
+    "• Pra eu confirmar o agendamento, eu preciso da *foto do comprovante* aqui no Whats.\n" +
+    pixLine +
+    "Assim que chegar, eu já sigo com a agenda."
+  );
+}
+
+// ✅ pergunta de agenda completa
+function msgPerguntaAgenda() {
+  return (
+    "Perfeito — comprovante recebido.\n\n" +
+    "• Pra eu agendar do melhor jeito pra você:\n" +
+    "• Você prefere horário *comercial* ou *pós-comercial*?\n" +
+    "• Você tem alguma data específica livre?\n\n" +
+    "Se você não tiver uma data em mente, eu posso te colocar no *próximo horário disponível* e já te retorno com as opções."
+  );
+}
+
+// ✅ resposta quando o cliente pede “próximo horário disponível”
+function msgVouVerificarAgendaSemData() {
+  return (
+    "Fechado.\n\n" +
+    "• Vou verificar minha agenda agora.\n" +
+    "• Em instantes eu te retorno com as *próximas datas e horários disponíveis* pra você escolher e eu já deixo reservado."
+  );
+}
+
+// ✅ resposta quando o cliente manda uma data específica
+function msgVouVerificarAgendaComData() {
+  return (
+    "Perfeito.\n\n" +
+    "• Vou verificar na agenda se essa data está disponível.\n" +
+    "• Em instantes eu te retorno confirmando as opções de *data e horário* da sua sessão."
+  );
+}
+
+// ✅ mensagem final (fim do atendimento)
+function msgEncerramentoFinal() {
+  return (
+    "Fechado.\n\n" +
+    "• Qualquer dúvida sobre o atendimento, é só me chamar que eu te respondo por aqui.\n" +
+    "• Se precisar remarcar, tranquilo — só peço *aviso com 48h de antecedência*.\n\n" +
+    "Obrigado por confiar no meu trabalho. Vai ficar um trampo bem forte e bem executado."
+  );
+}
+
+// ✅ cuidados pré sessão
+function msgCuidadosPreSessao() {
+  return (
+    "Antes da sessão, pra sua experiência ser a melhor possível e a pele responder bem:\n\n" +
+    "• Beba bastante água no dia anterior e no dia da sessão.\n" +
+    "• Hidrate a pele da região (creme hidratante comum) por alguns dias antes.\n" +
+    "• Evite álcool no dia anterior.\n" +
+    "• Se alimente bem antes de vir (refeição completa).\n\n" +
+    "Isso ajuda na resistência, no conforto durante a sessão e no resultado final."
+  );
+}
+
+// ✅ regra black & grey
+function msgSoBlackGrey() {
+  return (
+    "Perfeito — só um detalhe importante pra alinhar direitinho.\n\n" +
+    "• Eu trabalho com *black & grey* (preto e cinza).\n" +
+    "• Não faço tatuagem totalmente colorida — no máximo *pequenos detalhes* (ex: olhos ou pontos específicos), quando combina com o projeto.\n\n" +
+    "Se você curtir a ideia em preto e cinza, eu sigo e deixo o desenho com muita profundidade e contraste."
+  );
+}
+
+function msgFinalizaPorNaoAceitarBW() {
+  return (
+    "Entendi.\n\n" +
+    "• Como eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender do jeito que você quer em colorido.\n\n" +
+    "Obrigado por me chamar e fico à disposição caso você decida fazer em preto e cinza no futuro."
+  );
+}
+
+// ✅ endereço do estúdio
+function msgEndereco() {
+  return (
+    "Claro.\n\n" +
+    "• Endereço: *Av. Mauá, 1308* — próximo à rodoviária.\n" +
+    "• É um estúdio *privado e aconchegante*, pensado pra você ter uma experiência confortável e focada no resultado.\n\n" +
+    "Se quiser, me diz seu bairro que eu te passo uma referência rápida de como chegar."
+  );
+}
+
+// ✅ troca a “última msg repetitiva” por “ficou alguma dúvida?”
+function msgChecagemDuvidas() {
+  return (
+    "Perfeito.\n\n" +
+    "• Ficou alguma dúvida sobre o atendimento?\n" +
+    "Se não ficou, tá tudo certo — eu fico à disposição."
+  );
 }
 
 // -------------------- Routes --------------------
 app.get("/", (_req, res) => res.status(200).send("OK"));
+
 app.get("/health", (_req, res) => {
   const miss = missingEnvs();
   res.status(miss.length ? 500 : 200).json({
@@ -466,6 +573,7 @@ app.get("/health", (_req, res) => {
       ZAPI_INSTANCE_TOKEN: !!ENV.ZAPI_INSTANCE_TOKEN,
       ZAPI_CLIENT_TOKEN: !!ENV.ZAPI_CLIENT_TOKEN,
       PIX_KEY: !!ENV.PIX_KEY,
+      OWNER_PHONE: !!ENV.OWNER_PHONE,
     },
   });
 });
@@ -494,28 +602,31 @@ app.post("/zapi", async (req, res) => {
     if (!phone) return;
     if (fromMe) return;
 
-    // ✅ RESET atendimento (zera sessão)
-    if (isResetCommand(message)) {
-      delete sessions[phone];
-      const s = getSession(phone);
-      const reply =
-        "Fechado — vamos começar do zero.\n\n" +
-        "Me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.\n" +
-        "Se souber o tamanho aproximado, melhor — mas se não souber, sem problema.";
-      if (!antiRepeat(s, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
     const session = getSession(phone);
     const lower = (message || "").toLowerCase();
 
-    // ✅ responder “Qual o pix?” sem bagunçar fluxo
-    if (isAskingPix(message)) {
-      const pix = ENV.PIX_KEY ? `Chave Pix: ${ENV.PIX_KEY}` : "Minha chave Pix não está cadastrada aqui no sistema.";
+    // ✅ comando reset/reiniciar atendimento
+    if (/^reset$|^reiniciar$|^reinicia$|^começar\s*novamente$|^comecar\s*novamente$/i.test(lower)) {
+      resetSession(phone);
+      const s2 = getSession(phone);
       const reply =
-        `${pix}\n\n` +
-        "Pra reservar teu horário eu peço um *sinal de R$ 50*.\n" +
-        "Assim que confirmar e me mandar o comprovante, eu já te passo as opções de agenda certinhas.";
+        "Perfeito.\n\n" +
+        "• Atendimento reiniciado.\n" +
+        "Me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.";
+      if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    // ✅ endereço
+    if (askedAddress(message)) {
+      const reply = msgEndereco();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    // ✅ se cliente pedir pix
+    if (askedPix(message)) {
+      const reply = msgPixDireto();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
@@ -531,78 +642,12 @@ app.post("/zapi", async (req, res) => {
     const maybeSizeLoc = extractSizeLocation(message);
     if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
 
-    // etapa agenda (após sinal confirmado)
-    if (session.stage === "agenda") {
-      const pref = parseSchedulePref(message || "");
-      if (pref.shift) session.schedulePref.shift = pref.shift;
-      if (pref.dateText) session.schedulePref.dateText = pref.dateText;
-
-      if (!session.askedSchedule) {
-        const r = msgPerguntaAgenda();
-        if (!antiRepeat(session, r)) await zapiSendText(phone, r);
-        session.askedSchedule = true;
-        return;
-      }
-
-      if (session.schedulePref.shift || session.schedulePref.dateText) {
-        const shiftText =
-          session.schedulePref.shift === "pos"
-            ? "pós-comercial"
-            : session.schedulePref.shift === "comercial"
-              ? "comercial"
-              : "não informado";
-
-        const dateText = session.schedulePref.dateText || "não informado";
-
-        const reply =
-          "Perfeito. Vou conferir minha agenda e já te retorno com as opções mais próximas.\n\n" +
-          `Preferência de horário: *${shiftText}*\n` +
-          `Data: *${dateText}*`;
-
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.stage = "pos_agenda";
-        return;
-      }
-
-      const fallback =
-        "Show — só me confirma: você prefere *comercial* ou *pós-comercial*? E tem alguma *data* em mente?\n" +
-        "Se não tiver, eu te passo a *próxima data livre*.";
-      if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
-      return;
-    }
-
-    // confirmação de sinal/comprovante -> pergunta agenda (uma vez)
-    const depositByText = detectDepositConfirmation(message);
-    const depositByImageAfterQuote = Boolean(imageUrl) && (session.stage === "pos_orcamento" || session.sentQuote);
-
-    if (!session.depositConfirmed && (depositByText || depositByImageAfterQuote)) {
-      session.depositConfirmed = true;
-      session.stage = "agenda";
-      session.askedSchedule = false;
-
-      const reply = msgPerguntaAgenda();
+    // ✅ se o cliente falar de colorido em texto
+    if (!session.finished && detectColorIntentByText(message)) {
+      session.awaitingBWAnswer = true;
+      const reply = msgSoBlackGrey();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.askedSchedule = true;
-      return;
-    }
-
-    // imagem chegou -> salva e gera resumo (e reseta flags do orçamento, pq é nova referência)
-    if (imageUrl) {
-      try {
-        const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
-        session.imageDataUrl = dataUrl;
-
-        session.imageSummary = await describeImageForClient(dataUrl);
-
-        // Nova referência: reseta flags para permitir novo orçamento (uma vez só)
-        session.sentSummary = false;
-        session.sentPayments = false;
-        session.sentQuote = false;
-
-        session.stage = "aguardando_info";
-      } catch (e) {
-        console.error("[IMG] failed:", e?.message || e);
-      }
+      // não retorna, porque ele pode estar só perguntando; mas na prática deixa seguir
     }
 
     // criação
@@ -619,6 +664,79 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
+    // ✅ se está aguardando resposta de black & grey
+    if (session.awaitingBWAnswer) {
+      const bw = detectBWAccept(message);
+      if (bw === "no") {
+        session.finished = true;
+        session.stage = "finalizado";
+        const reply = msgFinalizaPorNaoAceitarBW();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+      if (bw === "yes") {
+        session.awaitingBWAnswer = false;
+        // segue fluxo normalmente
+      }
+    }
+
+    // ✅ confirmação por TEXTO sem foto: avisa que precisa da foto do comprovante
+    const depositTextOnly = detectDepositTextOnly(message);
+    const isAfterQuote = session.stage === "pos_orcamento" || session.sentQuote;
+
+    if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterQuote) {
+      const reply = msgAguardandoComprovante();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    // ✅ FOTO do comprovante (image) após orçamento => confirma e pergunta agenda + notifica OWNER
+    const depositByImageAfterQuote = Boolean(imageUrl) && isAfterQuote;
+
+    if (!session.depositConfirmed && depositByImageAfterQuote) {
+      session.depositConfirmed = true;
+      session.stage = "agenda";
+      session.askedSchedule = true;
+
+      await notifyOwner(
+        [
+          "⚠️ COMPROVANTE RECEBIDO (bot)",
+          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+          "• Próximo passo: você confirma agenda manualmente",
+        ].join("\n")
+      );
+
+      const reply = msgPerguntaAgenda();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    // ✅ imagem chegou (referência) -> salva e gera resumo
+    if (imageUrl) {
+      try {
+        const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
+        session.imageDataUrl = dataUrl;
+        session.imageSummary = await describeImageForClient(dataUrl);
+
+        // ✅ se a descrição indicar “colorida”, valida black & grey
+        if (detectColorIntentBySummary(session.imageSummary)) {
+          session.awaitingBWAnswer = true;
+          const reply = msgSoBlackGrey();
+          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+          // segue fluxo, mas travado até resposta (acima)
+        }
+
+        // Nova referência: reseta flags para permitir novo orçamento (uma vez só)
+        session.sentSummary = false;
+        session.sentPayments = false;
+        session.sentQuote = false;
+
+        session.stage = "aguardando_info";
+      } catch (e) {
+        console.error("[IMG] failed:", e?.message || e);
+      }
+    }
+
     // fluxo inicial
     if (session.stage === "inicio") {
       const reply = msgInicio();
@@ -631,7 +749,7 @@ app.post("/zapi", async (req, res) => {
     if (session.stage === "aguardando_referencia") {
       if (!session.imageDataUrl) {
         const wantsPrice = /valor|preço|orc|orç|quanto/i.test(lower);
-        const reply = wantsPrice ? msgInicio() : "Me manda a referência em *imagem* pra eu avaliar certinho 🙏";
+        const reply = wantsPrice ? msgInicio() : "• Me manda a referência em *imagem* pra eu avaliar certinho.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
@@ -646,16 +764,18 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
+      // 1) explica o valor do trabalho (UMA VEZ)
       if (!session.sentSummary && session.imageSummary) {
         const intro =
-          "Perfeito, recebi a referência.\n" +
-          "Antes de falar de valor, deixa eu te explicar o que esse projeto exige pra ficar bem feito:\n\n" +
+          "Perfeito, recebi a referência.\n\n" +
+          "• Antes de falar de valor, deixa eu te explicar o que esse projeto exige pra ficar bem feito:\n\n" +
           session.imageSummary;
 
         if (!antiRepeat(session, intro)) await zapiSendText(phone, intro);
         session.sentSummary = true;
       }
 
+      // 2) calcula orçamento
       const infoParaCalculo =
         session.sizeLocation ||
         (session.bodyRegion ? `Região do corpo: ${session.bodyRegion} (tamanho não informado)` : "não informado");
@@ -664,12 +784,14 @@ app.post("/zapi", async (req, res) => {
       const sessoes = sessionsFromHours(hours);
       const valor = calcPriceFromHours(hours);
 
+      // 3) pagamentos e sessões (UMA VEZ)
       if (!session.sentPayments) {
         const bloco = msgPagamentosESessoes(sessoes);
         if (!antiRepeat(session, bloco)) await zapiSendText(phone, bloco);
         session.sentPayments = true;
       }
 
+      // 4) valor (UMA VEZ)
       if (!session.sentQuote) {
         const final = msgFechamentoValor(valor);
         if (!antiRepeat(session, final)) await zapiSendText(phone, final);
@@ -677,33 +799,75 @@ app.post("/zapi", async (req, res) => {
       }
 
       session.stage = "pos_orcamento";
-      session.askedDoubts = false; // ✅ reseta pra fazer a pergunta de dúvidas 1x
+      return;
+    }
+
+    // ✅ etapa agenda (após comprovante por FOTO)
+    if (session.stage === "agenda") {
+      // captura preferências e encerra pro manual
+      const pref = detectCommercialPref(message);
+      const hasDate = detectHasSpecificDate(message);
+      const noDate = detectNoSpecificDate(message);
+
+      if (pref || hasDate || noDate) {
+        session.scheduleCaptured = true;
+        session.manualHandoff = true;
+        session.stage = "pos_agenda_manual";
+
+        if (noDate && !hasDate) {
+          const reply = [msgVouVerificarAgendaSemData(), "", msgCuidadosPreSessao(), "", msgEncerramentoFinal()].join("\n\n");
+          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+          return;
+        }
+
+        if (hasDate) {
+          const reply = [msgVouVerificarAgendaComData(), "", msgCuidadosPreSessao(), "", msgEncerramentoFinal()].join("\n\n");
+          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+          return;
+        }
+
+        // se só falou comercial/pós mas não disse data e nem pediu próximo horário
+        const reply =
+          "Perfeito.\n\n" +
+          "• Vou verificar minha agenda e já te retorno com opções de *data e horário*.\n\n" +
+          msgCuidadosPreSessao() +
+          "\n\n" +
+          msgEncerramentoFinal();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
+      // se ainda não respondeu direito
+      const reply = msgPerguntaAgenda();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
     // pós orçamento
     if (session.stage === "pos_orcamento") {
+      // se o cliente tentar “fechar” mas não mandar comprovante: reforça sinal + foto
+      if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
+        const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+        const reply =
+          "Fechado.\n\n" +
+          "• Pra reservar teu horário eu peço um *sinal de R$ 50*.\n" +
+          pixLine +
+          "• Assim que você enviar a *foto do comprovante* aqui, eu confirmo o agendamento e seguimos pra agenda.";
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
       if (/mensal|por mês|dividir|parcelar por mês/i.test(lower)) {
         const reply =
-          "Dá sim.\n" +
-          "Quando fica pesado pagar tudo de uma vez, eu consigo organizar em *sessões mensais*.\n" +
-          "Aí o total ajusta um pouco por ficar parcelado por sessão.\n" +
+          "Dá sim.\n\n" +
+          "• Quando fica pesado pagar tudo de uma vez, eu consigo organizar em *sessões mensais*.\n" +
+          "• O total ajusta um pouco por virar um atendimento em etapas.\n\n" +
           "Me diz em quantos meses você prefere que eu já te proponho o formato certinho.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
-        const pixLine = ENV.PIX_KEY ? `\nChave Pix: ${ENV.PIX_KEY}` : "";
-        const reply =
-          "Fechado.\n" +
-          "Pra reservar teu horário eu peço um *sinal de R$ 50*." +
-          pixLine +
-          "\nAssim que cair, me manda o comprovante aqui que eu já te passo as opções de agenda certinhas.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
+      // se cliente mandar mais info de local/tamanho depois, recalcula
       if (maybeRegion || maybeSizeLoc) {
         session.sentPayments = false;
         session.sentQuote = false;
@@ -713,33 +877,18 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      // ✅ AQUI: troca a mensagem final repetitiva por “ficou alguma dúvida…”
-      if (isNoDoubt(message)) {
-        const reply = msgSemDuvidas();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        // mantém em pos_orcamento, mas não fica cutucando
-        session.askedDoubts = true;
-        return;
-      }
-
-      if (isHasDoubt(message)) {
-        const reply = msgPedirDuvida();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.askedDoubts = true;
-        return;
-      }
-
-      if (!session.askedDoubts) {
-        const reply = msgDuvidasAtendimento();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.askedDoubts = true;
-        return;
-      }
-
-      // se já perguntou dúvidas e o cliente manda “oi”/mensagem solta, não repete blocos
-      const reply =
-        "Perfeito. Se você quiser, me diz o que você tem em mente (ou manda a referência) e eu te oriento certinho por aqui.";
+      // ✅ mensagem final do atendimento (não repetir “local no corpo”)
+      const reply = msgChecagemDuvidas();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    // ✅ quando o cliente agradecer no fim, agradece e encerra
+    if ((session.stage === "pos_agenda_manual" || session.manualHandoff) && detectThanks(message)) {
+      const reply = msgEncerramentoFinal();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.finished = true;
+      session.stage = "finalizado";
       return;
     }
 
