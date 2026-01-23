@@ -1540,91 +1540,6 @@ app.listen(Number(ENV.PORT), () => {
   console.log("Server running on port", ENV.PORT);
 });
 
-// --- Ajuste: tentar puxar nome do contato (se o Z-API enviar) ---
-function parseZapiInbound(body) {
-  const phone =
-    body?.phone ||
-    body?.from ||
-    body?.sender ||
-    body?.senderPhone ||
-    body?.remoteJid ||
-    body?.chatId ||
-    body?.data?.phone ||
-    body?.data?.from ||
-    null;
-
-  const message =
-    body?.message ||
-    body?.text?.message ||
-    body?.text ||
-    body?.Body ||
-    body?.data?.message ||
-    body?.data?.text ||
-    "";
-
-  const imageUrl =
-    body?.image?.imageUrl ||
-    body?.image?.url ||
-    body?.imageUrl ||
-    body?.message?.image?.url ||
-    body?.media?.url ||
-    body?.data?.image?.imageUrl ||
-    body?.data?.imageUrl ||
-    body?.data?.mediaUrl ||
-    null;
-
-  const imageMime =
-    body?.image?.mimeType ||
-    body?.image?.mimetype ||
-    body?.mimeType ||
-    body?.data?.mimeType ||
-    "image/jpeg";
-
-  const fromMe = Boolean(body?.fromMe || body?.data?.fromMe);
-
-  const messageType =
-    body?.messageType ||
-    body?.type ||
-    body?.data?.messageType ||
-    body?.data?.type ||
-    "";
-
-  // ✅ tenta extrair nome
-  const contactName =
-    body?.senderName ||
-    body?.pushName ||
-    body?.contact?.name ||
-    body?.data?.senderName ||
-    body?.data?.pushName ||
-    body?.data?.contact?.name ||
-    null;
-
-  return {
-    phone: phone ? String(phone) : null,
-    message: String(message || "").trim(),
-    imageUrl: imageUrl ? String(imageUrl) : null,
-    imageMime: String(imageMime || "image/jpeg"),
-    fromMe,
-    messageType: String(messageType || ""),
-    contactName: contactName ? String(contactName).trim() : null,
-    raw: body,
-  };
-}
-
-// --- Ajuste: session com campos extras (adicione dentro do getSession) ---
-/*
-Dentro do getSession(phone), no objeto sessions[phone], adicione:
-  greeted: false,
-  greetVariant: null,
-  closingVariant: null,
-  clientProfile: null,
-  sentProfileMsg: false,
-  sentNeedRefMsg: false,
-  askedDoubts: false,
-  lastOwnerNotifyAt: 0,
-*/
-
-// -------------------- util simples --------------------
 function pickOne(arr) {
   if (!Array.isArray(arr) || !arr.length) return null;
   return arr[Math.floor(Math.random() * arr.length)];
@@ -1633,9 +1548,7 @@ function pickOne(arr) {
 function safeName(name) {
   const n = String(name || "").trim();
   if (!n) return "";
-  // evita nomes gigantes / lixo
   if (n.length > 24) return n.slice(0, 24);
-  // evita "undefined"
   if (/undefined|null|unknown/i.test(n)) return "";
   return n;
 }
@@ -1693,12 +1606,12 @@ function classifyClientProfile(text, hasImage) {
     /refer[eê]ncia|referencia|foto|imagem|print|pose|estilo|artista|igual|id[eê]ntic|realista|black\s*&\s*grey|whip|fineline|tra[cç]o|sombras/i.test(t)
   ) return "arquiteto";
 
-  // Explorador: tem uma ideia geral + pede ajuda pra criar
+  // Explorador: ideia geral + pede ajuda pra desenvolver
   if (
-    /quero\s*um|quero\s*algo|ideia\s*geral|m[ií]stic|animal|le[oã]o|tigre|lobo|medusa|jesus|anjo|santo|samurai|viking|caveira|olho|rosa|simbol|conceito|me\s*ajuda\s*a\s*criar|criar\s*um\s*conceito/i.test(t)
+    /quero\s*um|quero\s*algo|ideia\s*geral|m[ií]stic|animal|le[oã]o|tigre|lobo|medusa|jesus|anjo|santo|samurai|viking|caveira|olho|simbol|conceito|me\s*ajuda\s*a\s*criar|criar\s*um\s*conceito/i.test(t)
   ) return "explorador";
 
-  // Sonhador: sentimento, significado, abstrato
+  // Sonhador: sentimento / significado abstrato
   if (
     /signific|represent|liberdade|supera[cç][aã]o|for[cç]a|fam[ií]lia|prote[cç][aã]o|f[eé]|renascimento|mudan[cç]a|fase|hist[oó]ria|lembran[cç]a|homenagem/i.test(t)
   ) return "sonhador";
@@ -1770,8 +1683,8 @@ function msgDorResposta() {
     "Entendo perfeitamente — essa dúvida é super comum.\n\n" +
     "• A sensação varia de pessoa pra pessoa e depende bastante da região.\n" +
     "• A maioria dos meus clientes descreve mais como uma *ardência / arranhão intenso* do que uma dor absurda.\n" +
-    "• Eu trabalho com ritmo e pausas pra você ficar confortável, e a ideia é você ter uma experiência tranquila.\n\n" +
-    "Se você me disser a área do corpo, eu te falo as regiões mais tranquilas e as mais sensíveis pra você decidir com segurança."
+    "• Eu trabalho com ritmo e pausas pra você ficar confortável.\n\n" +
+    "Me diz a área do corpo que você pensa e eu te falo as regiões mais tranquilas e as mais sensíveis pra você decidir com segurança."
   );
 }
 
@@ -1803,7 +1716,8 @@ function msgHesitacaoResposta() {
 }
 
 // -------------------- ORÇAMENTO (unificado e na ordem correta) --------------------
-function msgFechamentoValor(valor, sessoes) {
+// ✅ RENOMEADO pra não bater com a função msgFechamentoValor(valor) que já existe no seu app.js
+function msgFechamentoValorOrcamento(valor, sessoes) {
   const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
@@ -1818,9 +1732,9 @@ function msgFechamentoValor(valor, sessoes) {
 
 // -------------------- HANDOFF manual (quando não tem configurado) --------------------
 async function handoffToManual(phone, session, motivo, mensagemCliente) {
-  // evita spam de notifyOwner em loop
   const now = Date.now();
   if (!session.lastOwnerNotifyAt) session.lastOwnerNotifyAt = 0;
+
   if (now - session.lastOwnerNotifyAt > 30_000) {
     session.lastOwnerNotifyAt = now;
     await notifyOwner(
