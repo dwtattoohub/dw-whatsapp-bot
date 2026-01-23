@@ -5,6 +5,7 @@
 // ZAPI_INSTANCE_TOKEN
 // ZAPI_CLIENT_TOKEN
 // (opcional) SYSTEM_PROMPT
+// (opcional) PIX_KEY
 
 import express from "express";
 import OpenAI from "openai";
@@ -19,6 +20,7 @@ const ENV = {
   ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN || "",
   ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || "",
   SYSTEM_PROMPT: process.env.SYSTEM_PROMPT || "",
+  PIX_KEY: process.env.PIX_KEY || "",
   PORT: process.env.PORT || "10000",
 };
 
@@ -46,9 +48,18 @@ function getSession(phone) {
       sentPayments: false,
       sentQuote: false,
 
-      // NOVO: etapa de sinal/agenda
+      // etapa de sinal/agenda
       depositConfirmed: false,
       askedSchedule: false,
+
+      // (ADICIONADO) preferências de agenda
+      schedulePref: {
+        shift: null,  // "comercial" | "pos"
+        dateText: null, // texto livre / "próxima data disponível"
+      },
+
+      // ✅ (ADICIONADO) pós-orçamento: dúvidas
+      askedDoubts: false,
 
       // anti loop básico
       lastReply: null,
@@ -202,7 +213,6 @@ function extractSizeLocation(text) {
 function extractBodyRegion(text) {
   const t = (text || "").toLowerCase();
 
-  // mapeia regiões importantes (pode adicionar mais)
   const regions = [
     "mão", "mao", "dedo", "punho", "antebraço", "antebraco", "braço", "braco",
     "ombro", "peito", "costela", "pescoço", "pescoco", "nuca",
@@ -214,7 +224,6 @@ function extractBodyRegion(text) {
 
   for (const r of regions) {
     if (t.includes(r)) {
-      // normaliza variações
       if (r === "mao") return "mão";
       if (r === "pescoco") return "pescoço";
       if (r === "pe") return "pé";
@@ -228,13 +237,12 @@ function extractBodyRegion(text) {
   return null;
 }
 
-// NOVO: detectar confirmação de sinal/comprovante
 function detectDepositConfirmation(text) {
   const t = (text || "").toLowerCase();
   return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(t);
 }
 
-// NOVO: pergunta de agenda (comercial vs pós + data)
+// ✅ AJUSTE: pergunta de agenda completa
 function msgPerguntaAgenda() {
   return (
     "Perfeito — sinal confirmado.\n\n" +
@@ -245,16 +253,60 @@ function msgPerguntaAgenda() {
   );
 }
 
+// ✅ (ADICIONADO) detectar comandos de reset
+function isResetCommand(text = "") {
+  const t = String(text || "").trim().toLowerCase();
+  return /^(reset|reiniciar|começar novamente|comecar novamente|recomeçar|recomecar)$/i.test(t);
+}
+
+// ✅ (ADICIONADO) extrair preferência de horário e data na etapa de agenda
+function parseSchedulePref(text = "") {
+  const t = String(text || "").toLowerCase();
+
+  let shift = null;
+  if (/(p[oó]s|pos)[-\s]?comercial|noite|depois do trabalho|ap[oó]s o trabalho|p[oó]s[-\s]?hor[aá]rio/i.test(t)) {
+    shift = "pos";
+  } else if (/comercial|hor[aá]rio comercial|manh[aã]|tarde/i.test(t)) {
+    shift = "comercial";
+  }
+
+  let dateText = null;
+  if (/pr[oó]xima|proxima|sem prefer[eê]ncia|sem preferencia|qualquer dia|tanto faz/i.test(t)) {
+    dateText = "próxima data disponível";
+  } else if (/\d{1,2}\/\d{1,2}|\d{1,2}-\d{1,2}|segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo/i.test(t)) {
+    dateText = String(text || "").trim();
+  }
+
+  return { shift, dateText };
+}
+
+// ✅ (ADICIONADO) detectar pedido de pix
+function isAskingPix(text = "") {
+  const t = String(text || "").toLowerCase();
+  return /qual\s*o\s*pix|chave\s*pix|me\s*passa\s*o\s*pix|pix\??$/i.test(t);
+}
+
+// ✅ (ADICIONADO) detectar resposta “sem dúvida”
+function isNoDoubt(text = "") {
+  const t = String(text || "").toLowerCase().trim();
+  return /^(n[aã]o|nao)\s*(tenho|tem)\s*(d[uú]vida|duvidas)\b|sem\s*d[uú]vida|sem\s*duvidas|tudo\s*certo|tranquilo|ok|de boa|show|fechado|beleza|perfeito$/i.test(t);
+}
+
+// ✅ (ADICIONADO) detectar resposta “tenho dúvida”
+function isHasDoubt(text = "") {
+  const t = String(text || "").toLowerCase();
+  return /(tenho|com)\s*d[uú]vida|d[uú]vida|duvida/i.test(t);
+}
+
 // Nova regra de preço:
 function calcPriceFromHours(hours) {
   const h = Math.max(1, Math.round(Number(hours) || 1));
-  // 1ª hora = 150, demais = 120
   return 150 + Math.max(0, h - 1) * 120;
 }
 
 function sessionsFromHours(hours) {
   const h = Math.max(1, Number(hours) || 1);
-  return Math.ceil(h / 7); // nunca passa de 7h por sessão
+  return Math.ceil(h / 7);
 }
 
 // -------------------- OpenAI prompts --------------------
@@ -374,12 +426,31 @@ function msgPagamentosESessoes(sessoes) {
   );
 }
 
+// ✅ AJUSTE: sinal é R$ 50 + mostra chave Pix
 function msgFechamentoValor(valor) {
+  const pixLine = ENV.PIX_KEY ? `Chave Pix: ${ENV.PIX_KEY}\n` : "";
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
-    "Se fizer sentido pra você, pra reservar o horário eu peço um *sinal de R$ 100*.\n" +
-    "Aí eu já te mando as opções de agenda certinhas."
+    "Se fizer sentido pra você, pra reservar o horário eu peço um *sinal de R$ 50*.\n" +
+    pixLine +
+    "Assim que confirmar e me mandar o comprovante aqui, eu já te passo as opções de agenda certinhas."
   );
+}
+
+// ✅ (ADICIONADO) pós-orçamento: pergunta de dúvidas
+function msgDuvidasAtendimento() {
+  return "Ficou alguma dúvida sobre o atendimento?";
+}
+
+function msgSemDuvidas() {
+  return (
+    "Perfeito — obrigado.\n" +
+    "Qualquer coisa que você precisar, é só me chamar por aqui. Fico à disposição."
+  );
+}
+
+function msgPedirDuvida() {
+  return "Pode me falar qual é a tua dúvida que eu te explico certinho por aqui.";
 }
 
 // -------------------- Routes --------------------
@@ -394,6 +465,7 @@ app.get("/health", (_req, res) => {
       ZAPI_INSTANCE_ID: !!ENV.ZAPI_INSTANCE_ID,
       ZAPI_INSTANCE_TOKEN: !!ENV.ZAPI_INSTANCE_TOKEN,
       ZAPI_CLIENT_TOKEN: !!ENV.ZAPI_CLIENT_TOKEN,
+      PIX_KEY: !!ENV.PIX_KEY,
     },
   });
 });
@@ -422,8 +494,31 @@ app.post("/zapi", async (req, res) => {
     if (!phone) return;
     if (fromMe) return;
 
+    // ✅ RESET atendimento (zera sessão)
+    if (isResetCommand(message)) {
+      delete sessions[phone];
+      const s = getSession(phone);
+      const reply =
+        "Fechado — vamos começar do zero.\n\n" +
+        "Me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.\n" +
+        "Se souber o tamanho aproximado, melhor — mas se não souber, sem problema.";
+      if (!antiRepeat(s, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
     const session = getSession(phone);
     const lower = (message || "").toLowerCase();
+
+    // ✅ responder “Qual o pix?” sem bagunçar fluxo
+    if (isAskingPix(message)) {
+      const pix = ENV.PIX_KEY ? `Chave Pix: ${ENV.PIX_KEY}` : "Minha chave Pix não está cadastrada aqui no sistema.";
+      const reply =
+        `${pix}\n\n` +
+        "Pra reservar teu horário eu peço um *sinal de R$ 50*.\n" +
+        "Assim que confirmar e me mandar o comprovante, eu já te passo as opções de agenda certinhas.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
 
     // intents
     if (detectCoverup(message)) session.isCoverup = true;
@@ -436,14 +531,54 @@ app.post("/zapi", async (req, res) => {
     const maybeSizeLoc = extractSizeLocation(message);
     if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
 
-    // NOVO: confirmação de sinal/comprovante -> pergunta agenda (uma vez)
-    // - se veio texto confirmando, ou veio imagem depois do orçamento (muito comum ser comprovante)
+    // etapa agenda (após sinal confirmado)
+    if (session.stage === "agenda") {
+      const pref = parseSchedulePref(message || "");
+      if (pref.shift) session.schedulePref.shift = pref.shift;
+      if (pref.dateText) session.schedulePref.dateText = pref.dateText;
+
+      if (!session.askedSchedule) {
+        const r = msgPerguntaAgenda();
+        if (!antiRepeat(session, r)) await zapiSendText(phone, r);
+        session.askedSchedule = true;
+        return;
+      }
+
+      if (session.schedulePref.shift || session.schedulePref.dateText) {
+        const shiftText =
+          session.schedulePref.shift === "pos"
+            ? "pós-comercial"
+            : session.schedulePref.shift === "comercial"
+              ? "comercial"
+              : "não informado";
+
+        const dateText = session.schedulePref.dateText || "não informado";
+
+        const reply =
+          "Perfeito. Vou conferir minha agenda e já te retorno com as opções mais próximas.\n\n" +
+          `Preferência de horário: *${shiftText}*\n` +
+          `Data: *${dateText}*`;
+
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        session.stage = "pos_agenda";
+        return;
+      }
+
+      const fallback =
+        "Show — só me confirma: você prefere *comercial* ou *pós-comercial*? E tem alguma *data* em mente?\n" +
+        "Se não tiver, eu te passo a *próxima data livre*.";
+      if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
+      return;
+    }
+
+    // confirmação de sinal/comprovante -> pergunta agenda (uma vez)
     const depositByText = detectDepositConfirmation(message);
     const depositByImageAfterQuote = Boolean(imageUrl) && (session.stage === "pos_orcamento" || session.sentQuote);
 
     if (!session.depositConfirmed && (depositByText || depositByImageAfterQuote)) {
       session.depositConfirmed = true;
       session.stage = "agenda";
+      session.askedSchedule = false;
 
       const reply = msgPerguntaAgenda();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -451,7 +586,7 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // 0) imagem chegou -> salva e gera resumo (e reseta flags de envio do orçamento, pq é nova referência)
+    // imagem chegou -> salva e gera resumo (e reseta flags do orçamento, pq é nova referência)
     if (imageUrl) {
       try {
         const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
@@ -464,7 +599,6 @@ app.post("/zapi", async (req, res) => {
         session.sentPayments = false;
         session.sentQuote = false;
 
-        // Mantém no fluxo de fechar orçamento
         session.stage = "aguardando_info";
       } catch (e) {
         console.error("[IMG] failed:", e?.message || e);
@@ -504,7 +638,7 @@ app.post("/zapi", async (req, res) => {
       session.stage = "aguardando_info";
     }
 
-    // com imagem, mas faltam infos mínimas: pelo menos local/região
+    // com imagem, mas faltam infos mínimas
     if (session.imageDataUrl && session.stage === "aguardando_info") {
       if (!session.bodyRegion && !session.sizeLocation) {
         const reply = msgPedirLocalOuTamanho();
@@ -512,7 +646,6 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      // 1) explica o valor do trabalho (UMA VEZ)
       if (!session.sentSummary && session.imageSummary) {
         const intro =
           "Perfeito, recebi a referência.\n" +
@@ -523,7 +656,6 @@ app.post("/zapi", async (req, res) => {
         session.sentSummary = true;
       }
 
-      // 2) calcula orçamento (com tamanho OU só região)
       const infoParaCalculo =
         session.sizeLocation ||
         (session.bodyRegion ? `Região do corpo: ${session.bodyRegion} (tamanho não informado)` : "não informado");
@@ -532,14 +664,12 @@ app.post("/zapi", async (req, res) => {
       const sessoes = sessionsFromHours(hours);
       const valor = calcPriceFromHours(hours);
 
-      // 3) pagamentos e sessões (UMA VEZ)
       if (!session.sentPayments) {
         const bloco = msgPagamentosESessoes(sessoes);
         if (!antiRepeat(session, bloco)) await zapiSendText(phone, bloco);
         session.sentPayments = true;
       }
 
-      // 4) valor (UMA VEZ)
       if (!session.sentQuote) {
         const final = msgFechamentoValor(valor);
         if (!antiRepeat(session, final)) await zapiSendText(phone, final);
@@ -547,22 +677,11 @@ app.post("/zapi", async (req, res) => {
       }
 
       session.stage = "pos_orcamento";
+      session.askedDoubts = false; // ✅ reseta pra fazer a pergunta de dúvidas 1x
       return;
     }
 
-    // NOVO: etapa agenda (após sinal confirmado)
-    if (session.stage === "agenda") {
-      // Se o cliente respondeu algo, você pode só agradecer e dizer que vai confirmar (sem forçar outra lógica).
-      // Mantém simples pra não quebrar o que já funcionava.
-      const reply =
-        "Fechado.\n" +
-        "Me passa essas informações (horário e data) que eu já organizo e te confirmo o melhor encaixe disponível.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.stage = "pos_agenda";
-      return;
-    }
-
-    // pós orçamento: NÃO repetir blocos; só responder conforme intenção
+    // pós orçamento
     if (session.stage === "pos_orcamento") {
       if (/mensal|por mês|dividir|parcelar por mês/i.test(lower)) {
         const reply =
@@ -575,17 +694,17 @@ app.post("/zapi", async (req, res) => {
       }
 
       if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
+        const pixLine = ENV.PIX_KEY ? `\nChave Pix: ${ENV.PIX_KEY}` : "";
         const reply =
           "Fechado.\n" +
-          "Pra reservar teu horário eu peço um *sinal de R$ 100*.\n" +
-          "Assim que cair, me manda o comprovante aqui que eu já te passo as opções de agenda certinhas.";
+          "Pra reservar teu horário eu peço um *sinal de R$ 50*." +
+          pixLine +
+          "\nAssim que cair, me manda o comprovante aqui que eu já te passo as opções de agenda certinhas.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      // Se o cliente mandar mais info de local/tamanho depois, libera novo cálculo (sem spam)
       if (maybeRegion || maybeSizeLoc) {
-        // reset somente do quote (pra recalcular uma vez)
         session.sentPayments = false;
         session.sentQuote = false;
         session.stage = "aguardando_info";
@@ -594,9 +713,32 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
+      // ✅ AQUI: troca a mensagem final repetitiva por “ficou alguma dúvida…”
+      if (isNoDoubt(message)) {
+        const reply = msgSemDuvidas();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        // mantém em pos_orcamento, mas não fica cutucando
+        session.askedDoubts = true;
+        return;
+      }
+
+      if (isHasDoubt(message)) {
+        const reply = msgPedirDuvida();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        session.askedDoubts = true;
+        return;
+      }
+
+      if (!session.askedDoubts) {
+        const reply = msgDuvidasAtendimento();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        session.askedDoubts = true;
+        return;
+      }
+
+      // se já perguntou dúvidas e o cliente manda “oi”/mensagem solta, não repete blocos
       const reply =
-        "Perfeito.\n" +
-        "Se você quiser, me confirma só o *local no corpo* (e o tamanho, se souber) pra eu ajustar tudo certinho — ou me diz se prefere seguir com esse formato mesmo.";
+        "Perfeito. Se você quiser, me diz o que você tem em mente (ou manda a referência) e eu te oriento certinho por aqui.";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
