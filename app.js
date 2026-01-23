@@ -40,6 +40,11 @@ function getSession(phone) {
     sessions[phone] = {
       stage: "inicio",
 
+      // triagem primeiro contato
+      triageAsked: false,
+      triageAttempts: 0,
+      isOngoingWithOwner: null, // true/false
+
       // referência / info
       imageDataUrl: null,
       imageSummary: null,
@@ -47,33 +52,28 @@ function getSession(phone) {
       bodyRegion: null,
       isCoverup: false,
 
-      // perfil
-      greeted: false,
-      greetVariant: null,
-      closingVariant: null,
-      clientProfile: null,
-      sentProfileMsg: false,
-
-      // ordem / flags
+      // fluxo
       sentSummary: false,
       askedDoubts: false,
-      doubtsResolved: false,
       sentQuote: false,
 
       // sinal / agenda
       depositConfirmed: false,
-      askedSchedule: false,
-      scheduleCaptured: false,
       manualHandoff: false,
-
-      // controle
-      awaitingBWAnswer: false,
       finished: false,
       lastOwnerNotifyAt: 0,
 
-      // anti spam/loop
+      // controle de repetição
       lastReply: null,
       lastReplyAt: 0,
+
+      // controle de insistência (pra não ficar pedindo referência infinito)
+      askRefCount: 0,
+      askInfoCount: 0,
+      lastAskAt: 0,
+
+      // preto e cinza
+      awaitingBWAnswer: false,
     };
   }
   return sessions[phone];
@@ -231,11 +231,6 @@ async function fetchImageAsDataUrl(url, mimeHint = "image/jpeg") {
 }
 
 // -------------------- utils --------------------
-function pickOne(arr) {
-  if (!Array.isArray(arr) || !arr.length) return null;
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
 function safeName(name) {
   const n = String(name || "").trim();
   if (!n) return "";
@@ -244,57 +239,9 @@ function safeName(name) {
   return n;
 }
 
-// -------------------- GREETINGS / CLOSINGS --------------------
-const GREETINGS = [
-  (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tatuador, especializado em realismo preto e cinza e whip shading.\n\n` +
-    `Fico feliz em receber sua mensagem! Conta pra mim: qual é a sua ideia pra transformarmos em arte na pele?\n\n` +
-    `• Se tiver uma referência em *imagem*, já pode me mandar.\n` +
-    `• Me diz também *onde no corpo* você quer fazer e o *tamanho aproximado* (se souber).`,
-  (name) =>
-    `Opa${name ? `, ${name}` : ""}! Tudo certo?\n` +
-    `Aqui é o DW — trabalho com realismo *black & grey* e whip shading.\n\n` +
-    `Me conta tua ideia e o que você quer representar com essa tattoo.\n\n` +
-    `• Se tiver referência em *imagem*, manda.\n` +
-    `• Me diz *local no corpo* e *tamanho aproximado* (se souber).`,
-  (name) =>
-    `Olá${name ? `, ${name}` : ""}! Seja bem-vindo.\n` +
-    `Eu sou o DW, tatuador focado em realismo preto e cinza e um acabamento bem limpo.\n\n` +
-    `Quero entender direitinho pra te orientar do melhor jeito: qual é a tua ideia?\n\n` +
-    `• Se tiver referência em *imagem*, manda.\n` +
-    `• Local no corpo + tamanho aproximado ajudam muito.`
-];
-
-const CLOSINGS = [
-  () =>
-    `Perfeito.\n\n` +
-    `• Obrigado por confiar no meu trabalho.\n` +
-    `• Qualquer dúvida, é só me chamar.\n` +
-    `• Se precisar remarcar, tranquilo — só peço *48h de antecedência*.\n\n` +
-    `A gente se vê na sessão. Vai ficar um trampo muito forte.`,
-  () =>
-    `Fechado!\n\n` +
-    `• Valeu por fechar comigo.\n` +
-    `• Se surgir qualquer dúvida até o dia, me chama por aqui.\n` +
-    `• Remarcação: *48h de antecedência*.\n\n` +
-    `Agora é só chegar bem hidratado e alimentado que vai ser uma experiência top.`,
-  () =>
-    `Show.\n\n` +
-    `• Obrigado pela confiança.\n` +
-    `• Tô à disposição se precisar de qualquer ajuste ou tirar dúvidas.\n` +
-    `• Remarcação: *48h de antecedência*.\n\n` +
-    `Vai ficar com muita presença e acabamento limpo.`
-];
-
-function chooseGreetingOnce(session, contactName) {
-  if (!session.greetVariant) session.greetVariant = pickOne(GREETINGS) || GREETINGS[0];
-  const nm = safeName(contactName);
-  return session.greetVariant(nm);
-}
-
-function chooseClosingOnce(session) {
-  if (!session.closingVariant) session.closingVariant = pickOne(CLOSINGS) || CLOSINGS[0];
-  return session.closingVariant();
+function pickOne(arr) {
+  if (!Array.isArray(arr) || !arr.length) return null;
+  return arr[Math.floor(Math.random() * arr.length)];
 }
 
 // -------------------- Business rules --------------------
@@ -307,6 +254,7 @@ function extractSizeLocation(text) {
   const t = (text || "").trim();
   if (!t) return null;
   if (!/\d/.test(t)) return null;
+  // qualquer texto com número (ex: 10cm, 15x8, 20 cm)
   return t;
 }
 
@@ -320,6 +268,7 @@ function extractBodyRegion(text) {
     "coxa", "joelho", "virilha",
     "costas", "escápula", "escapula", "coluna",
     "rosto", "cabeça", "cabeca",
+    "perna", "pernas", "barriga", "abdomen", "abdômen", "biceps", "bíceps",
   ];
 
   for (const r of regions) {
@@ -335,12 +284,6 @@ function extractBodyRegion(text) {
     }
   }
   return null;
-}
-
-// comprovante confirmado só com FOTO (imageUrl) após orçamento
-function detectDepositTextOnly(text) {
-  const t = (text || "").toLowerCase();
-  return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(t);
 }
 
 function askedPix(text) {
@@ -371,86 +314,17 @@ function detectColorIntentBySummary(summary) {
 
 function detectBWAccept(text) {
   const t = (text || "").toLowerCase();
-  if (/sim|aceito|pode|fechado|bora|ok|topo|manda|vamo/i.test(t)) return "yes";
-  if (/não|nao|prefiro\s*color|quero\s*color|não\s*quero\s*preto|nao\s*quero\s*preto/i.test(t)) return "no";
+  if (/sim|aceito|pode|fechado|bora|ok|topo|manda|vamo|quero\s*preto|preto\s*e\s*cinza/i.test(t)) return "yes";
+  if (/não|nao|prefiro\s*color|quero\s*color|não\s*quero\s*preto|nao\s*quero\s*preto|quero\s*colorida/i.test(t)) return "no";
   return "";
 }
 
-// agenda
-function detectCommercialPref(text) {
+// comprovante confirmado só com FOTO (imageUrl) após orçamento
+function detectDepositTextOnly(text) {
   const t = (text || "").toLowerCase();
-  if (/(p[oó]s|pos)[ -]?comercial|noite|ap[oó]s\s*o\s*trabalho|depois\s*do\s*trabalho/i.test(t)) return "pos";
-  if (/comercial|manh[aã]|tarde|hor[aá]rio\s*comercial/i.test(t)) return "comercial";
-  return "";
+  return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(t);
 }
 
-function detectNoSpecificDate(text) {
-  const t = (text || "").toLowerCase();
-  return /pr[oó]xim[ao]\s*(hor[aá]rio|data)\s*(livre|dispon[ií]vel)|qualquer\s*data|pr[oó]xima\s*data|pode\s*marcar\s*no\s*pr[oó]ximo|o\s*que\s*voc[eê]\s*tiver/i.test(t);
-}
-
-function detectHasSpecificDate(text) {
-  const t = (text || "").toLowerCase();
-  return /(\d{1,2}\/\d{1,2})|(\d{1,2}\-\d{1,2})|dia\s*\d{1,2}|(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)/i.test(t);
-}
-
-// -------------------- PERFIL do cliente --------------------
-function classifyClientProfile(text, hasImage) {
-  const raw = String(text || "");
-  const t = raw.toLowerCase();
-
-  // se o cliente explicitamente disse que NÃO tem referência, não pode virar "arquiteto"
-  const saidNoReference =
-    /n[aã]o\s*tenho\s*refer[eê]ncia|sem\s*refer[eê]ncia|ainda\s*n[aã]o\s*tenho\s*refer[eê]ncia|n[aã]o\s*tenho\s*foto|sem\s*foto/i.test(t);
-
-  // com imagem = arquiteto (já tem referência real)
-  if (hasImage) return "arquiteto";
-
-  // arquiteto só quando fala de referência/igual/etc E NÃO negou referência
-  if (
-    !saidNoReference &&
-    /refer[eê]ncia|referencia|print|pose|igual|id[eê]ntic|id[eê]ntica|mesmo\s*estilo|mesma\s*tatuagem|quero\s*igual|fiel|realista|black\s*&\s*grey|whip|fineline|tra[cç]o|sombras/i.test(t)
-  ) return "arquiteto";
-
-  if (
-    /quero\s*um|quero\s*algo|ideia\s*geral|m[ií]stic|animal|le[oã]o|tigre|lobo|medusa|jesus|anjo|santo|samurai|viking|caveira|olho|simbol|conceito|me\s*ajuda\s*a\s*criar|criar\s*um\s*conceito/i.test(t)
-  ) return "explorador";
-
-  if (
-    /signific|represent|liberdade|supera[cç][aã]o|for[cç]a|fam[ií]lia|prote[cç][aã]o|f[eé]|renascimento|mudan[cç]a|fase|hist[oó]ria|lembran[cç]a|homenagem/i.test(t)
-  ) return "sonhador";
-
-  return "";
-}
-
-function msgPerfilArquiteto() {
-  return (
-    "Perfeito!\n\n" +
-    "• Me manda referências de estilo/pose e detalhes que você quer manter.\n" +
-    "• Aí eu adapto pro seu corpo com encaixe, proporção e leitura.\n\n" +
-    "O que você quer garantir nessa tattoo? (contraste, expressão, composição, tema…)"
-  );
-}
-
-function msgPerfilExplorador() {
-  return (
-    "Maravilha.\n\n" +
-    "• Me diz em 1 frase qual tema você curte (ex: leão, lobo, anjo, caveira…).\n" +
-    "• E qual vibe: mais agressiva, mais suave, mais sombria, mais clean?\n\n" +
-    "Depois disso eu te peço região + tamanho pra te passar um orçamento bem fiel."
-  );
-}
-
-function msgPerfilSonhador() {
-  return (
-    "Que massa essa ideia.\n\n" +
-    "• Me fala em palavras-chave o que essa tattoo precisa representar.\n" +
-    "• Se tiver algum símbolo que não pode faltar, me diz.\n\n" +
-    "Depois eu te peço região + tamanho pra fechar o orçamento certinho."
-  );
-}
-
-// -------------------- DÚVIDAS / INTENTS --------------------
 function askedPain(text) {
   const t = String(text || "").toLowerCase();
   return /do[ií]|d[oó]i\s*muito|vai\s*doer|dor|aguenta|sens[ií]vel|anest[eé]s|anestesia/i.test(t);
@@ -473,49 +347,25 @@ function askedHesitation(text) {
 
 function answeredNoDoubts(text) {
   const t = String(text || "").toLowerCase();
-  return /n[aã]o|nao|nenhuma|tudo\s*certo|tranquilo|fechado|sem\s*d[uú]vidas|ok|blz|beleza|deboa|de boa/i.test(t);
+  return /n[aã]o|nao|nenhuma|tudo\s*certo|tranquilo|fechado|sem\s*d[uú]vidas|ok|blz|beleza|deboa|de boa|suave/i.test(t);
 }
 
-function answeredHasDoubts(text) {
-  const t = String(text || "").toLowerCase();
-  return /tenho|sim|alguma|d[uú]vida|me\s*explica|n[aã]o\s*entendi|como\s*funciona|e\s*se/i.test(t);
+// agenda
+function detectCommercialPref(text) {
+  const t = (text || "").toLowerCase();
+  if (/(p[oó]s|pos)[ -]?comercial|noite|ap[oó]s\s*o\s*trabalho|depois\s*do\s*trabalho/i.test(t)) return "pos";
+  if (/comercial|manh[aã]|tarde|hor[aá]rio\s*comercial/i.test(t)) return "comercial";
+  return "";
 }
 
-// respostas rápidas
-function msgDorResposta() {
-  return (
-    "Entendo perfeitamente — essa dúvida é super comum.\n\n" +
-    "• A sensação varia de pessoa pra pessoa e depende bastante da região.\n" +
-    "• A maioria descreve mais como uma *ardência / arranhão intenso*.\n" +
-    "• Eu trabalho com ritmo e pausas pra você ficar confortável.\n\n" +
-    "Me diz a área do corpo que você pensa e eu te falo as regiões mais tranquilas e as mais sensíveis."
-  );
+function detectNoSpecificDate(text) {
+  const t = (text || "").toLowerCase();
+  return /pr[oó]xim[ao]\s*(hor[aá]rio|data)\s*(livre|dispon[ií]vel)|qualquer\s*data|pr[oó]xima\s*data|pode\s*marcar\s*no\s*pr[oó]ximo|o\s*que\s*voc[eê]\s*tiver/i.test(t);
 }
 
-function msgTempoResposta() {
-  return (
-    "Boa.\n\n" +
-    "• O tempo varia pelo *tamanho* e pelo *nível de detalhe* (transições, textura, contraste e acabamento).\n" +
-    "• Meu foco é manter qualidade e cicatrização correta.\n\n" +
-    "Me diz o local no corpo e o tamanho aproximado que eu te passo uma noção bem fiel."
-  );
-}
-
-function msgPrecoAntesDoValor() {
-  return (
-    "Boa pergunta.\n\n" +
-    "• Pra eu te passar um valor justo, eu preciso ver a referência em *imagem* e entender *onde no corpo* + *tamanho*.\n" +
-    "• Isso muda o nível de detalhe, sombras, encaixe e acabamento.\n\n" +
-    "Me manda a referência e essas infos que eu já te retorno com tudo alinhado."
-  );
-}
-
-function msgHesitacaoResposta() {
-  return (
-    "Tranquilo — é uma decisão importante mesmo.\n\n" +
-    "• O que tá te travando mais: desenho, orçamento ou data?\n" +
-    "• Se tiver uma data preferencial, me fala pra eu tentar priorizar um encaixe."
-  );
+function detectHasSpecificDate(text) {
+  const t = (text || "").toLowerCase();
+  return /(\d{1,2}\/\d{1,2})|(\d{1,2}\-\d{1,2})|dia\s*\d{1,2}|(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)/i.test(t);
 }
 
 // -------------------- Regras de preço --------------------
@@ -531,25 +381,25 @@ function sessionsFromHours(hours) {
 
 // -------------------- OpenAI prompts --------------------
 const BASE_SYSTEM = (ENV.SYSTEM_PROMPT || `
-Você é um tatuador profissional atendendo no WhatsApp (tom humano e profissional).
+Você é um tatuador profissional atendendo no WhatsApp (tom humano e direto).
 Regras:
 - Nunca diga que é IA.
 - Não assine mensagem.
 - Não fale de horas nem preço/hora para o cliente (isso é interno).
 - Antes de falar preço: explique o valor do trabalho (complexidade, sombras, transições, acabamento, encaixe).
-- Você trabalha com whip shading (técnica delicada e limpa).
+- Você trabalha com whip shading (técnica limpa).
 - Você não faz sessões acima de 7 horas; se passar disso, divide em 2+ sessões (sem falar horas).
 - Pagamento: Pix, débito, crédito até 12x.
 - Inclui 1 retoque se necessário em 40–50 dias.
-- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais, com ajuste no total.
-- Cobertura: peça foto da tattoo atual, mas deixe claro que raramente aceita cobertura por causa do seu estilo (whip shading), e que vai analisar antes de confirmar.
+- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais (ajuste no total).
+- Cobertura: peça foto da tattoo atual, mas deixe claro que vai analisar antes de confirmar.
 - Criação: você faz criações exclusivas baseadas na referência e adapta ao corpo do cliente.
 `).trim();
 
 async function describeImageForClient(imageDataUrl) {
   const resp = await openai.chat.completions.create({
     model: "gpt-4o",
-    temperature: 0.35,
+    temperature: 0.3,
     messages: [
       { role: "system", content: BASE_SYSTEM },
       {
@@ -558,7 +408,7 @@ async function describeImageForClient(imageDataUrl) {
           {
             type: "text",
             text:
-              "Analise a referência e gere uma explicação curta, direta e profissional do que o projeto exige (sombras, transições, volume, contraste, acabamento, encaixe). NÃO fale de preço, NÃO fale de horas. 5 a 8 linhas no máximo. Sem enfeitar.",
+              "Analise a referência e gere uma explicação curta, direta e profissional do que o projeto exige (sombras, transições, volume, contraste, acabamento, encaixe). NÃO fale de preço, NÃO fale de horas. 4 a 7 linhas. Linguagem humana, sem repetir palavras.",
           },
           { type: "image_url", image_url: { url: imageDataUrl } },
         ],
@@ -577,7 +427,7 @@ async function estimateHoursInternal(imageDataUrl, sizeLocationOrRegion, isCover
       {
         role: "system",
         content:
-          "Você é um tatuador experiente. Estime SOMENTE um número de horas (inteiro) para execução, considerando complexidade e as informações (tamanho/local OU apenas região). Responda APENAS com um número. Sem texto.",
+          "Você é um tatuador experiente. Estime SOMENTE um número de horas (inteiro) para execução, considerando complexidade e as infos (tamanho/local OU apenas região). Responda APENAS com um número.",
       },
       {
         role: "user",
@@ -600,135 +450,229 @@ Estime horas inteiras.`,
   return Math.min(30, n);
 }
 
-// -------------------- Replies --------------------
-function msgCriacao() {
-  return (
-    "Sim — eu faço *criações exclusivas*.\n" +
-    "A referência serve como base, e eu adapto a composição pro teu corpo (encaixe, proporção e leitura), mantendo o estilo do meu trabalho."
-  );
+// -------------------- Mensagens (sem "Perfeito" repetido) --------------------
+function msgGreetingAndTriage(contactName) {
+  const nm = safeName(contactName);
+  const variants = [
+    (name) =>
+      `Oi${name ? `, ${name}` : ""}! Aqui é o DW.\n` +
+      `Eu trabalho com realismo preto e cinza e whip shading, com acabamento bem limpo.\n\n` +
+      `Antes de eu te orientar: é seu primeiro contato comigo? (sim/não)`,
+    (name) =>
+      `Olá${name ? `, ${name}` : ""}! Tudo certo?\n` +
+      `Eu sou o DW — realismo black & grey e whip shading.\n\n` +
+      `Só pra eu seguir certo contigo: é seu primeiro contato? Responde "sim" ou "não".`,
+    (name) =>
+      `E aí${name ? `, ${name}` : ""}! Aqui é o DW.\n` +
+      `Trampo com realismo preto e cinza e um sombreamento bem fino.\n\n` +
+      `Me confirma uma coisa: é o primeiro contato comigo? (sim/não)`,
+  ];
+  const fn = pickOne(variants) || variants[0];
+  return fn(nm);
 }
 
-function msgCoberturaPedirFoto() {
-  return (
-    "Sobre *cobertura*: me manda uma foto bem nítida da tattoo atual (de perto e de um pouco mais longe).\n\n" +
-    "• Só pra ser transparente: eu *raramente* pego cobertura, porque meu estilo (whip shading) é bem limpo e delicado e, na maioria dos casos, cobertura não entrega o resultado que eu gosto de entregar.\n\n" +
-    "Me manda a foto que eu analiso e te falo com sinceridade se dá pra fazer ou não."
-  );
+function detectFirstContactAnswer(text) {
+  const t = (text || "").toLowerCase();
+
+  // NÃO = já tem orçamento/atendimento andando com você
+  if (/^n[aã]o$|^nao$/.test(t)) return "ongoing";
+  if (/j[aá]\s*(tenho|tive|conversei|falei|estou\s*falando)|em\s*andamento|or[cç]amento\s*andando|j[aá]\s*tem/i.test(t)) return "ongoing";
+  if (/or[cç]amento|atendimento|conversa\s*com\s*voc[eê]|já\s*conversamos/i.test(t) && /j[aá]/.test(t)) return "ongoing";
+
+  // SIM = primeiro contato
+  if (/^sim$/.test(t)) return "first";
+  if (/primeir|1a\s*vez|primeira\s*vez|come[cç]ando|do\s*zero/i.test(t)) return "first";
+
+  return "";
 }
 
-function msgPedirLocalOuTamanho() {
+function msgTriageClarify() {
   return (
-    "Perfeito.\n" +
-    "• Me diz *onde no corpo* você quer fazer (ex: costela, pescoço, mão, antebraço).\n" +
-    "• E o *tamanho aproximado* (se não souber em cm, descreve do jeito que você imagina)."
-  );
-}
-
-function msgSoBlackGrey() {
-  return (
-    "Perfeito — só um detalhe importante pra alinhar direitinho.\n\n" +
-    "• Eu trabalho com *black & grey* (preto e cinza).\n" +
-    "• Não faço tatuagem totalmente colorida — no máximo *pequenos detalhes* quando combina com o projeto.\n\n" +
-    "Se você curtir a ideia em preto e cinza, eu sigo e deixo o desenho com muita profundidade e contraste."
-  );
-}
-
-function msgFinalizaPorNaoAceitarBW() {
-  return (
-    "Entendi.\n\n" +
-    "• Como eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender do jeito que você quer em colorido.\n\n" +
-    "Obrigado por me chamar e fico à disposição caso você decida fazer em preto e cinza no futuro."
+    `Só pra eu seguir certo contigo:\n\n` +
+    `• Responde "sim" se é seu primeiro contato\n` +
+    `• Responde "não" se já existe um orçamento/atendimento em andamento comigo`
   );
 }
 
 function msgEndereco() {
   return (
-    "Claro.\n\n" +
-    "• Endereço: *Av. Mauá, 1308* — próximo à rodoviária.\n" +
-    "• É um estúdio *privado e aconchegante*, pensado pra você ter uma experiência confortável e focada no resultado.\n\n" +
-    "Se quiser, me diz seu bairro que eu te passo uma referência rápida de como chegar."
-  );
-}
-
-function msgAguardandoComprovante() {
-  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
-  return (
-    "Perfeito.\n\n" +
-    "• Pra eu confirmar o agendamento, eu preciso da *foto do comprovante* aqui no Whats.\n" +
-    pixLine +
-    "Assim que chegar, eu já sigo com a agenda."
+    "Endereço do estúdio:\n\n" +
+    "• Av. Mauá, 1308 — próximo à rodoviária.\n" +
+    "Se quiser, me diz seu bairro que eu te passo um ponto de referência pra facilitar."
   );
 }
 
 function msgPixDireto() {
   const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "(chave pix não configurada no momento)";
   return (
-    "Perfeito.\n\n" +
-    `• Chave Pix: ${pixLine}\n` +
+    "Chave Pix pra sinal:\n\n" +
+    `• ${pixLine}\n` +
     "• Sinal para reserva: *R$ 50*\n\n" +
-    "Assim que você enviar a *foto do comprovante* aqui, eu confirmo e seguimos pra agenda."
+    "Quando fizer, envia a *foto do comprovante* aqui que eu já confirmo e seguimos pra agenda."
   );
 }
 
-function msgPerguntaAgenda() {
+function msgSoBlackGrey() {
   return (
-    "Perfeito — comprovante recebido.\n\n" +
-    "• Pra eu agendar do melhor jeito pra você:\n" +
-    "• Você prefere horário *comercial* ou *pós-comercial*?\n" +
-    "• Você tem alguma data específica livre?\n\n" +
-    "Se você não tiver uma data em mente, eu posso te colocar no *próximo horário disponível* e já te retorno com as opções."
+    "Só alinhando um detalhe importante:\n\n" +
+    "• Eu trabalho com *preto e cinza (black & grey)*.\n" +
+    "• Não faço tattoo totalmente colorida.\n\n" +
+    "Se você curtir em preto e cinza, dá pra ficar com muita profundidade e contraste."
   );
 }
 
-function msgVouVerificarAgendaSemData() {
+function msgFinalizaPorNaoAceitarBW() {
   return (
-    "Fechado.\n\n" +
-    "• Vou verificar minha agenda.\n" +
-    "• Já já eu te retorno com as *próximas datas e horários disponíveis* pra você escolher."
+    "Entendi.\n\n" +
+    "Como eu trabalho só com *preto e cinza*, eu não vou conseguir te atender do jeito que você quer em colorido.\n" +
+    "Se em algum momento você decidir fazer em black & grey, é só me chamar."
   );
 }
 
-function msgVouVerificarAgendaComData() {
+function msgPedirReferenciaOuIdeia(session) {
+  // 1ª tentativa: pede imagem + local + tamanho
+  // 2ª tentativa: pede só o básico e avisa que vai analisar assim que receber
+  const now = Date.now();
+  session.lastAskAt = now;
+  session.askRefCount += 1;
+
+  if (session.askRefCount <= 1) {
+    return (
+      "Me manda uma referência em *imagem* (print/foto), se tiver.\n" +
+      "E me diz também:\n" +
+      "• onde no corpo\n" +
+      "• tamanho aproximado (cm ou “do tamanho de uma mão”, por exemplo)\n\n" +
+      "Aí eu já te retorno com o orçamento certinho."
+    );
+  }
+
   return (
-    "Perfeito.\n\n" +
-    "• Vou verificar na agenda se essa data está disponível.\n" +
-    "• Já já eu te retorno confirmando as opções de *data e horário*."
+    "Pra eu te passar um orçamento fiel, eu preciso só de 2 coisas:\n\n" +
+    "• uma *imagem de referência* (se tiver)\n" +
+    "• onde no corpo + tamanho aproximado\n\n" +
+    "Assim que você mandar isso eu já sigo."
   );
 }
 
-function msgCuidadosPreSessao() {
+function msgPedirLocalOuTamanho(session) {
+  const now = Date.now();
+  session.lastAskAt = now;
+  session.askInfoCount += 1;
+
+  if (session.askInfoCount <= 1) {
+    return (
+      "Boa — agora me confirma:\n" +
+      "• onde no corpo você quer fazer\n" +
+      "• tamanho aproximado\n\n" +
+      "Se for cobertura, me avisa também."
+    );
+  }
+
   return (
-    "Antes da sessão, pra sua experiência ser a melhor possível:\n\n" +
-    "• Beba bastante água no dia anterior e no dia.\n" +
-    "• Evite álcool no dia anterior.\n" +
-    "• Se alimente bem antes de vir.\n\n" +
-    "Isso ajuda no conforto e no resultado final."
+    "Só falta eu saber:\n" +
+    "• local no corpo\n" +
+    "• tamanho aproximado\n\n" +
+    "Com isso eu fecho teu orçamento."
+  );
+}
+
+function msgDorResposta() {
+  return (
+    "Total — essa dúvida é normal.\n\n" +
+    "A sensação varia bastante pela região e pela tolerância de cada um.\n" +
+    "Geralmente é uma ardência/arranhado mais intenso.\n\n" +
+    "Me diz a região do corpo que você quer fazer que eu te falo se costuma ser mais tranquilo ou mais sensível."
+  );
+}
+
+function msgTempoResposta() {
+  return (
+    "Depende do tamanho e do nível de detalhe (transições, textura, contraste e acabamento).\n\n" +
+    "Me diz onde no corpo + tamanho aproximado que eu te passo uma noção bem fiel."
+  );
+}
+
+function msgPrecoAntesDoValor() {
+  return (
+    "Pra eu te passar um valor justo, eu preciso:\n\n" +
+    "• referência em imagem (se tiver)\n" +
+    "• onde no corpo\n" +
+    "• tamanho aproximado\n\n" +
+    "Com isso eu te retorno certinho."
+  );
+}
+
+function msgHesitacaoResposta() {
+  return (
+    "Tranquilo.\n\n" +
+    "O que tá pesando mais pra você agora: desenho, valor ou data?\n" +
+    "Se você me disser o ponto principal, eu te oriento direto."
   );
 }
 
 function msgChecagemDuvidas() {
-  return (
-    "Perfeito.\n\n" +
-    "• Ficou alguma dúvida sobre o atendimento?\n" +
-    "Se não ficou, me confirma que tá tudo certo que eu já te passo o investimento e as formas de pagamento."
-  );
+  const variants = [
+    "Ficou alguma dúvida antes de eu te passar o investimento e as formas de pagamento?",
+    "Quer tirar alguma dúvida do atendimento antes de eu te passar o investimento?",
+    "Se tiver alguma dúvida rápida, manda agora. Se estiver tudo ok, eu já te passo o investimento e as formas de pagamento.",
+  ];
+  return pickOne(variants) || variants[0];
 }
 
 function msgOrcamentoCompleto(valor, sessoes) {
   const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
   return (
-    `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
+    `Pelo tamanho e complexidade do projeto, o investimento fica em *R$ ${valor}*.\n\n` +
     `• Pra ficar bem executado e cicatrizar redondo, eu organizo em *${sessoes} sessão(ões)*.\n` +
     "• Pagamento: Pix, débito ou crédito em até 12x.\n" +
     "• Inclui *1 retoque* (se necessário) entre 40 e 50 dias.\n\n" +
-    "• Pra reservar o horário eu peço um *sinal de R$ 50*.\n" +
+    "Pra reservar horário:\n" +
+    "• sinal de *R$ 50*\n" +
     pixLine +
-    "• Assim que você enviar a *foto do comprovante* aqui, eu confirmo o agendamento e seguimos pra agenda."
+    "Depois é só enviar a *foto do comprovante* aqui que eu confirmo e seguimos pra agenda."
   );
 }
 
+function msgAguardandoComprovante() {
+  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+  return (
+    "Certo.\n\n" +
+    "Pra eu confirmar o agendamento, preciso da *foto do comprovante* aqui no Whats.\n" +
+    pixLine +
+    "Assim que chegar eu já sigo com a agenda."
+  );
+}
+
+function msgPerguntaAgenda() {
+  return (
+    "Comprovante recebido.\n\n" +
+    "Pra eu te encaixar do melhor jeito:\n" +
+    "• você prefere horário *comercial* ou *pós-comercial*?\n" +
+    "• tem alguma data específica livre?"
+  );
+}
+
+function msgCuidadosPreSessao() {
+  return (
+    "Antes da sessão:\n\n" +
+    "• se alimente bem\n" +
+    "• hidrate bastante\n" +
+    "• evite álcool no dia anterior\n\n" +
+    "Isso ajuda no conforto e no resultado."
+  );
+}
+
+function msgClosing() {
+  const variants = [
+    "Fechado. Qualquer ajuste ou dúvida, me chama por aqui.",
+    "Combinado. Se surgir alguma dúvida até o dia, é só me chamar.",
+    "Show. Tô por aqui se precisar de algo.",
+  ];
+  return pickOne(variants) || variants[0];
+}
+
 // -------------------- HANDOFF manual --------------------
-async function handoffToManual(phone, session, motivo, mensagemCliente) {
+async function handoffToManual(phone, session, motivo, mensagemCliente, silentToClient = false) {
   const now = Date.now();
   if (!session.lastOwnerNotifyAt) session.lastOwnerNotifyAt = 0;
 
@@ -748,9 +692,9 @@ async function handoffToManual(phone, session, motivo, mensagemCliente) {
   session.manualHandoff = true;
   session.stage = "manual_pendente";
 
-  const reply =
-    "Perfeito.\n\n" +
-    "• Vou analisar direitinho e em breve te respondo.";
+  if (silentToClient) return;
+
+  const reply = "Entendi. Vou analisar direitinho e te retorno em breve.";
   if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
 }
 
@@ -802,8 +746,8 @@ app.post("/zapi", async (req, res) => {
 
     // ✅ se já entrou em handoff manual
     if (session.manualHandoff) {
-      if ((session.stage === "pos_agenda_manual" || session.stage === "manual_pendente") && detectThanks(message)) {
-        const reply = chooseClosingOnce(session);
+      if (detectThanks(message) && !session.finished) {
+        const reply = msgClosing();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         session.finished = true;
         session.stage = "finalizado";
@@ -816,9 +760,8 @@ app.post("/zapi", async (req, res) => {
       resetSession(phone);
       const s2 = getSession(phone);
       const reply =
-        "Perfeito.\n\n" +
-        "• Atendimento reiniciado.\n" +
-        "Me manda a referência em *imagem* e me diz *onde no corpo* você quer fazer.";
+        "Beleza — atendimento reiniciado.\n\n" +
+        "Me manda uma referência em imagem (se tiver) e me diz onde no corpo + tamanho aproximado.";
       if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
       return;
     }
@@ -862,6 +805,7 @@ app.post("/zapi", async (req, res) => {
     }
 
     if (priceAsk && !session.finished) {
+      // só bloqueia se ainda não tem o mínimo pra orçamento
       if (!session.imageDataUrl || (!session.bodyRegion && !session.sizeLocation)) {
         const reply = msgPrecoAntesDoValor();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -869,9 +813,8 @@ app.post("/zapi", async (req, res) => {
       }
     }
 
-    // intents gerais
+    // ✅ flags gerais
     if (detectCoverup(message)) session.isCoverup = true;
-    const askedCreation = /cria|criação|desenho|autor|exclusiv/i.test(lower);
 
     const maybeRegion = extractBodyRegion(message);
     if (!session.bodyRegion && maybeRegion) session.bodyRegion = maybeRegion;
@@ -879,24 +822,11 @@ app.post("/zapi", async (req, res) => {
     const maybeSizeLoc = extractSizeLocation(message);
     if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
 
+    // ✅ intenção de colorido
     if (!session.finished && detectColorIntentByText(message)) {
       session.awaitingBWAnswer = true;
       const reply = msgSoBlackGrey();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    if (askedCreation) {
-      const reply = msgCriacao();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      // não returna, deixa seguir fluxo
-    }
-
-    // ✅ coverup sem imagem
-    if (session.isCoverup && !session.imageDataUrl && !imageUrl) {
-      const reply = msgCoberturaPedirFoto();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.stage = "aguardando_referencia";
       return;
     }
 
@@ -913,7 +843,7 @@ app.post("/zapi", async (req, res) => {
       if (bw === "yes") session.awaitingBWAnswer = false;
     }
 
-    // ✅ comprovante por texto sem foto
+    // ✅ comprovante por texto sem foto (após orçamento)
     const depositTextOnly = detectDepositTextOnly(message);
     const isAfterQuote = session.stage === "pos_orcamento" || session.sentQuote;
 
@@ -929,7 +859,6 @@ app.post("/zapi", async (req, res) => {
     if (!session.depositConfirmed && depositByImageAfterQuote) {
       session.depositConfirmed = true;
       session.stage = "agenda";
-      session.askedSchedule = true;
 
       await notifyOwner(
         [
@@ -939,53 +868,87 @@ app.post("/zapi", async (req, res) => {
         ].join("\n")
       );
 
-      const reply = msgPerguntaAgenda();
+      const reply = [msgPerguntaAgenda(), "", msgCuidadosPreSessao()].join("\n\n");
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
-    // -------------------- FLUXO NOVO (ORDEM CERTA) --------------------
+    // -------------------- FLUXO (SIMPLIFICADO e FUNCIONAL) --------------------
+
+    // ✅ inicio -> manda saudação + triagem
     if (session.stage === "inicio") {
-      const reply = chooseGreetingOnce(session, contactName);
+      const reply = msgGreetingAndTriage(contactName);
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.greeted = true;
-      session.stage = "aguardando_referencia";
+      session.stage = "triagem_primeiro_contato";
       return;
     }
 
-    // ✅ se está aguardando referência e NÃO tem imagem -> manda UMA mensagem e sai (evita duplicar)
-    if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
-      // se já definiu perfil (explorador/sonhador), pode mandar mensagem de perfil ao invés de pedir imagem seco
-      if (!session.clientProfile) {
-        const p = classifyClientProfile(message, false);
-        if (p) session.clientProfile = p;
-      }
+    // ✅ triagem primeiro contato
+    if (session.stage === "triagem_primeiro_contato") {
+      const ans = detectFirstContactAnswer(message);
 
-      if (session.clientProfile && !session.sentProfileMsg) {
-        let reply = "";
-        if (session.clientProfile === "explorador") reply = msgPerfilExplorador();
-        if (session.clientProfile === "sonhador") reply = msgPerfilSonhador();
-        if (session.clientProfile === "arquiteto") reply = msgPerfilArquiteto();
+      if (!ans) {
+        session.triageAttempts += 1;
 
-        if (reply) {
+        if (session.triageAttempts <= 1) {
+          const reply = msgTriageClarify();
           if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          session.sentProfileMsg = true;
           return;
         }
+
+        // se não respondeu claramente, handoff (melhor que ficar repetindo)
+        await handoffToManual(phone, session, "Triagem sem resposta clara (sim/não)", message);
+        return;
       }
 
-      const reply = "Perfeito. • Se tiver uma referência em *imagem* (print/foto), me manda pra eu avaliar certinho.\n• E me diz *onde no corpo* + *tamanho aproximado*.";
+      if (ans === "ongoing") {
+        session.isOngoingWithOwner = true;
+
+        // avisa você e cala o bot (silent)
+        await notifyOwner(
+          [
+            "⚠️ CLIENTE DISSE QUE JÁ TEM ORÇAMENTO/ATENDIMENTO EM ANDAMENTO COM VOCÊ",
+            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+            `• Mensagem: ${(message || "").slice(0, 400)}`,
+            "• Ação: você assume a conversa (bot parou).",
+          ].join("\n")
+        );
+
+        session.manualHandoff = true;
+        session.stage = "manual_pendente";
+        return;
+      }
+
+      // primeiro contato: segue normal
+      session.isOngoingWithOwner = false;
+      session.stage = "aguardando_referencia";
+
+      const reply = msgPedirReferenciaOuIdeia(session);
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
-    // ✅ imagem referência chegou (PRIORIDADE) -> salva + pede região/tamanho (SEM mandar perfil)
-    if (imageUrl) {
+    // ✅ se está aguardando referência e NÃO tem imagem -> evita loop
+    if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
+      // se o cliente ficar mandando texto aleatório sem mandar o básico, depois de 2 tentativas vira handoff
+      if (session.askRefCount >= 2) {
+        await handoffToManual(phone, session, "Cliente sem referência/infos após tentativas", message);
+        return;
+      }
+
+      const reply = msgPedirReferenciaOuIdeia(session);
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    // ✅ imagem chegou (referência) — prioridade total
+    if (imageUrl && !depositByImageAfterQuote) {
       try {
         const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
         session.imageDataUrl = dataUrl;
         session.imageSummary = await describeImageForClient(dataUrl);
 
+        // se imagem indica colorido, alinha
         if (detectColorIntentBySummary(session.imageSummary)) {
           session.awaitingBWAnswer = true;
           const reply = msgSoBlackGrey();
@@ -993,63 +956,59 @@ app.post("/zapi", async (req, res) => {
           return;
         }
 
-        // reset flags de fluxo
+        // reset flags
         session.sentSummary = false;
         session.askedDoubts = false;
-        session.doubtsResolved = false;
         session.sentQuote = false;
 
         session.stage = "aguardando_info";
 
-        // se não tem região/tamanho -> pede e PARA (evita 2 msgs)
-        if (!session.bodyRegion && !session.sizeLocation) {
-          const reply = msgPedirLocalOuTamanho();
+        // se falta info básica, pede e para
+        if (!session.bodyRegion || !session.sizeLocation) {
+          const reply = msgPedirLocalOuTamanho(session);
           if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
           return;
         }
       } catch (e) {
         console.error("[IMG] failed:", e?.message || e);
-      }
-    }
-
-    // se ainda não tem profile (sem imagem), tenta definir
-    if (!session.clientProfile && !session.imageDataUrl) {
-      const p = classifyClientProfile(message, false);
-      if (p) session.clientProfile = p;
-    }
-
-    // ✅ mensagem de perfil SÓ quando NÃO tem imagem (pra não parecer IA repetindo)
-    if (session.clientProfile && !session.sentProfileMsg && !session.imageDataUrl && session.stage !== "agenda" && session.stage !== "finalizado") {
-      let reply = "";
-      if (session.clientProfile === "arquiteto") reply = msgPerfilArquiteto();
-      if (session.clientProfile === "explorador") reply = msgPerfilExplorador();
-      if (session.clientProfile === "sonhador") reply = msgPerfilSonhador();
-
-      if (reply) {
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.sentProfileMsg = true;
+        // se falhar download, melhor handoff do que bugado insistindo
+        await handoffToManual(phone, session, "Falha ao baixar imagem", message);
         return;
       }
     }
 
-    // ✅ se tem imagem e está aguardando info -> pede o que falta / manda resumo / dúvidas
-    if (session.imageDataUrl && session.stage === "aguardando_info") {
-      if (!session.bodyRegion && !session.sizeLocation) {
-        const reply = msgPedirLocalOuTamanho();
+    // ✅ aguardando_info: precisa de imagem + local + tamanho
+    if (session.stage === "aguardando_info") {
+      if (!session.imageDataUrl) {
+        // se por algum motivo caiu aqui sem imagem, volta pra referência
+        session.stage = "aguardando_referencia";
+        const reply = msgPedirReferenciaOuIdeia(session);
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
+      if (!session.bodyRegion || !session.sizeLocation) {
+        if (session.askInfoCount >= 2) {
+          await handoffToManual(phone, session, "Faltou local/tamanho após tentativas", message);
+          return;
+        }
+        const reply = msgPedirLocalOuTamanho(session);
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
+      // manda resumo 1x
       if (!session.sentSummary && session.imageSummary) {
         const intro =
-          "Perfeito, recebi a referência.\n\n" +
-          "• Pra esse projeto ficar bem feito, ele exige:\n\n" +
+          "Recebi a referência.\n\n" +
+          "Pra esse projeto ficar bem executado, ele pede:\n\n" +
           session.imageSummary;
 
         if (!antiRepeat(session, intro)) await zapiSendText(phone, intro);
         session.sentSummary = true;
       }
 
+      // pergunta dúvida 1x
       if (!session.askedDoubts) {
         const reply = msgChecagemDuvidas();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -1059,16 +1018,13 @@ app.post("/zapi", async (req, res) => {
       }
 
       session.stage = "aguardando_duvidas";
+      return;
     }
 
-    // -------------------- DÚVIDAS -> ORÇAMENTO --------------------
+    // ✅ dúvidas -> orçamento
     if (session.stage === "aguardando_duvidas") {
       if (answeredNoDoubts(message)) {
-        session.doubtsResolved = true;
-
-        const infoParaCalculo =
-          session.sizeLocation ||
-          (session.bodyRegion ? `Região do corpo: ${session.bodyRegion} (tamanho não informado)` : "não informado");
+        const infoParaCalculo = session.sizeLocation || `Região: ${session.bodyRegion || "não informado"}`;
 
         const hours = await estimateHoursInternal(session.imageDataUrl, infoParaCalculo, session.isCoverup);
         const sessoes = sessionsFromHours(hours);
@@ -1082,67 +1038,65 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      if (answeredHasDoubts(message) || pain || timeAsk || priceAsk || hes) {
-        let reply = "";
-        if (session.clientProfile === "arquiteto") {
-          reply =
-            "Entendi.\n\n" +
-            "• Me diz o que você quer ajustar/confirmar (tamanho, encaixe, contraste, nível de realismo).\n" +
-            "• Se tiver outra referência que ajude, pode mandar também.";
-        } else if (session.clientProfile === "explorador") {
-          reply =
-            "Boa.\n\n" +
-            "• Me diz o que você quer garantir nesse projeto.\n" +
-            "• Tem algum elemento que não pode faltar ou algo que você não quer de jeito nenhum?";
-        } else if (session.clientProfile === "sonhador") {
-          reply =
-            "Entendi.\n\n" +
-            "• Me fala em 2 ou 3 palavras o que você quer sentir quando olhar essa tattoo.\n" +
-            "• E se existe algum símbolo/lembrança que represente isso pra você.";
-        } else {
-          reply =
-            "Entendi.\n\n" +
-            "• Me explica rapidinho qual é a dúvida principal pra eu te orientar do jeito certo.";
-        }
-
+      // se perguntou dor/tempo/preço/hesitação, responde e mantém no fluxo
+      if (pain) {
+        const reply = msgDorResposta();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+      if (timeAsk) {
+        const reply = msgTempoResposta();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+      if (priceAsk) {
+        // já tem base, então só orienta: "se estiver ok eu passo o investimento"
+        const reply =
+          "Consigo te passar certinho sim.\n" +
+          "Se estiver tudo alinhado, me confirma que tá ok que eu já te passo o investimento e formas de pagamento.";
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+      if (hes) {
+        const reply = msgHesitacaoResposta();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      await handoffToManual(phone, session, "Dúvida fora do configurado (etapa dúvidas)", message);
+      // qualquer coisa fora, melhor handoff do que bot burro repetindo
+      await handoffToManual(phone, session, "Mensagem fora do fluxo (dúvidas)", message);
       return;
     }
 
-    // -------------------- PÓS ORÇAMENTO --------------------
+    // ✅ pós orçamento
     if (session.stage === "pos_orcamento") {
-      if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
+      if (/fech|vamos|bora|quero|ok|topo|pode marcar|vou fazer|vamo fechar/i.test(lower)) {
         const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
         const reply =
-          "Fechado.\n\n" +
-          "• Pra reservar teu horário eu peço um *sinal de R$ 50*.\n" +
+          "Beleza — pra reservar teu horário:\n\n" +
+          "• sinal de *R$ 50*\n" +
           pixLine +
-          "• Assim que você enviar a *foto do comprovante* aqui, eu confirmo o agendamento e seguimos pra agenda.";
+          "Depois é só enviar a *foto do comprovante* aqui que eu confirmo e seguimos pra agenda.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
       if (/mensal|por mês|dividir|parcelar por mês/i.test(lower)) {
         const reply =
-          "Dá sim.\n\n" +
-          "• Quando fica pesado pagar tudo de uma vez, eu consigo organizar em *sessões mensais*.\n" +
-          "• O total ajusta um pouco por virar um atendimento em etapas.\n\n" +
-          "Me diz em quantos meses você prefere que eu já te proponho o formato certinho.";
+          "Dá pra organizar sim.\n\n" +
+          "Eu consigo montar em *sessões mensais* quando fica pesado pagar tudo de uma vez.\n" +
+          "Me diz em quantos meses você prefere que eu te proponho o formato certinho.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
+      // se o cliente mandou info nova, volta pra ajuste (sem spam)
       if (maybeRegion || maybeSizeLoc) {
         session.sentSummary = false;
         session.askedDoubts = false;
-        session.doubtsResolved = false;
         session.sentQuote = false;
         session.stage = "aguardando_info";
-        const reply = "Perfeito — com essa informação eu consigo ajustar certinho. Só um instante.";
+        const reply = "Show — com essa informação eu ajusto certinho. Só um instante.";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
@@ -1151,14 +1105,13 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // -------------------- AGENDA --------------------
+    // ✅ agenda (após comprovante): capta preferência e te chama
     if (session.stage === "agenda") {
       const pref = detectCommercialPref(message);
       const hasDate = detectHasSpecificDate(message);
       const noDate = detectNoSpecificDate(message);
 
       if (pref || hasDate || noDate) {
-        session.scheduleCaptured = true;
         session.manualHandoff = true;
         session.stage = "pos_agenda_manual";
 
@@ -1171,28 +1124,15 @@ app.post("/zapi", async (req, res) => {
           ].join("\n")
         );
 
-        if (noDate && !hasDate) {
-          const reply = [msgVouVerificarAgendaSemData(), "", msgCuidadosPreSessao()].join("\n\n");
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-
-        if (hasDate) {
-          const reply = [msgVouVerificarAgendaComData(), "", msgCuidadosPreSessao()].join("\n\n");
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-
         const reply =
-          "Perfeito.\n\n" +
-          "• Vou verificar minha agenda e já te retorno com opções de *data e horário*.\n\n" +
+          "Fechado — vou confirmar aqui e já te retorno com as opções.\n\n" +
           msgCuidadosPreSessao();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      const reply = msgPerguntaAgenda();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      // se não respondeu o que precisa, pergunta só uma vez e se insistir -> handoff
+      await handoffToManual(phone, session, "Agenda sem resposta útil", message);
       return;
     }
 
