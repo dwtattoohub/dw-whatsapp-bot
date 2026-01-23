@@ -456,16 +456,16 @@ function msgGreetingAndTriage(contactName) {
   const variants = [
     (name) =>
       `Oi${name ? `, ${name}` : ""}! Aqui é o DW.\n` +
-      `Eu trabalho com realismo preto e cinza e whip shading, com acabamento bem limpo.\n\n` +
+      `Eu trabalho com realismo preto e cinza e whip shading, é um prazer falar com você.\n\n` +
       `Antes de eu te orientar: é seu primeiro contato comigo? (sim/não)`,
     (name) =>
       `Olá${name ? `, ${name}` : ""}! Tudo certo?\n` +
       `Eu sou o DW — realismo black & grey e whip shading.\n\n` +
-      `Só pra eu seguir certo contigo: é seu primeiro contato? Responde "sim" ou "não".`,
+      `Só pra eu seguir certo contigo: é seu primeiro contato ou ja temos um orçamento em andwmento?.`,
     (name) =>
       `E aí${name ? `, ${name}` : ""}! Aqui é o DW.\n` +
-      `Trampo com realismo preto e cinza e um sombreamento bem fino.\n\n` +
-      `Me confirma uma coisa: é o primeiro contato comigo? (sim/não)`,
+      `Trampo com realismo preto e cinza.\n\n` +
+      `Me confirma uma coisa: é o primeiro contato comigo ou ja temos um orçamento pendente?`,
   ];
   const fn = pickOne(variants) || variants[0];
   return fn(nm);
