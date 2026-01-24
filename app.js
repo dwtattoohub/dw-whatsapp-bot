@@ -7,7 +7,6 @@
 // (opcional) SYSTEM_PROMPT
 // (opcional) PIX_KEY
 // (opcional) OWNER_PHONE   // ex: 5544999999999
-// (opcional) PORT          // default 10000
 
 import express from "express";
 import OpenAI from "openai";
@@ -253,13 +252,15 @@ function safeName(name) {
 
 // -------------------- GREETINGS / CLOSINGS --------------------
 const GREETINGS = [
+  // Versão A — Profissional premium
   (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tatuador, especializado em realismo preto e cinza e whip shading.\n\n` +
-    `Fico feliz em receber sua mensagem!\n\n` +
-    `Pra eu te atender do jeito certo: você já tem um orçamento/atendimento em andamento comigo ou é o primeiro contato?`,
+    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tatuador, especialista em realismo preto e cinza e whip shading.\n\n` +
+    `Pra eu te atender do jeito certo: você já tem um orçamento/atendimento em andamento comigo ou é seu primeiro contato?`,
+
+  // Versão B — Humana e acolhedora
   (name) =>
     `Oi${name ? `, ${name}` : ""}! Aqui é o DW Tatuador — realismo preto e cinza e whip shading.\n\n` +
-    `Pra eu te orientar certinho: você já está com orçamento em andamento comigo ou é a primeira vez por aqui?`,
+    `Antes da gente seguir, só me confirma rapidinho: você já tem um orçamento/atendimento em andamento comigo ou é seu primeiro contato?`,
 ];
 
 const CLOSINGS = [
@@ -286,18 +287,6 @@ function chooseGreetingOnce(session, contactName) {
 function chooseClosingOnce(session) {
   if (!session.closingVariant) session.closingVariant = pickOne(CLOSINGS) || CLOSINGS[0];
   return session.closingVariant();
-}
-
-// -------------------- Mensagem HUMANA do primeiro contato --------------------
-function msgPrimeiroContatoProximoPasso() {
-  return (
-    "Perfeito — seja bem-vindo(a)! 👊\n\n" +
-    "Bora fazer um trampo bem feito e com a tua cara.\n\n" +
-    "Pra eu te passar um orçamento bem fiel, me manda:\n" +
-    "• uma referência em imagem (se tiver)\n" +
-    "• onde no corpo você quer fazer\n" +
-    "• e o tamanho aproximado (pode ser em cm ou na ideia, tipo “do pulso até metade do antebraço”)."
-  );
 }
 
 // -------------------- Business rules --------------------
@@ -369,8 +358,7 @@ function detectColorIntentBySummary(summary) {
 function detectBWAccept(text) {
   const t = (text || "").toLowerCase();
   if (/\b(sim|aceito|pode|fechado|bora|ok|topo|manda|vamo)\b/i.test(t)) return "yes";
-  if (/\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t))
-    return "no";
+  if (/\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t)) return "no";
   return "";
 }
 
@@ -407,6 +395,7 @@ function detectWillSendReceipt(text) {
 }
 
 function detectReceiptContext(session, message) {
+  // evita o bot tentar analisar comprovante como "referência"
   const t = (message || "").toLowerCase();
   if (session.stage === "pos_orcamento" || session.sentQuote) return true;
   if (session.depositDeadlineAt && session.depositDeadlineAt > 0) return true;
@@ -420,13 +409,11 @@ function detectFirstContactAnswer(text) {
 
   // EM ANDAMENTO
   if (/^n[aã]o$|^nao$/.test(t)) return "ongoing";
-  if (/andamento|já\s*tenho|ja\s*tenho|já\s*falei|ja\s*falei|já\s*conversei|ja\s*conversei|or[cç]amento/i.test(t))
-    return "ongoing";
+  if (/andamento|já\s*tenho|ja\s*tenho|já\s*falei|ja\s*falei|já\s*conversei|ja\s*conversei|or[cç]amento/i.test(t)) return "ongoing";
 
   // PRIMEIRO CONTATO
   if (/^sim$/.test(t)) return "first";
-  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando/i.test(t))
-    return "first";
+  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando/i.test(t)) return "first";
 
   return "";
 }
@@ -493,7 +480,7 @@ function msgHesitacaoResposta() {
   );
 }
 
-// -------------------- Regras de preço (interno) --------------------
+// -------------------- Regras de preço --------------------
 function calcPriceFromHours(hours) {
   const h = Math.max(1, Math.round(Number(hours) || 1));
   return 150 + Math.max(0, h - 1) * 120;
@@ -592,9 +579,9 @@ function msgCoberturaPedirFoto() {
 
 function msgPedirLocalOuTamanho() {
   return (
-    "Me diz rapidinho:\n" +
+    "Pra eu te orientar com precisão, me diz rapidinho:\n" +
     "• onde no corpo você quer fazer\n" +
-    "• e o tamanho aproximado (se não souber em cm, descreve como você imagina)."
+    "• e o tamanho aproximado (se não souber em cm, pode descrever como você imagina)."
   );
 }
 
@@ -758,7 +745,6 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/zapi", async (req, res) => {
-  // responde rápido pro webhook
   res.status(200).json({ ok: true });
 
   try {
@@ -912,9 +898,8 @@ app.post("/zapi", async (req, res) => {
       }
     }
 
-    // -------------------- FLUXO NOVO (gate do primeiro contato) --------------------
-
-    // ✅ inicio -> manda saudação + pergunta do primeiro contato
+    // -------------------- FLUXO NOVO (com gate do primeiro contato) --------------------
+    // ✅ inicio -> manda saudação + pergunta do primeiro contato (SEM pedir referência ainda)
     if (session.stage === "inicio") {
       const reply = chooseGreetingOnce(session, contactName);
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -945,20 +930,25 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      // ✅ PRIMEIRO CONTATO -> mensagem humana e segue fluxo
+      // primeiro contato -> segue o fluxo normal (AGORA mais humano/pro)
       if (ans === "first") {
         session.firstContactResolved = true;
         session.stage = "aguardando_referencia";
 
-        const reply = msgPrimeiroContatoProximoPasso();
+        const reply =
+          "Perfeito — seja bem-vindo(a)!\n\n" +
+          "Bora montar um projeto bem da hora e com a tua cara.\n\n" +
+          "Pra eu já te orientar certinho, me manda:\n" +
+          "• uma referência em imagem (se tiver)\n" +
+          "• onde no corpo você quer fazer\n" +
+          "• e o tamanho aproximado (pode ser em cm ou só uma noção)";
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      // se não entendeu
       const retry =
         "Só pra eu te direcionar certinho:\n" +
-        "você já tem um orçamento em andamento comigo ou é o primeiro contato?";
+        "você já tem um orçamento/atendimento em andamento comigo ou é seu primeiro contato?";
       if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
       return;
     }
@@ -974,10 +964,12 @@ app.post("/zapi", async (req, res) => {
     // ✅ se está aguardando referência e NÃO tem imagem
     if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
       const reply =
-        "Tranquilo.\n\n" +
+        "Show.\n\n" +
         "Quando puder, me manda:\n" +
-        "• referência em imagem (print/foto)\n" +
-        "• onde no corpo + tamanho aproximado";
+        "• a referência em imagem (print/foto)\n" +
+        "• onde no corpo\n" +
+        "• e o tamanho aproximado\n\n" +
+        "Com isso eu já te digo o melhor caminho pro projeto ficar forte e bem encaixado.";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
@@ -1019,7 +1011,7 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ imagem referência chegou
+    // ✅ imagem referência chegou (PRIORIDADE)
     if (imageUrl && !isReceiptImage) {
       try {
         const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
@@ -1034,6 +1026,7 @@ app.post("/zapi", async (req, res) => {
           return;
         }
 
+        // reset flags de fluxo
         session.sentSummary = false;
         session.askedDoubts = false;
         session.doubtsResolved = false;
@@ -1072,7 +1065,7 @@ app.post("/zapi", async (req, res) => {
             "Só me confirma:\n" +
             "• onde no corpo\n" +
             "• tamanho aproximado\n" +
-            "e se é só igual a referência ou quer alguma alteração.";
+            "e se é pra ficar igual à referência ou se você quer alguma alteração.";
           if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
           session.sentSummary = true;
         } else {
