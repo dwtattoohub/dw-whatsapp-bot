@@ -610,7 +610,7 @@ function msgEndereco() {
 function depositDeadlineLine() {
   return (
     "• Depois do orçamento, você tem até *12 horas* pra enviar a foto do comprovante.\n" +
-    "Se não enviar nesse prazo, o agendamento é *cancelado* e o agendamento é cancelado."
+    "Se não enviar nesse prazo, o agendamento é *cancelado* e o horário volta pra agenda."
   );
 }
 
@@ -667,7 +667,7 @@ function msgVouVerificarAgendaComData() {
 
 function msgCuidadosPreSessao() {
   return (
-    "Lembre antes da sessão:\n\n" +
+    "Antes da sessão:\n\n" +
     "• Beba bastante água.\n" +
     "• Evite álcool no dia anterior.\n" +
     "• Se alimente bem antes de vir."
@@ -689,7 +689,7 @@ function msgOrcamentoCompleto(valor, sessoes) {
     `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.\n` +
     "• Pagamento: Pix, débito ou crédito em até 12x.\n" +
     "• Inclui *1 retoque* (se necessário) entre 40 e 50 dias.\n\n" +
-    "Pra confirmar e reservar o horário eu peço um *sinal de R$ 50* que é abatatido no valor final no dia da sessão.\n" +
+    "Pra reservar o horário eu peço um *sinal de R$ 50*.\n" +
     pixLine +
     "Depois me manda a *foto do comprovante* aqui.\n\n" +
     depositDeadlineLine()
