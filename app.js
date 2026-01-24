@@ -202,6 +202,66 @@ function parseZapiInbound(body) {
   };
 }
 
+// -------------------- ALWAYS-DELAY BUFFER (10s) --------------------
+// Junta texto + imagem que chegam separados e só processa depois do "silêncio" de 10s.
+const inboundBuffer = new Map(); // phone -> { timer, firstAt, lastInbound, messages: [], lastImageUrl, lastImageMime, lastContactName, lastMessageType, fromMe }
+
+function pushInbound(inbound) {
+  const phone = inbound.phone;
+  if (!phone) return;
+
+  const now = Date.now();
+  const existing = inboundBuffer.get(phone) || {
+    timer: null,
+    firstAt: now,
+    lastInbound: null,
+    messages: [],
+    lastImageUrl: null,
+    lastImageMime: "image/jpeg",
+    lastContactName: null,
+    lastMessageType: "",
+    fromMe: false,
+  };
+
+  if (inbound.message && inbound.message.trim()) {
+    existing.messages.push(inbound.message.trim());
+  }
+
+  if (inbound.imageUrl) {
+    existing.lastImageUrl = inbound.imageUrl;
+    existing.lastImageMime = inbound.imageMime || existing.lastImageMime;
+  }
+
+  existing.lastContactName = inbound.contactName || existing.lastContactName;
+  existing.lastMessageType = inbound.messageType || existing.lastMessageType;
+  existing.fromMe = inbound.fromMe || false;
+  existing.lastInbound = inbound;
+
+  if (existing.timer) clearTimeout(existing.timer);
+
+  existing.timer = setTimeout(() => {
+    inboundBuffer.delete(phone);
+
+    const merged = {
+      ...existing.lastInbound,
+      phone,
+      message: existing.messages.join("\n").trim(),
+      imageUrl: existing.lastImageUrl,
+      imageMime: existing.lastImageMime,
+      contactName: existing.lastContactName,
+      messageType: existing.lastMessageType,
+      fromMe: existing.fromMe,
+      raw: existing.lastInbound?.raw,
+    };
+
+    processInboundMerged(merged).catch((e) => {
+      console.error("[PROCESS MERGED ERROR]", e?.message || e);
+    });
+  }, 10_000);
+
+  inboundBuffer.set(phone, existing);
+}
+
 // -------------------- fetchImage --------------------
 async function fetchImageAsDataUrl(url, mimeHint = "image/jpeg") {
   const controller = new AbortController();
@@ -252,15 +312,14 @@ function safeName(name) {
 
 // -------------------- GREETINGS / CLOSINGS --------------------
 const GREETINGS = [
-  // Versão A — Profissional premium
   (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tatuador, especialista em realismo preto e cinza e whip shading.\n\n` +
-    `Pra eu te atender do jeito certo: você já tem um orçamento/atendimento em andamento comigo ou é seu primeiro contato?`,
-
-  // Versão B — Humana e acolhedora
+    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer, especialista em tatuagens realistas em preto e cinza e whip shading.\n\n` +
+    `Fico feliz em receber sua mensagem!\n\n` +
+    `Pra eu te atender do jeito certo: você já tem um orçamento/atendimento em andamento comigo ou é o seu primeiro contato?`,
   (name) =>
-    `Oi${name ? `, ${name}` : ""}! Aqui é o DW Tatuador — realismo preto e cinza e whip shading.\n\n` +
-    `Antes da gente seguir, só me confirma rapidinho: você já tem um orçamento/atendimento em andamento comigo ou é seu primeiro contato?`,
+    `Oi${name ? `, ${name}` : ""}! Aqui é o DW Tattooer, especialista em tatuagens realistas em preto e cinza e whip shading.\n\n` +
+    `Antes da gente seguir, só me confirma rapidinho:\n` +
+    `você já tem um orçamento/atendimento em andamento comigo ou é o seu primeiro contato?`,
 ];
 
 const CLOSINGS = [
@@ -306,12 +365,12 @@ function extractBodyRegion(text) {
   const t = (text || "").toLowerCase();
 
   const regions = [
-    "mão","mao","dedo","punho","antebraço","antebraco","braço","braco",
-    "ombro","peito","costela","pescoço","pescoco","nuca",
-    "pé","pe","tornozelo","panturrilha","canela",
-    "coxa","joelho","virilha",
-    "costas","escápula","escapula","coluna",
-    "rosto","cabeça","cabeca",
+    "mão", "mao", "dedo", "punho", "antebraço", "antebraco", "braço", "braco",
+    "ombro", "peito", "costela", "pescoço", "pescoco", "nuca",
+    "pé", "pe", "tornozelo", "panturrilha", "canela",
+    "coxa", "joelho", "virilha",
+    "costas", "escápula", "escapula", "coluna",
+    "rosto", "cabeça", "cabeca",
   ];
 
   for (const r of regions) {
@@ -395,7 +454,6 @@ function detectWillSendReceipt(text) {
 }
 
 function detectReceiptContext(session, message) {
-  // evita o bot tentar analisar comprovante como "referência"
   const t = (message || "").toLowerCase();
   if (session.stage === "pos_orcamento" || session.sentQuote) return true;
   if (session.depositDeadlineAt && session.depositDeadlineAt > 0) return true;
@@ -409,11 +467,11 @@ function detectFirstContactAnswer(text) {
 
   // EM ANDAMENTO
   if (/^n[aã]o$|^nao$/.test(t)) return "ongoing";
-  if (/andamento|já\s*tenho|ja\s*tenho|já\s*falei|ja\s*falei|já\s*conversei|ja\s*conversei|or[cç]amento/i.test(t)) return "ongoing";
+  if (/andamento|já\s*tenho|ja\s*tenho|or[cç]amento|atendimento|em\s*andamento|continuar/i.test(t)) return "ongoing";
 
   // PRIMEIRO CONTATO
   if (/^sim$/.test(t)) return "first";
-  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando/i.test(t)) return "first";
+  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando|novo\s*or[cç]amento/i.test(t)) return "first";
 
   return "";
 }
@@ -579,9 +637,9 @@ function msgCoberturaPedirFoto() {
 
 function msgPedirLocalOuTamanho() {
   return (
-    "Pra eu te orientar com precisão, me diz rapidinho:\n" +
+    "Me diz rapidinho:\n" +
     "• onde no corpo você quer fazer\n" +
-    "• e o tamanho aproximado (se não souber em cm, pode descrever como você imagina)."
+    "• e o tamanho aproximado (se não souber em cm, descreve como você imagina)."
   );
 }
 
@@ -725,28 +783,8 @@ async function handoffToManual(phone, session, motivo, mensagemCliente) {
   if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
 }
 
-// -------------------- Routes --------------------
-app.get("/", (_req, res) => res.status(200).send("OK"));
-
-app.get("/health", (_req, res) => {
-  const miss = missingEnvs();
-  res.status(miss.length ? 500 : 200).json({
-    ok: miss.length === 0,
-    missing: miss,
-    have: {
-      OPENAI_API_KEY: !!ENV.OPENAI_API_KEY,
-      ZAPI_INSTANCE_ID: !!ENV.ZAPI_INSTANCE_ID,
-      ZAPI_INSTANCE_TOKEN: !!ENV.ZAPI_INSTANCE_TOKEN,
-      ZAPI_CLIENT_TOKEN: !!ENV.ZAPI_CLIENT_TOKEN,
-      PIX_KEY: !!ENV.PIX_KEY,
-      OWNER_PHONE: !!ENV.OWNER_PHONE,
-    },
-  });
-});
-
-app.post("/zapi", async (req, res) => {
-  res.status(200).json({ ok: true });
-
+// -------------------- MAIN PROCESSOR (runs after 10s) --------------------
+async function processInboundMerged(inbound) {
   try {
     const miss = missingEnvs();
     if (miss.length) {
@@ -754,15 +792,14 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    const inbound = parseZapiInbound(req.body || {});
     const { phone, message, imageUrl, imageMime, fromMe, messageType, contactName } = inbound;
 
-    console.log("[IN]", {
+    console.log("[IN MERGED]", {
       phone,
       fromMe,
       messageType,
       hasImageUrl: !!imageUrl,
-      messagePreview: (message || "").slice(0, 120),
+      messagePreview: (message || "").slice(0, 180),
     });
 
     if (!phone) return;
@@ -898,8 +935,7 @@ app.post("/zapi", async (req, res) => {
       }
     }
 
-    // -------------------- FLUXO NOVO (com gate do primeiro contato) --------------------
-    // ✅ inicio -> manda saudação + pergunta do primeiro contato (SEM pedir referência ainda)
+    // -------------------- FLUXO (gate do primeiro contato) --------------------
     if (session.stage === "inicio") {
       const reply = chooseGreetingOnce(session, contactName);
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -910,11 +946,9 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ aguardando resposta do "primeiro contato?"
     if (session.stage === "aguardando_primeiro_contato") {
       const ans = detectFirstContactAnswer(message);
 
-      // cliente disse que já tem orçamento em andamento -> avisa dono e para o bot
       if (ans === "ongoing") {
         await notifyOwner(
           [
@@ -930,7 +964,6 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      // primeiro contato -> segue o fluxo normal (AGORA mais humano/pro)
       if (ans === "first") {
         session.firstContactResolved = true;
         session.stage = "aguardando_referencia";
@@ -948,7 +981,7 @@ app.post("/zapi", async (req, res) => {
 
       const retry =
         "Só pra eu te direcionar certinho:\n" +
-        "você já tem um orçamento/atendimento em andamento comigo ou é seu primeiro contato?";
+        "você já tem um orçamento/atendimento em andamento comigo ou é o seu primeiro contato?";
       if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
       return;
     }
@@ -961,15 +994,13 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ se está aguardando referência e NÃO tem imagem
+    // ✅ se está aguardando referência e NÃO tem imagem -> pede
     if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
       const reply =
-        "Show.\n\n" +
+        "Tranquilo.\n\n" +
         "Quando puder, me manda:\n" +
-        "• a referência em imagem (print/foto)\n" +
-        "• onde no corpo\n" +
-        "• e o tamanho aproximado\n\n" +
-        "Com isso eu já te digo o melhor caminho pro projeto ficar forte e bem encaixado.";
+        "• referência em imagem (print/foto)\n" +
+        "• onde no corpo + tamanho aproximado";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
@@ -1011,7 +1042,7 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ imagem referência chegou (PRIORIDADE)
+    // ✅ imagem referência chegou -> salva + pede região/tamanho
     if (imageUrl && !isReceiptImage) {
       try {
         const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
@@ -1026,7 +1057,6 @@ app.post("/zapi", async (req, res) => {
           return;
         }
 
-        // reset flags de fluxo
         session.sentSummary = false;
         session.askedDoubts = false;
         session.doubtsResolved = false;
@@ -1065,7 +1095,7 @@ app.post("/zapi", async (req, res) => {
             "Só me confirma:\n" +
             "• onde no corpo\n" +
             "• tamanho aproximado\n" +
-            "e se é pra ficar igual à referência ou se você quer alguma alteração.";
+            "e se é só igual a referência ou quer alguma alteração.";
           if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
           session.sentSummary = true;
         } else {
@@ -1216,6 +1246,40 @@ app.post("/zapi", async (req, res) => {
 
     // fallback final
     await handoffToManual(phone, session, "Fallback geral (não configurado)", message);
+  } catch (err) {
+    console.error("[PROCESS ERROR]", err?.message || err);
+  }
+}
+
+// -------------------- Routes --------------------
+app.get("/", (_req, res) => res.status(200).send("OK"));
+
+app.get("/health", (_req, res) => {
+  const miss = missingEnvs();
+  res.status(miss.length ? 500 : 200).json({
+    ok: miss.length === 0,
+    missing: miss,
+    have: {
+      OPENAI_API_KEY: !!ENV.OPENAI_API_KEY,
+      ZAPI_INSTANCE_ID: !!ENV.ZAPI_INSTANCE_ID,
+      ZAPI_INSTANCE_TOKEN: !!ENV.ZAPI_INSTANCE_TOKEN,
+      ZAPI_CLIENT_TOKEN: !!ENV.ZAPI_CLIENT_TOKEN,
+      PIX_KEY: !!ENV.PIX_KEY,
+      OWNER_PHONE: !!ENV.OWNER_PHONE,
+    },
+  });
+});
+
+// ✅ Webhook responde 200 na hora e SEMPRE espera 10s pra processar (juntar imagem + texto)
+app.post("/zapi", async (req, res) => {
+  res.status(200).json({ ok: true });
+
+  try {
+    const inbound = parseZapiInbound(req.body || {});
+    if (!inbound.phone) return;
+    if (inbound.fromMe) return;
+
+    pushInbound(inbound);
   } catch (err) {
     console.error("[ZAPI WEBHOOK ERROR]", err?.message || err);
   }
