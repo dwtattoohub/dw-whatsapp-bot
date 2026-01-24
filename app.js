@@ -1567,6 +1567,4 @@ app.listen(Number(ENV.PORT || 10000), () => {
   const miss = missingEnvs();
   console.log("🚀 Server on port", ENV.PORT);
   if (miss.length) console.log("⚠️ Missing ENV:", miss.join(", "));
-});
-
-Confirma se ta certo 
+}); 
