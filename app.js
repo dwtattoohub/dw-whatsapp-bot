@@ -786,9 +786,7 @@ app.post("/zapi", async (req, res) => {
       const s2 = getSession(phone);
       const reply =
         "Atendimento reiniciado.\n\n" +
-        const reply = `Perfeito.
-• Se tiver uma imagem de referência (print/foto), me manda pra eu avaliar certinho.
-• E me diz onde no corpo + tamanho aproximado.`;
+        "Me manda a referência em imagem e me diz onde no corpo + tamanho aproximado.";
       if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
       return;
     }
