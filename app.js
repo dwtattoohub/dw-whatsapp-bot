@@ -80,6 +80,16 @@ function getSession(phone) {
       // anti spam/loop
       lastReply: null,
       lastReplyAt: 0,
+
+      // buffer p/ juntar mensagens (imagem + local, etc)
+      pending: {
+        timer: null,
+        textParts: [],
+        lastContactName: null,
+        imageUrl: null,
+        imageMime: "image/jpeg",
+        messageType: "",
+      },
     };
   }
   return sessions[phone];
@@ -95,6 +105,39 @@ function antiRepeat(session, reply) {
   session.lastReply = reply;
   session.lastReplyAt = now;
   return false;
+}
+
+// -------------------- smart delay --------------------
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isSimpleAck(text) {
+  const t = String(text || "").toLowerCase().trim();
+  return /^(ok|blz|beleza|fechou|show|top|tmj|valeu|isso|sim|não|nao)$/i.test(t);
+}
+
+function detectRegionOrSizeHint(text) {
+  const t = (text || "").toLowerCase();
+  return (
+    /(antebra[cç]o|bra[cç]o|ombro|peito|costela|perna|coxa|panturrilha|canela|m[aã]o|pesco[cç]o|nuca|costas|esc[aá]pula|coluna|rosto|cabe[cç]a|tornozelo|punho|dedo)/i.test(
+      t
+    ) ||
+    /(\d+\s*(cm|cent[ií]metro|centimetro|mm|mil[ií]metro|milimetro)|\d+\s*x\s*\d+)/i.test(t)
+  );
+}
+
+function stageIsDoubts(stage) {
+  return stage === "aguardando_duvidas";
+}
+
+function computeDelayMs(session, mergedText, hasImage) {
+  const t = String(mergedText || "");
+  if (hasImage) return 10_000; // referência: sempre 10s
+  if (detectRegionOrSizeHint(t)) return 10_000; // info importante: 10s
+  if (stageIsDoubts(session.stage)) return 5_000; // dúvidas: 5s
+  if (isSimpleAck(t)) return 2_500; // curto e natural
+  return 3_500; // padrão humano
 }
 
 // -------------------- Z-API Send --------------------
@@ -202,66 +245,6 @@ function parseZapiInbound(body) {
   };
 }
 
-// -------------------- ALWAYS-DELAY BUFFER (10s) --------------------
-// Junta texto + imagem que chegam separados e só processa depois do "silêncio" de 10s.
-const inboundBuffer = new Map(); // phone -> { timer, firstAt, lastInbound, messages: [], lastImageUrl, lastImageMime, lastContactName, lastMessageType, fromMe }
-
-function pushInbound(inbound) {
-  const phone = inbound.phone;
-  if (!phone) return;
-
-  const now = Date.now();
-  const existing = inboundBuffer.get(phone) || {
-    timer: null,
-    firstAt: now,
-    lastInbound: null,
-    messages: [],
-    lastImageUrl: null,
-    lastImageMime: "image/jpeg",
-    lastContactName: null,
-    lastMessageType: "",
-    fromMe: false,
-  };
-
-  if (inbound.message && inbound.message.trim()) {
-    existing.messages.push(inbound.message.trim());
-  }
-
-  if (inbound.imageUrl) {
-    existing.lastImageUrl = inbound.imageUrl;
-    existing.lastImageMime = inbound.imageMime || existing.lastImageMime;
-  }
-
-  existing.lastContactName = inbound.contactName || existing.lastContactName;
-  existing.lastMessageType = inbound.messageType || existing.lastMessageType;
-  existing.fromMe = inbound.fromMe || false;
-  existing.lastInbound = inbound;
-
-  if (existing.timer) clearTimeout(existing.timer);
-
-  existing.timer = setTimeout(() => {
-    inboundBuffer.delete(phone);
-
-    const merged = {
-      ...existing.lastInbound,
-      phone,
-      message: existing.messages.join("\n").trim(),
-      imageUrl: existing.lastImageUrl,
-      imageMime: existing.lastImageMime,
-      contactName: existing.lastContactName,
-      messageType: existing.lastMessageType,
-      fromMe: existing.fromMe,
-      raw: existing.lastInbound?.raw,
-    };
-
-    processInboundMerged(merged).catch((e) => {
-      console.error("[PROCESS MERGED ERROR]", e?.message || e);
-    });
-  }, 10_000);
-
-  inboundBuffer.set(phone, existing);
-}
-
 // -------------------- fetchImage --------------------
 async function fetchImageAsDataUrl(url, mimeHint = "image/jpeg") {
   const controller = new AbortController();
@@ -313,13 +296,13 @@ function safeName(name) {
 // -------------------- GREETINGS / CLOSINGS --------------------
 const GREETINGS = [
   (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer, especialista em tatuagens realistas em preto e cinza e whip shading.\n\n` +
-    `Fico feliz em receber sua mensagem!\n\n` +
-    `Pra eu te atender do jeito certo: você já tem um orçamento/atendimento em andamento comigo ou é o seu primeiro contato?`,
+    `Olá${name ? `, ${name}` : ""}! Oi, aqui é o DW Tattooer, especialista em tatuagens realistas em preto e cinza e whip shading.\n\n` +
+    `Pra eu te atender do jeito certo, me diz uma coisa rapidinho:\n` +
+    `Você já tem um *orçamento em andamento* comigo e quer continuar, ou quer *começar um orçamento novo do zero*?`,
   (name) =>
-    `Oi${name ? `, ${name}` : ""}! Aqui é o DW Tattooer, especialista em tatuagens realistas em preto e cinza e whip shading.\n\n` +
-    `Antes da gente seguir, só me confirma rapidinho:\n` +
-    `você já tem um orçamento/atendimento em andamento comigo ou é o seu primeiro contato?`,
+    `Oi${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.\n\n` +
+    `Só pra eu te direcionar certinho:\n` +
+    `Você já tem um *orçamento em andamento* comigo (pra continuar), ou é um *orçamento novo do zero*?`,
 ];
 
 const CLOSINGS = [
@@ -365,12 +348,35 @@ function extractBodyRegion(text) {
   const t = (text || "").toLowerCase();
 
   const regions = [
-    "mão", "mao", "dedo", "punho", "antebraço", "antebraco", "braço", "braco",
-    "ombro", "peito", "costela", "pescoço", "pescoco", "nuca",
-    "pé", "pe", "tornozelo", "panturrilha", "canela",
-    "coxa", "joelho", "virilha",
-    "costas", "escápula", "escapula", "coluna",
-    "rosto", "cabeça", "cabeca",
+    "mão",
+    "mao",
+    "dedo",
+    "punho",
+    "antebraço",
+    "antebraco",
+    "braço",
+    "braco",
+    "ombro",
+    "peito",
+    "costela",
+    "pescoço",
+    "pescoco",
+    "nuca",
+    "pé",
+    "pe",
+    "tornozelo",
+    "panturrilha",
+    "canela",
+    "coxa",
+    "joelho",
+    "virilha",
+    "costas",
+    "escápula",
+    "escapula",
+    "coluna",
+    "rosto",
+    "cabeça",
+    "cabeca",
   ];
 
   for (const r of regions) {
@@ -417,7 +423,10 @@ function detectColorIntentBySummary(summary) {
 function detectBWAccept(text) {
   const t = (text || "").toLowerCase();
   if (/\b(sim|aceito|pode|fechado|bora|ok|topo|manda|vamo)\b/i.test(t)) return "yes";
-  if (/\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t)) return "no";
+  if (
+    /\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t)
+  )
+    return "no";
   return "";
 }
 
@@ -431,29 +440,38 @@ function detectCommercialPref(text) {
 
 function detectNoSpecificDate(text) {
   const t = (text || "").toLowerCase();
-  return /pr[oó]xim[ao]\s*(hor[aá]rio|data)\s*(livre|dispon[ií]vel)|qualquer\s*data|pr[oó]xima\s*data|pode\s*marcar\s*no\s*pr[oó]ximo|o\s*que\s*voc[eê]\s*tiver/i.test(t);
+  return /pr[oó]xim[ao]\s*(hor[aá]rio|data)\s*(livre|dispon[ií]vel)|qualquer\s*data|pr[oó]xima\s*data|pode\s*marcar\s*no\s*pr[oó]ximo|o\s*que\s*voc[eê]\s*tiver/i.test(
+    t
+  );
 }
 
 function detectHasSpecificDate(text) {
   const t = (text || "").toLowerCase();
-  return /(\d{1,2}\/\d{1,2})|(\d{1,2}\-\d{1,2})|dia\s*\d{1,2}|(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)/i.test(t);
+  return /(\d{1,2}\/\d{1,2})|(\d{1,2}\-\d{1,2})|dia\s*\d{1,2}|(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)/i.test(
+    t
+  );
 }
 
 // comprovante confirmado só com FOTO (imageUrl) após orçamento
 function detectDepositTextOnly(text) {
   const t = (text || "").toLowerCase();
-  return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(t);
+  return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(
+    t
+  );
 }
 
 function detectWillSendReceipt(text) {
   const t = (text || "").toLowerCase();
   return (
-    /(ja\s*ja|já\s*já|logo|daqui\s*a\s*pouco|vou\s*mandar|já\s*vou\s*mandar|vou\s*enviar|ja\s*envio|já\s*envio|assim\s*que\s*eu\s*fizer|assim\s*que\s*eu\s*conseguir|to\s*fazendo|tô\s*fazendo)/i.test(t) &&
+    /(ja\s*ja|já\s*já|logo|daqui\s*a\s*pouco|vou\s*mandar|já\s*vou\s*mandar|vou\s*enviar|ja\s*envio|já\s*envio|assim\s*que\s*eu\s*fizer|assim\s*que\s*eu\s*conseguir|to\s*fazendo|tô\s*fazendo)/i.test(
+      t
+    ) &&
     /(comprovante|pix|sinal|transfer|pagamento)/i.test(t)
   );
 }
 
 function detectReceiptContext(session, message) {
+  // evita o bot tentar analisar comprovante como "referência"
   const t = (message || "").toLowerCase();
   if (session.stage === "pos_orcamento" || session.sentQuote) return true;
   if (session.depositDeadlineAt && session.depositDeadlineAt > 0) return true;
@@ -465,13 +483,15 @@ function detectReceiptContext(session, message) {
 function detectFirstContactAnswer(text) {
   const t = (text || "").toLowerCase().trim();
 
-  // EM ANDAMENTO
+  // EM ANDAMENTO (continuar orçamento)
   if (/^n[aã]o$|^nao$/.test(t)) return "ongoing";
-  if (/andamento|já\s*tenho|ja\s*tenho|or[cç]amento|atendimento|em\s*andamento|continuar/i.test(t)) return "ongoing";
+  if (/andamento|or[cç]amento\s*em\s*andamento|continuar|dar\s*continuidade|já\s*tenho|ja\s*tenho|já\s*fiz|ja\s*fiz/i.test(t))
+    return "ongoing";
 
-  // PRIMEIRO CONTATO
+  // ORÇAMENTO NOVO (do zero)
   if (/^sim$/.test(t)) return "first";
-  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando|novo\s*or[cç]amento/i.test(t)) return "first";
+  if (/primeir[ao]|1a\s*vez|primeira\s*vez|novo\s*or[cç]amento|do\s*zero|come[cç]ando|comecando|novo/i.test(t))
+    return "first";
 
   return "";
 }
@@ -508,14 +528,14 @@ function msgDorResposta() {
     "• A dor varia bastante de pessoa e região.\n" +
     "• A maioria descreve como uma ardência/arranhão forte.\n" +
     "• Eu vou ajustando ritmo e pausas pra ficar confortável.\n\n" +
-    "Me diz qual região do corpo que você pretende fazer."
+    "Me diz qual região do corpo você pretende fazer."
   );
 }
 
 function msgTempoResposta() {
   return (
     "Boa.\n\n" +
-    "• O tempo varia pelo tamanho + nível de detalhe (sombras, textura, contraste e acabamento).\n" +
+    "• O tempo varia pelo tamanho + nível de detalhe (sombras, textura e transições).\n" +
     "• Meu foco é entregar qualidade e cicatrização correta.\n\n" +
     "Me diz local no corpo e tamanho aproximado."
   );
@@ -533,8 +553,8 @@ function msgPrecoAntesDoValor() {
 function msgHesitacaoResposta() {
   return (
     "Tranquilo.\n\n" +
-    "• O que tá pegando mais: desenho, valor ou data?\n" +
-    "• Se tiver uma data preferencial, me fala pra eu tentar priorizar."
+    "Pra eu te ajudar de verdade: o que tá pesando mais agora — desenho, valor ou data?\n" +
+    "Se tiver uma data preferencial, me fala que eu tento priorizar."
   );
 }
 
@@ -551,19 +571,21 @@ function sessionsFromHours(hours) {
 
 // -------------------- OpenAI prompts --------------------
 const BASE_SYSTEM = (ENV.SYSTEM_PROMPT || `
-Você é um tatuador profissional atendendo no WhatsApp (tom humano e profissional).
+Você é o DW Tattooer, tatuador profissional atendendo no WhatsApp (tom humano, direto e profissional).
 Regras:
 - Nunca diga que é IA.
 - Não assine mensagem.
-- Não fale de horas nem preço/hora para o cliente (isso é interno).
-- Antes de falar preço: explique o valor do trabalho (complexidade, sombras, transições, acabamento, encaixe).
-- Você trabalha com whip shading.
+- Não use termos estranhos tipo "acabamento bem limpo". Fale como tatuador de verdade.
+- Não fale de horas nem preço/hora pro cliente (isso é interno).
+- Antes de falar preço: explique o valor do trabalho de forma simples (complexidade, sombras, transições, encaixe, cicatrização).
+- Você trabalha com realismo em preto e cinza + whip shading.
 - Você não faz sessões acima de 7 horas; se passar disso, divide em 2+ sessões (sem falar horas).
 - Pagamento: Pix, débito, crédito até 12x.
 - Inclui 1 retoque se necessário em 40–50 dias.
-- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais, com ajuste no total.
+- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais.
 - Cobertura: peça foto da tattoo atual, e diga que vai analisar antes de confirmar.
 - Criação: você faz criações exclusivas baseadas na referência e adapta ao corpo do cliente.
+- Depois de fechar (depósito e agenda), responda apenas dúvidas simples e práticas.
 `).trim();
 
 async function describeImageForClient(imageDataUrl) {
@@ -578,7 +600,7 @@ async function describeImageForClient(imageDataUrl) {
           {
             type: "text",
             text:
-              "Analise a referência e gere uma explicação curta, direta e profissional do que o projeto exige (sombras, transições, volume, contraste, acabamento, encaixe). NÃO fale de preço, NÃO fale de horas. 5 a 8 linhas no máximo. Sem enfeitar.",
+              "Analise a referência e gere uma explicação curta, direta e profissional do que o projeto exige (sombras, transições, volume, contraste, encaixe). NÃO fale de preço, NÃO fale de horas. 5 a 8 linhas no máximo.",
           },
           { type: "image_url", image_url: { url: imageDataUrl } },
         ],
@@ -620,32 +642,63 @@ Estime horas inteiras.`,
   return Math.min(30, n);
 }
 
+// “máxima inteligência nas dúvidas”: responde a dúvida com GPT (curto e tatuador real) e volta pro fluxo
+async function answerClientDoubtSmart(question, session) {
+  const context = [
+    session.bodyRegion ? `Região: ${session.bodyRegion}` : null,
+    session.sizeLocation ? `Tamanho/descrição: ${session.sizeLocation}` : null,
+    session.isCoverup ? "É cobertura: sim" : "É cobertura: não",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o",
+    temperature: 0.45,
+    messages: [
+      { role: "system", content: BASE_SYSTEM },
+      {
+        role: "user",
+        content:
+          `Cliente perguntou: "${String(question || "").slice(0, 700)}"\n` +
+          `Contexto do atendimento: ${context || "não informado"}\n\n` +
+          "Responda como o DW Tattooer, de forma humana, objetiva e profissional. " +
+          "No máximo 6 linhas. Termine perguntando se ficou claro e se podemos seguir (ele responde OK).",
+      },
+    ],
+  });
+
+  return resp.choices?.[0]?.message?.content?.trim() || "";
+}
+
 // -------------------- Replies --------------------
 function msgCriacao() {
   return (
     "Sim — eu faço *criações exclusivas*.\n" +
-    "A referência serve como base, e eu adapto a composição pro teu corpo (encaixe, proporção e leitura), mantendo o estilo do meu trabalho."
+    "A referência serve como base, e eu adapto a composição pro teu corpo (encaixe, proporção e leitura), mantendo meu estilo."
   );
 }
 
 function msgCoberturaPedirFoto() {
   return (
-    "Sobre *cobertura*: me manda uma foto bem nítida da tattoo atual (de perto e de um pouco mais longe).\n\n" +
-    "Assim eu analiso e te falo com sinceridade se dá pra fazer ou não."
+    "Sobre *cobertura*: me manda uma foto bem nítida da tattoo atual (de perto e um pouco mais longe).\n\n" +
+    "Aí eu analiso e te falo com sinceridade se dá pra fazer ou se vale outro caminho."
   );
 }
 
-function msgPedirLocalOuTamanho() {
+function msgPedirLocalOuTamanhoMaisHumano() {
   return (
-    "Me diz rapidinho:\n" +
-    "• onde no corpo você quer fazer\n" +
-    "• e o tamanho aproximado (se não souber em cm, descreve como você imagina)."
+    "Fechado — agora vamos deixar isso bem redondo.\n\n" +
+    "Me manda só mais duas coisas pra eu te passar um orçamento certinho:\n" +
+    "• *onde no corpo* você quer fazer\n" +
+    "• *tamanho aproximado* (se não souber em cm, descreve na mão mesmo)\n\n" +
+    "Se tiver alguma alteração além da referência, pode falar também."
   );
 }
 
 function msgSoBlackGrey() {
   return (
-    "Só pra alinhar:\n\n" +
+    "Só pra alinhar rapidinho:\n\n" +
     "• Eu trabalho com *black & grey* (preto e cinza).\n" +
     "• Não faço tatuagem totalmente colorida.\n\n" +
     "Se você curtir em preto e cinza, eu sigo e deixo bem forte."
@@ -730,7 +783,8 @@ function msgCuidadosPreSessao() {
     "Antes da sessão:\n\n" +
     "• Beba bastante água.\n" +
     "• Evite álcool no dia anterior.\n" +
-    "• Se alimente bem antes de vir."
+    "• Se alimente bem antes de vir.\n" +
+    "• Se puder, usar *creme hidratante* na região nos dias anteriores ajuda bastante a pele (pigmento e durabilidade agradecem)."
   );
 }
 
@@ -783,472 +837,522 @@ async function handoffToManual(phone, session, motivo, mensagemCliente) {
   if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
 }
 
-// -------------------- MAIN PROCESSOR (runs after 10s) --------------------
-async function processInboundMerged(inbound) {
-  try {
-    const miss = missingEnvs();
-    if (miss.length) {
-      console.warn("[ENV Missing]", miss.join(", "));
-      return;
-    }
+// -------------------- Buffer / Merge inbound --------------------
+function enqueueInbound(session, inbound) {
+  const p = session.pending;
+  if (inbound.contactName) p.lastContactName = inbound.contactName;
 
-    const { phone, message, imageUrl, imageMime, fromMe, messageType, contactName } = inbound;
+  // guarda partes de texto
+  const msg = String(inbound.message || "").trim();
+  if (msg) p.textParts.push(msg);
 
-    console.log("[IN MERGED]", {
-      phone,
-      fromMe,
-      messageType,
-      hasImageUrl: !!imageUrl,
-      messagePreview: (message || "").slice(0, 180),
+  // guarda imagem (se veio)
+  if (inbound.imageUrl) {
+    p.imageUrl = inbound.imageUrl;
+    p.imageMime = inbound.imageMime || "image/jpeg";
+  }
+
+  p.messageType = inbound.messageType || p.messageType || "";
+
+  // reseta timer e agenda processamento com delay inteligente
+  if (p.timer) clearTimeout(p.timer);
+
+  const mergedTextPreview = p.textParts.join(" \n");
+  const delay = computeDelayMs(session, mergedTextPreview, Boolean(p.imageUrl));
+
+  p.timer = setTimeout(() => {
+    p.timer = null;
+    const mergedText = p.textParts.join("\n").trim();
+    const merged = {
+      phone: inbound.phone,
+      message: mergedText,
+      imageUrl: p.imageUrl,
+      imageMime: p.imageMime,
+      contactName: p.lastContactName,
+      messageType: p.messageType,
+    };
+
+    // limpa buffer antes de processar (pra não duplicar)
+    p.textParts = [];
+    p.imageUrl = null;
+    p.imageMime = "image/jpeg";
+    p.messageType = "";
+
+    // processa (async)
+    processMergedInbound(merged.phone, merged).catch((e) => {
+      console.error("[PROCESS MERGED ERROR]", e?.message || e);
     });
+  }, delay);
+}
 
-    if (!phone) return;
-    if (fromMe) return;
+// -------------------- Core processor --------------------
+async function processMergedInbound(phone, merged) {
+  const session = getSession(phone);
 
-    const session = getSession(phone);
-    const lower = (message || "").toLowerCase();
+  const message = String(merged.message || "").trim();
+  const lower = message.toLowerCase();
+  const imageUrl = merged.imageUrl || null;
+  const imageMime = merged.imageMime || "image/jpeg";
+  const contactName = merged.contactName || null;
 
-    // ✅ se já entrou em handoff manual
-    if (session.manualHandoff) {
-      if ((session.stage === "pos_agenda_manual" || session.stage === "manual_pendente") && detectThanks(message)) {
-        const reply = chooseClosingOnce(session);
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.finished = true;
-        session.stage = "finalizado";
-      }
+  console.log("[MERGED IN]", {
+    phone,
+    stage: session.stage,
+    hasImageUrl: !!imageUrl,
+    messagePreview: (message || "").slice(0, 160),
+  });
+
+  // ✅ se já entrou em handoff manual
+  if (session.manualHandoff) {
+    if ((session.stage === "pos_agenda_manual" || session.stage === "manual_pendente") && detectThanks(message)) {
+      const reply = chooseClosingOnce(session);
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.finished = true;
+      session.stage = "finalizado";
+    }
+    return;
+  }
+
+  // ✅ comando reset
+  if (/^reset$|^reiniciar$|^reinicia$|^começar\s*novamente$|^comecar\s*novamente$/i.test(lower)) {
+    resetSession(phone);
+    const s2 = getSession(phone);
+    const reply =
+      "Atendimento reiniciado.\n\n" +
+      "Me manda a referência em imagem e me diz onde no corpo + tamanho aproximado.";
+    if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // ✅ endereço
+  if (askedAddress(message)) {
+    const reply = msgEndereco();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // ✅ pix
+  if (askedPix(message)) {
+    const reply = msgPixDireto();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // intents (dor/tempo/preço/hesitação)
+  const pain = askedPain(message);
+  const timeAsk = askedTime(message);
+  const priceAsk = askedPrice(message);
+  const hes = askedHesitation(message);
+
+  if (pain && !session.finished) {
+    const reply = msgDorResposta();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  if (timeAsk && !session.finished) {
+    const reply = msgTempoResposta();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  if (hes && !session.finished) {
+    const reply = msgHesitacaoResposta();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  if (priceAsk && !session.finished) {
+    if (!session.imageDataUrl || (!session.bodyRegion && !session.sizeLocation)) {
+      const reply = msgPrecoAntesDoValor();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
+  }
 
-    // ✅ comando reset
-    if (/^reset$|^reiniciar$|^reinicia$|^começar\s*novamente$|^comecar\s*novamente$/i.test(lower)) {
-      resetSession(phone);
-      const s2 = getSession(phone);
+  // intents gerais
+  if (detectCoverup(message)) session.isCoverup = true;
+  const askedCreation = /cria|criação|desenho|autor|exclusiv/i.test(lower);
+
+  const maybeRegion = extractBodyRegion(message);
+  if (!session.bodyRegion && maybeRegion) session.bodyRegion = maybeRegion;
+
+  const maybeSizeLoc = extractSizeLocation(message);
+  if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
+
+  if (!session.finished && detectColorIntentByText(message)) {
+    session.awaitingBWAnswer = true;
+    const reply = msgSoBlackGrey();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  if (askedCreation) {
+    const reply = msgCriacao();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    // não returna, deixa seguir fluxo
+  }
+
+  // ✅ aceitar/recusar preto e cinza
+  if (session.awaitingBWAnswer) {
+    const bw = detectBWAccept(message);
+    if (bw === "no") {
+      session.finished = true;
+      session.stage = "finalizado";
+      const reply = msgFinalizaPorNaoAceitarBW();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+    if (bw === "yes") session.awaitingBWAnswer = false;
+  }
+
+  // -------------------- PRAZO 12H (cancelamento) --------------------
+  if (session.depositDeadlineAt && !session.depositConfirmed) {
+    const now = Date.now();
+    if (now > session.depositDeadlineAt) {
       const reply =
-        "Atendimento reiniciado.\n\n" +
-        "Me manda a referência em imagem e me diz onde no corpo + tamanho aproximado.";
-      if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    // ✅ endereço
-    if (askedAddress(message)) {
-      const reply = msgEndereco();
+        "Certo.\n\n" +
+        "Como o comprovante não chegou dentro do prazo, eu cancelei a reserva e o horário voltou pra agenda.\n" +
+        "Se você ainda quiser fazer, me chama aqui que a gente retoma e vê novos horários.";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    // ✅ pix
-    if (askedPix(message)) {
-      const reply = msgPixDireto();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    // intents (dor/tempo/preço/hesitação)
-    const pain = askedPain(message);
-    const timeAsk = askedTime(message);
-    const priceAsk = askedPrice(message);
-    const hes = askedHesitation(message);
-
-    if (pain && !session.finished) {
-      const reply = msgDorResposta();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    if (timeAsk && !session.finished) {
-      const reply = msgTempoResposta();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    if (hes && !session.finished) {
-      const reply = msgHesitacaoResposta();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    if (priceAsk && !session.finished) {
-      if (!session.imageDataUrl || (!session.bodyRegion && !session.sizeLocation)) {
-        const reply = msgPrecoAntesDoValor();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-    }
-
-    // intents gerais
-    if (detectCoverup(message)) session.isCoverup = true;
-    const askedCreation = /cria|criação|desenho|autor|exclusiv/i.test(lower);
-
-    const maybeRegion = extractBodyRegion(message);
-    if (!session.bodyRegion && maybeRegion) session.bodyRegion = maybeRegion;
-
-    const maybeSizeLoc = extractSizeLocation(message);
-    if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
-
-    if (!session.finished && detectColorIntentByText(message)) {
-      session.awaitingBWAnswer = true;
-      const reply = msgSoBlackGrey();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    if (askedCreation) {
-      const reply = msgCriacao();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      // não returna, deixa seguir fluxo
-    }
-
-    // ✅ aceitar/recusar preto e cinza
-    if (session.awaitingBWAnswer) {
-      const bw = detectBWAccept(message);
-      if (bw === "no") {
-        session.finished = true;
-        session.stage = "finalizado";
-        const reply = msgFinalizaPorNaoAceitarBW();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-      if (bw === "yes") session.awaitingBWAnswer = false;
-    }
-
-    // -------------------- PRAZO 12H (cancelamento) --------------------
-    if (session.depositDeadlineAt && !session.depositConfirmed) {
-      const now = Date.now();
-      if (now > session.depositDeadlineAt) {
-        const reply =
-          "Certo.\n\n" +
-          "Como o comprovante não chegou dentro do prazo, eu cancelei a reserva e o horário voltou pra agenda.\n" +
-          "Se você ainda quiser fazer, me chama aqui que a gente retoma e vê novos horários.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-        await notifyOwner(
-          [
-            "⏰ PRAZO EXPIRADO (bot)",
-            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-            "• Ação: reserva cancelada (12h sem comprovante)",
-          ].join("\n")
-        );
-
-        resetSession(phone);
-        return;
-      }
-    }
-
-    // -------------------- FLUXO (gate do primeiro contato) --------------------
-    if (session.stage === "inicio") {
-      const reply = chooseGreetingOnce(session, contactName);
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-      session.greeted = true;
-      session.askedFirstContact = true;
-      session.stage = "aguardando_primeiro_contato";
-      return;
-    }
-
-    if (session.stage === "aguardando_primeiro_contato") {
-      const ans = detectFirstContactAnswer(message);
-
-      if (ans === "ongoing") {
-        await notifyOwner(
-          [
-            "⚠️ CLIENTE DISSE QUE JÁ TEM ORÇAMENTO/ATENDIMENTO EM ANDAMENTO COM VOCÊ",
-            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-            `• Mensagem: ${(message || "").slice(0, 400)}`,
-            "• Ação: você assume a conversa (bot parou).",
-          ].join("\n")
-        );
-
-        session.manualHandoff = true;
-        session.stage = "manual_pendente";
-        return;
-      }
-
-      if (ans === "first") {
-        session.firstContactResolved = true;
-        session.stage = "aguardando_referencia";
-
-        const reply =
-          "Perfeito — seja bem-vindo(a)!\n\n" +
-          "Bora montar um projeto bem da hora e com a tua cara.\n\n" +
-          "Pra eu já te orientar certinho, me manda:\n" +
-          "• uma referência em imagem (se tiver)\n" +
-          "• onde no corpo você quer fazer\n" +
-          "• e o tamanho aproximado (pode ser em cm ou só uma noção)";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      const retry =
-        "Só pra eu te direcionar certinho:\n" +
-        "você já tem um orçamento/atendimento em andamento comigo ou é o seu primeiro contato?";
-      if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
-      return;
-    }
-
-    // ✅ coverup sem imagem
-    if (session.isCoverup && !session.imageDataUrl && !imageUrl) {
-      const reply = msgCoberturaPedirFoto();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.stage = "aguardando_referencia";
-      return;
-    }
-
-    // ✅ se está aguardando referência e NÃO tem imagem -> pede
-    if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
-      const reply =
-        "Tranquilo.\n\n" +
-        "Quando puder, me manda:\n" +
-        "• referência em imagem (print/foto)\n" +
-        "• onde no corpo + tamanho aproximado";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    // ✅ comprovante por texto sem foto (depois do orçamento)
-    const depositTextOnly = detectDepositTextOnly(message);
-    const isAfterQuote = session.stage === "pos_orcamento" || session.sentQuote;
-
-    if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterQuote) {
-      if (detectWillSendReceipt(message)) {
-        session.waitingReceipt = true;
-        const reply = msgFicoNoAguardoComprovante();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      const reply = msgAguardandoComprovante();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    // ✅ FOTO do comprovante (prioridade)
-    const isReceiptImage = Boolean(imageUrl) && detectReceiptContext(session, message);
-    if (!session.depositConfirmed && isReceiptImage && isAfterQuote) {
-      session.depositConfirmed = true;
-      session.stage = "agenda";
-      session.askedSchedule = true;
 
       await notifyOwner(
         [
-          "⚠️ COMPROVANTE RECEBIDO (bot)",
+          "⏰ PRAZO EXPIRADO (bot)",
           `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-          "• Próximo passo: você confirma agenda manualmente",
+          "• Ação: reserva cancelada (12h sem comprovante)",
         ].join("\n")
       );
 
-      const reply = msgPerguntaAgenda();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      resetSession(phone);
       return;
     }
-
-    // ✅ imagem referência chegou -> salva + pede região/tamanho
-    if (imageUrl && !isReceiptImage) {
-      try {
-        const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
-        session.imageDataUrl = dataUrl;
-
-        session.imageSummary = await describeImageForClient(dataUrl);
-
-        if (detectColorIntentBySummary(session.imageSummary)) {
-          session.awaitingBWAnswer = true;
-          const reply = msgSoBlackGrey();
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-
-        session.sentSummary = false;
-        session.askedDoubts = false;
-        session.doubtsResolved = false;
-        session.sentQuote = false;
-
-        session.stage = "aguardando_info";
-
-        if (!session.bodyRegion && !session.sizeLocation) {
-          const reply = msgPedirLocalOuTamanho();
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-      } catch (e) {
-        console.error("[IMG] failed:", e?.message || e);
-        session.stage = "aguardando_info";
-        if (!session.bodyRegion && !session.sizeLocation) {
-          const reply = msgPedirLocalOuTamanho();
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-      }
-    }
-
-    // ✅ se tem imagem e está aguardando info -> manda resumo / dúvidas
-    if (session.imageDataUrl && session.stage === "aguardando_info") {
-      if (!session.bodyRegion && !session.sizeLocation) {
-        const reply = msgPedirLocalOuTamanho();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      if (!session.sentSummary) {
-        if (!session.imageSummary) {
-          const reply =
-            "Recebi a referência.\n\n" +
-            "Só me confirma:\n" +
-            "• onde no corpo\n" +
-            "• tamanho aproximado\n" +
-            "e se é só igual a referência ou quer alguma alteração.";
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          session.sentSummary = true;
-        } else {
-          const intro =
-            "Recebi a referência.\n\n" +
-            "Pra esse projeto ficar bem feito, ele exige:\n\n" +
-            session.imageSummary;
-          if (!antiRepeat(session, intro)) await zapiSendText(phone, intro);
-          session.sentSummary = true;
-        }
-      }
-
-      if (!session.askedDoubts) {
-        const reply = msgChecagemDuvidas();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.askedDoubts = true;
-        session.stage = "aguardando_duvidas";
-        return;
-      }
-
-      session.stage = "aguardando_duvidas";
-    }
-
-    // -------------------- DÚVIDAS -> ORÇAMENTO --------------------
-    if (session.stage === "aguardando_duvidas") {
-      if (answeredNoDoubts(message)) {
-        session.doubtsResolved = true;
-
-        const infoParaCalculo =
-          session.sizeLocation ||
-          (session.bodyRegion ? `Região do corpo: ${session.bodyRegion} (tamanho não informado)` : "não informado");
-
-        const hours = await estimateHoursInternal(session.imageDataUrl, infoParaCalculo, session.isCoverup);
-        const sessoes = sessionsFromHours(hours);
-        const valor = calcPriceFromHours(hours);
-
-        const quote = msgOrcamentoCompleto(valor, sessoes);
-        if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
-
-        session.sentDepositDeadlineInfo = true;
-        session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
-
-        session.sentQuote = true;
-        session.stage = "pos_orcamento";
-        return;
-      }
-
-      if (pain || timeAsk || priceAsk || hes || /\?/.test(message)) {
-        const reply =
-          "Entendi.\n\n" +
-          "Me fala rapidinho qual é a dúvida principal que eu te explico e já seguimos.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      await handoffToManual(phone, session, "Mensagem fora do fluxo (etapa dúvidas)", message);
-      return;
-    }
-
-    // -------------------- PÓS ORÇAMENTO --------------------
-    if (session.stage === "pos_orcamento") {
-      if (detectWillSendReceipt(message)) {
-        session.waitingReceipt = true;
-        const reply = msgFicoNoAguardoComprovante();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
-        const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
-        const reply =
-          "Fechado.\n\n" +
-          "Pra reservar teu horário eu peço um *sinal de R$ 50*.\n" +
-          pixLine +
-          "Depois me manda a *foto do comprovante* aqui no Whats.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      if (/mensal|por mês|dividir|parcelar por mês/i.test(lower)) {
-        const reply =
-          "Dá sim.\n\n" +
-          "Eu consigo organizar em *sessões mensais*.\n" +
-          "Me diz em quantos meses você prefere que eu já te proponho o formato certinho.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      if (maybeRegion || maybeSizeLoc) {
-        session.sentSummary = false;
-        session.askedDoubts = false;
-        session.doubtsResolved = false;
-        session.sentQuote = false;
-        session.stage = "aguardando_info";
-        const reply = "Boa — com essa info eu ajusto certinho. Só um instante.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      await handoffToManual(phone, session, "Mensagem fora do fluxo (pós orçamento)", message);
-      return;
-    }
-
-    // -------------------- AGENDA --------------------
-    if (session.stage === "agenda") {
-      const pref = detectCommercialPref(message);
-      const hasDate = detectHasSpecificDate(message);
-      const noDate = detectNoSpecificDate(message);
-
-      if (pref || hasDate || noDate) {
-        session.scheduleCaptured = true;
-        session.manualHandoff = true;
-        session.stage = "pos_agenda_manual";
-
-        await notifyOwner(
-          [
-            "🗓️ PREFERÊNCIA DE AGENDA (bot)",
-            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-            `• Mensagem: ${(message || "").slice(0, 400)}`,
-            "• Ação: confirmar agendamento manualmente e responder o cliente",
-          ].join("\n")
-        );
-
-        if (noDate && !hasDate) {
-          const reply = [msgVouVerificarAgendaSemData(), "", msgCuidadosPreSessao()].join("\n\n");
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-
-        if (hasDate) {
-          const reply = [msgVouVerificarAgendaComData(), "", msgCuidadosPreSessao()].join("\n\n");
-          if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-          return;
-        }
-
-        const reply =
-          "Fechado.\n\n" +
-          "Vou verificar minha agenda e já te retorno.\n\n" +
-          msgCuidadosPreSessao();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
-
-      const reply = msgPerguntaAgenda();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    // fallback final
-    await handoffToManual(phone, session, "Fallback geral (não configurado)", message);
-  } catch (err) {
-    console.error("[PROCESS ERROR]", err?.message || err);
   }
+
+  // -------------------- FLUXO (gate primeiro contato) --------------------
+  if (session.stage === "inicio") {
+    const reply = chooseGreetingOnce(session, contactName);
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+
+    session.greeted = true;
+    session.askedFirstContact = true;
+    session.stage = "aguardando_primeiro_contato";
+    return;
+  }
+
+  if (session.stage === "aguardando_primeiro_contato") {
+    const ans = detectFirstContactAnswer(message);
+
+    // já tem orçamento em andamento -> avisa dono e para
+    if (ans === "ongoing") {
+      await notifyOwner(
+        [
+          "⚠️ CLIENTE DISSE QUE JÁ TEM ORÇAMENTO EM ANDAMENTO (quer continuar)",
+          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+          `• Mensagem: ${(message || "").slice(0, 400)}`,
+          "• Ação: você assume a conversa (bot parou).",
+        ].join("\n")
+      );
+
+      session.manualHandoff = true;
+      session.stage = "manual_pendente";
+      return; // não responde mais nada
+    }
+
+    // orçamento novo -> segue
+    if (ans === "first") {
+      session.firstContactResolved = true;
+      session.stage = "aguardando_referencia";
+
+      const reply =
+        "Show! Então vamos montar um orçamento novo bem certinho.\n\n" +
+        "Pra eu te passar um valor bem fiel, me manda:\n" +
+        "• *a referência em imagem* (se tiver)\n" +
+        "• *onde no corpo* você quer fazer + *tamanho aproximado*\n\n" +
+        "Se você tiver alguma ideia de ajuste além da referência, pode falar também.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    const retry =
+      "Só pra eu te direcionar certinho:\n" +
+      "Você quer *continuar um orçamento em andamento* comigo, ou quer *começar um orçamento novo do zero*?";
+    if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+    return;
+  }
+
+  // ✅ coverup sem imagem
+  if (session.isCoverup && !session.imageDataUrl && !imageUrl) {
+    const reply = msgCoberturaPedirFoto();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    session.stage = "aguardando_referencia";
+    return;
+  }
+
+  // ✅ aguardando referência e não tem imagem
+  if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
+    const reply =
+      "Perfeito.\n\n" +
+      "Quando puder, me manda:\n" +
+      "• *referência em imagem* (print/foto)\n" +
+      "• *onde no corpo* + *tamanho aproximado*";
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // ✅ comprovante por texto sem foto (depois do orçamento)
+  const depositTextOnly = detectDepositTextOnly(message);
+  const isAfterQuote = session.stage === "pos_orcamento" || session.sentQuote;
+
+  if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterQuote) {
+    // “já já mando”
+    if (detectWillSendReceipt(message)) {
+      session.waitingReceipt = true;
+      const reply = msgFicoNoAguardoComprovante();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    const reply = msgAguardandoComprovante();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // ✅ FOTO do comprovante
+  const isReceiptImage = Boolean(imageUrl) && detectReceiptContext(session, message);
+  if (!session.depositConfirmed && isReceiptImage && isAfterQuote) {
+    session.depositConfirmed = true;
+    session.stage = "agenda";
+    session.askedSchedule = true;
+
+    await notifyOwner(
+      [
+        "⚠️ COMPROVANTE RECEBIDO (bot)",
+        `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+        "• Próximo passo: você confirma agenda manualmente",
+      ].join("\n")
+    );
+
+    const reply = msgPerguntaAgenda();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // ✅ imagem referência chegou -> salva + analisa
+  if (imageUrl && !isReceiptImage) {
+    try {
+      const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
+      session.imageDataUrl = dataUrl;
+
+      session.imageSummary = await describeImageForClient(dataUrl);
+
+      if (detectColorIntentBySummary(session.imageSummary)) {
+        session.awaitingBWAnswer = true;
+        const reply = msgSoBlackGrey();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
+      // reset flags
+      session.sentSummary = false;
+      session.askedDoubts = false;
+      session.doubtsResolved = false;
+      session.sentQuote = false;
+
+      session.stage = "aguardando_info";
+
+      if (!session.bodyRegion && !session.sizeLocation) {
+        const reply = msgPedirLocalOuTamanhoMaisHumano();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+    } catch (e) {
+      console.error("[IMG] failed:", e?.message || e);
+      session.stage = "aguardando_info";
+      if (!session.bodyRegion && !session.sizeLocation) {
+        const reply = msgPedirLocalOuTamanhoMaisHumano();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+    }
+  }
+
+  // ✅ se tem imagem e está aguardando info -> manda resumo / dúvidas
+  if (session.imageDataUrl && session.stage === "aguardando_info") {
+    if (!session.bodyRegion && !session.sizeLocation) {
+      const reply = msgPedirLocalOuTamanhoMaisHumano();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    if (!session.sentSummary) {
+      if (!session.imageSummary) {
+        const reply =
+          "Recebi a referência.\n\n" +
+          "Só me confirma:\n" +
+          "• onde no corpo\n" +
+          "• tamanho aproximado\n" +
+          "e se é igual à referência ou quer alguma alteração.";
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        session.sentSummary = true;
+      } else {
+        const intro =
+          "Recebi a referência.\n\n" +
+          "Pra esse projeto ficar bem executado, ele exige:\n\n" +
+          session.imageSummary;
+        if (!antiRepeat(session, intro)) await zapiSendText(phone, intro);
+        session.sentSummary = true;
+      }
+    }
+
+    if (!session.askedDoubts) {
+      const reply = msgChecagemDuvidas();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.askedDoubts = true;
+      session.stage = "aguardando_duvidas";
+      return;
+    }
+
+    session.stage = "aguardando_duvidas";
+  }
+
+  // -------------------- DÚVIDAS -> ORÇAMENTO --------------------
+  if (session.stage === "aguardando_duvidas") {
+    if (answeredNoDoubts(message)) {
+      session.doubtsResolved = true;
+
+      const infoParaCalculo =
+        session.sizeLocation ||
+        (session.bodyRegion ? `Região do corpo: ${session.bodyRegion} (tamanho não informado)` : "não informado");
+
+      const hours = await estimateHoursInternal(session.imageDataUrl, infoParaCalculo, session.isCoverup);
+      const sessoes = sessionsFromHours(hours);
+      const valor = calcPriceFromHours(hours);
+
+      const quote = msgOrcamentoCompleto(valor, sessoes);
+      if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
+
+      // inicia 12h
+      session.sentDepositDeadlineInfo = true;
+      session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
+
+      session.sentQuote = true;
+      session.stage = "pos_orcamento";
+      return;
+    }
+
+    // dúvida real: usa GPT (máxima inteligência) e volta pedindo OK
+    if (pain || timeAsk || priceAsk || hes || /\?/.test(message) || message.length > 5) {
+      const smart = await answerClientDoubtSmart(message, session);
+      if (smart) {
+        if (!antiRepeat(session, smart)) await zapiSendText(phone, smart);
+        return;
+      }
+
+      // fallback simples (se OpenAI falhar)
+      const reply =
+        "Entendi.\n\n" +
+        "Me fala rapidinho qual é a dúvida principal que eu te explico e já seguimos.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    await handoffToManual(phone, session, "Mensagem fora do fluxo (etapa dúvidas)", message);
+    return;
+  }
+
+  // -------------------- PÓS ORÇAMENTO --------------------
+  if (session.stage === "pos_orcamento") {
+    // “já já mando” -> não repete 12h
+    if (detectWillSendReceipt(message)) {
+      session.waitingReceipt = true;
+      const reply = msgFicoNoAguardoComprovante();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    if (/fech|vamos|bora|quero|ok|topo|pode marcar/i.test(lower)) {
+      const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+      const reply =
+        "Fechado.\n\n" +
+        "Pra reservar teu horário eu peço um *sinal de R$ 50*.\n" +
+        pixLine +
+        "Depois me manda a *foto do comprovante* aqui no Whats.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    if (/mensal|por mês|dividir|parcelar por mês/i.test(lower)) {
+      const reply =
+        "Dá sim.\n\n" +
+        "Eu consigo organizar em *sessões mensais*.\n" +
+        "Me diz em quantos meses você prefere que eu já te proponho o formato certinho.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    if (maybeRegion || maybeSizeLoc) {
+      session.sentSummary = false;
+      session.askedDoubts = false;
+      session.doubtsResolved = false;
+      session.sentQuote = false;
+      session.stage = "aguardando_info";
+      const reply = "Boa — com essa info eu ajusto certinho. Só um instante.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    await handoffToManual(phone, session, "Mensagem fora do fluxo (pós orçamento)", message);
+    return;
+  }
+
+  // -------------------- AGENDA --------------------
+  if (session.stage === "agenda") {
+    const pref = detectCommercialPref(message);
+    const hasDate = detectHasSpecificDate(message);
+    const noDate = detectNoSpecificDate(message);
+
+    if (pref || hasDate || noDate) {
+      session.scheduleCaptured = true;
+      session.manualHandoff = true;
+      session.stage = "pos_agenda_manual";
+
+      await notifyOwner(
+        [
+          "🗓️ PREFERÊNCIA DE AGENDA (bot)",
+          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+          `• Mensagem: ${(message || "").slice(0, 400)}`,
+          "• Ação: confirmar agendamento manualmente e responder o cliente",
+        ].join("\n")
+      );
+
+      if (noDate && !hasDate) {
+        const reply = [msgVouVerificarAgendaSemData(), "", msgCuidadosPreSessao()].join("\n\n");
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
+      if (hasDate) {
+        const reply = [msgVouVerificarAgendaComData(), "", msgCuidadosPreSessao()].join("\n\n");
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        return;
+      }
+
+      const reply =
+        "Fechado.\n\n" +
+        "Vou verificar minha agenda e já te retorno.\n\n" +
+        msgCuidadosPreSessao();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    const reply = msgPerguntaAgenda();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    return;
+  }
+
+  // fallback final (bem mais raro agora por causa do buffer + delay)
+  await handoffToManual(phone, session, "Fallback geral (não configurado)", message);
 }
 
 // -------------------- Routes --------------------
@@ -1270,16 +1374,34 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// ✅ Webhook responde 200 na hora e SEMPRE espera 10s pra processar (juntar imagem + texto)
 app.post("/zapi", async (req, res) => {
+  // responde rápido pro webhook
   res.status(200).json({ ok: true });
 
   try {
-    const inbound = parseZapiInbound(req.body || {});
-    if (!inbound.phone) return;
-    if (inbound.fromMe) return;
+    const miss = missingEnvs();
+    if (miss.length) {
+      console.warn("[ENV Missing]", miss.join(", "));
+      return;
+    }
 
-    pushInbound(inbound);
+    const inbound = parseZapiInbound(req.body || {});
+    const { phone, message, imageUrl, imageMime, fromMe, messageType, contactName } = inbound;
+
+    console.log("[IN]", {
+      phone,
+      fromMe,
+      messageType,
+      hasImageUrl: !!imageUrl,
+      messagePreview: (message || "").slice(0, 120),
+    });
+
+    if (!phone) return;
+    if (fromMe) return;
+
+    // bufferiza pra juntar mensagens (imagem + local etc) e aplicar delay global
+    const session = getSession(phone);
+    enqueueInbound(session, { ...inbound, phone, contactName, messageType, imageUrl, imageMime });
   } catch (err) {
     console.error("[ZAPI WEBHOOK ERROR]", err?.message || err);
   }
