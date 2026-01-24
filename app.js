@@ -7,6 +7,7 @@
 // (opcional) SYSTEM_PROMPT
 // (opcional) PIX_KEY
 // (opcional) OWNER_PHONE   // ex: 5544999999999
+// (opcional) PORT          // default 10000
 
 import express from "express";
 import OpenAI from "openai";
@@ -287,6 +288,18 @@ function chooseClosingOnce(session) {
   return session.closingVariant();
 }
 
+// -------------------- Mensagem HUMANA do primeiro contato --------------------
+function msgPrimeiroContatoProximoPasso() {
+  return (
+    "Perfeito — seja bem-vindo(a)! 👊\n\n" +
+    "Bora fazer um trampo bem feito e com a tua cara.\n\n" +
+    "Pra eu te passar um orçamento bem fiel, me manda:\n" +
+    "• uma referência em imagem (se tiver)\n" +
+    "• onde no corpo você quer fazer\n" +
+    "• e o tamanho aproximado (pode ser em cm ou na ideia, tipo “do pulso até metade do antebraço”)."
+  );
+}
+
 // -------------------- Business rules --------------------
 function detectCoverup(text) {
   const t = (text || "").toLowerCase();
@@ -356,7 +369,8 @@ function detectColorIntentBySummary(summary) {
 function detectBWAccept(text) {
   const t = (text || "").toLowerCase();
   if (/\b(sim|aceito|pode|fechado|bora|ok|topo|manda|vamo)\b/i.test(t)) return "yes";
-  if (/\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t)) return "no";
+  if (/\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t))
+    return "no";
   return "";
 }
 
@@ -393,7 +407,6 @@ function detectWillSendReceipt(text) {
 }
 
 function detectReceiptContext(session, message) {
-  // evita o bot tentar analisar comprovante como "referência"
   const t = (message || "").toLowerCase();
   if (session.stage === "pos_orcamento" || session.sentQuote) return true;
   if (session.depositDeadlineAt && session.depositDeadlineAt > 0) return true;
@@ -407,11 +420,13 @@ function detectFirstContactAnswer(text) {
 
   // EM ANDAMENTO
   if (/^n[aã]o$|^nao$/.test(t)) return "ongoing";
-  if (/andamento|já\s*tenho|ja\s*tenho|já\s*falei|ja\s*falei|já\s*conversei|ja\s*conversei|or[cç]amento/i.test(t)) return "ongoing";
+  if (/andamento|já\s*tenho|ja\s*tenho|já\s*falei|ja\s*falei|já\s*conversei|ja\s*conversei|or[cç]amento/i.test(t))
+    return "ongoing";
 
   // PRIMEIRO CONTATO
   if (/^sim$/.test(t)) return "first";
-  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando/i.test(t)) return "first";
+  if (/primeir[ao]|1a\s*vez|primeira\s*vez|primeiro\s*contato|do\s*zero|come[cç]ando|comecando/i.test(t))
+    return "first";
 
   return "";
 }
@@ -478,7 +493,7 @@ function msgHesitacaoResposta() {
   );
 }
 
-// -------------------- Regras de preço --------------------
+// -------------------- Regras de preço (interno) --------------------
 function calcPriceFromHours(hours) {
   const h = Math.max(1, Math.round(Number(hours) || 1));
   return 150 + Math.max(0, h - 1) * 120;
@@ -743,6 +758,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/zapi", async (req, res) => {
+  // responde rápido pro webhook
   res.status(200).json({ ok: true });
 
   try {
@@ -874,7 +890,6 @@ app.post("/zapi", async (req, res) => {
     }
 
     // -------------------- PRAZO 12H (cancelamento) --------------------
-    // Se passou do prazo e ainda não confirmou depósito, cancela e reinicia
     if (session.depositDeadlineAt && !session.depositConfirmed) {
       const now = Date.now();
       if (now > session.depositDeadlineAt) {
@@ -897,9 +912,9 @@ app.post("/zapi", async (req, res) => {
       }
     }
 
-    // -------------------- FLUXO NOVO (com gate do primeiro contato) --------------------
+    // -------------------- FLUXO NOVO (gate do primeiro contato) --------------------
 
-    // ✅ inicio -> manda saudação + pergunta do primeiro contato (SEM pedir referência ainda)
+    // ✅ inicio -> manda saudação + pergunta do primeiro contato
     if (session.stage === "inicio") {
       const reply = chooseGreetingOnce(session, contactName);
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -927,24 +942,20 @@ app.post("/zapi", async (req, res) => {
 
         session.manualHandoff = true;
         session.stage = "manual_pendente";
-        return; // não responde mais nada
+        return;
       }
 
-      // primeiro contato -> segue o fluxo normal
+      // ✅ PRIMEIRO CONTATO -> mensagem humana e segue fluxo
       if (ans === "first") {
         session.firstContactResolved = true;
         session.stage = "aguardando_referencia";
 
-        const reply =
-          "Perfeito.\n\n" +
-          "Me manda:\n" +
-          "• a referência em imagem (se tiver)\n" +
-          "• onde no corpo você quer fazer + tamanho aproximado";
+        const reply = msgPrimeiroContatoProximoPasso();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         return;
       }
 
-      // se não entendeu, pergunta de novo (humano, curto)
+      // se não entendeu
       const retry =
         "Só pra eu te direcionar certinho:\n" +
         "você já tem um orçamento em andamento comigo ou é o primeiro contato?";
@@ -960,7 +971,7 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ se está aguardando referência e NÃO tem imagem -> pede (sem repetir “perfeito” em loop)
+    // ✅ se está aguardando referência e NÃO tem imagem
     if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
       const reply =
         "Tranquilo.\n\n" +
@@ -976,7 +987,6 @@ app.post("/zapi", async (req, res) => {
     const isAfterQuote = session.stage === "pos_orcamento" || session.sentQuote;
 
     if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterQuote) {
-      // se cliente falou “já já mando”, responde só “fico no aguardo”
       if (detectWillSendReceipt(message)) {
         session.waitingReceipt = true;
         const reply = msgFicoNoAguardoComprovante();
@@ -989,7 +999,7 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ FOTO do comprovante (prioridade) — não analisa como referência
+    // ✅ FOTO do comprovante (prioridade)
     const isReceiptImage = Boolean(imageUrl) && detectReceiptContext(session, message);
     if (!session.depositConfirmed && isReceiptImage && isAfterQuote) {
       session.depositConfirmed = true;
@@ -1009,13 +1019,12 @@ app.post("/zapi", async (req, res) => {
       return;
     }
 
-    // ✅ imagem referência chegou (PRIORIDADE) -> salva + pede região/tamanho (SEM mandar coisa repetida)
+    // ✅ imagem referência chegou
     if (imageUrl && !isReceiptImage) {
       try {
         const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
         session.imageDataUrl = dataUrl;
 
-        // se for vídeo/arquivo e o modelo não conseguir ler, não trava: segue pedindo info + handoff se necessário
         session.imageSummary = await describeImageForClient(dataUrl);
 
         if (detectColorIntentBySummary(session.imageSummary)) {
@@ -1025,7 +1034,6 @@ app.post("/zapi", async (req, res) => {
           return;
         }
 
-        // reset flags de fluxo
         session.sentSummary = false;
         session.askedDoubts = false;
         session.doubtsResolved = false;
@@ -1040,7 +1048,6 @@ app.post("/zapi", async (req, res) => {
         }
       } catch (e) {
         console.error("[IMG] failed:", e?.message || e);
-        // não tenta “analisar” — pede info e segue
         session.stage = "aguardando_info";
         if (!session.bodyRegion && !session.sizeLocation) {
           const reply = msgPedirLocalOuTamanho();
@@ -1059,7 +1066,6 @@ app.post("/zapi", async (req, res) => {
       }
 
       if (!session.sentSummary) {
-        // se não conseguiu summary, não inventa: pede 1 frase do que é e segue
         if (!session.imageSummary) {
           const reply =
             "Recebi a referência.\n\n" +
@@ -1106,7 +1112,6 @@ app.post("/zapi", async (req, res) => {
         const quote = msgOrcamentoCompleto(valor, sessoes);
         if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
 
-        // ✅ marca que já falou das 12h e inicia contador de 12h
         session.sentDepositDeadlineInfo = true;
         session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
 
@@ -1115,7 +1120,6 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      // se mandou qualquer coisa diferente, tenta responder humano e curto
       if (pain || timeAsk || priceAsk || hes || /\?/.test(message)) {
         const reply =
           "Entendi.\n\n" +
@@ -1124,14 +1128,12 @@ app.post("/zapi", async (req, res) => {
         return;
       }
 
-      // fallback (sem loop)
       await handoffToManual(phone, session, "Mensagem fora do fluxo (etapa dúvidas)", message);
       return;
     }
 
     // -------------------- PÓS ORÇAMENTO --------------------
     if (session.stage === "pos_orcamento") {
-      // cliente disse "já já mando o comprovante" -> não repete 12h/pix
       if (detectWillSendReceipt(message)) {
         session.waitingReceipt = true;
         const reply = msgFicoNoAguardoComprovante();
