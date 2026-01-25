@@ -46,6 +46,9 @@ function getSession(phone) {
 
       // referência / info
       imageDataUrl: null,
+      descriptionText: null,
+      descriptionConfirmed: false,
+      pendingDescChanges: "",
       imageSummary: null,
       sizeLocation: null,
       bodyRegion: null,
@@ -721,6 +724,56 @@ async function describeImageForClient(imageDataUrl) {
   return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
+async function buildWorkDescription(imageDataUrl, bodyRegion, sizeLocation) {
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0.35,
+      messages: [
+        { role: "system", content: BASE_SYSTEM },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Crie uma descrição objetiva do projeto de tatuagem com base na referência. " +
+                "Inclua região do corpo e tamanho informado, em tom profissional e direto. " +
+                "Não fale de preço nem horas. 4 a 6 linhas no máximo.",
+            },
+            {
+              type: "text",
+              text: `Região: ${bodyRegion || "não informado"} | Tamanho: ${sizeLocation || "não informado"}`,
+            },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+    });
+
+    const content = resp.choices?.[0]?.message?.content?.trim();
+    if (content) return content;
+    return [
+      "Descrição do projeto:",
+      bodyRegion ? `• Região: ${bodyRegion}` : null,
+      sizeLocation ? `• Tamanho: ${sizeLocation}` : null,
+      "• Estilo: realismo black & grey, com sombras e transições suaves.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  } catch (e) {
+    console.error("[DESC BUILD ERROR]", e?.message || e);
+    return [
+      "Descrição do projeto:",
+      bodyRegion ? `• Região: ${bodyRegion}` : null,
+      sizeLocation ? `• Tamanho: ${sizeLocation}` : null,
+      "• Estilo: realismo black & grey, com sombras e transições suaves.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+}
+
 async function estimateHoursInternal(imageDataUrl, sizeLocationOrRegion, isCoverup) {
   const resp = await openai.chat.completions.create({
     model: "gpt-4o",
@@ -930,6 +983,44 @@ function msgOrcamentoCompleto(valor, sessoes) {
     "Depois me manda a *foto do comprovante* aqui.\n\n" +
     depositDeadlineLine()
   );
+}
+
+async function sendQuoteFlow(phone, session, message) {
+  if (!session.imageDataUrl || (!session.sizeLocation && !session.bodyRegion)) {
+    const reply = msgPedirLocalOuTamanhoMaisHumano(message);
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    session.stage = "aguardando_info";
+    return false;
+  }
+
+  try {
+    const info = session.sizeLocation || session.bodyRegion || "não informado";
+    const hours = await estimateHoursInternal(session.imageDataUrl, info, session.isCoverup);
+
+    const valor = calcPriceFromHours(hours);
+    const sessoes = sessionsFromHours(hours);
+
+    const quote = msgOrcamentoCompleto(valor, sessoes);
+    if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
+
+    session.sentQuote = true;
+    session.stage = "pos_orcamento";
+
+    // inicia prazo 12h (a partir do envio do orçamento)
+    session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
+    session.sentDepositDeadlineInfo = true;
+    session.waitingReceipt = false;
+
+    // follow-up 30min pós-orçamento (se sumir)
+    scheduleFollowup30min(phone, session, "pós orçamento");
+    return true;
+  } catch (e) {
+    console.error("[QUOTE ERROR]", e?.message || e);
+
+    // se der erro na estimativa, manda handoff manual (sem travar)
+    await handoffToManual(phone, session, "erro ao estimar orçamento", message);
+    return false;
+  }
 }
 
 // -------------------- HANDOFF manual --------------------
@@ -1297,6 +1388,9 @@ async function processMergedInbound(phone, merged) {
     try {
       const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
       session.imageDataUrl = dataUrl;
+      session.descriptionText = null;
+      session.descriptionConfirmed = false;
+      session.pendingDescChanges = "";
 
       session.imageSummary = await describeImageForClient(dataUrl);
 
@@ -1312,6 +1406,15 @@ async function processMergedInbound(phone, merged) {
       session.askedDoubts = false;
       session.doubtsResolved = false;
       session.sentQuote = false;
+
+      if (session.stage === "aguardando_confirmacao_descricao" || session.stage === "aguardando_ajustes_descricao") {
+        session.stage = "aguardando_ajustes_descricao";
+        await zapiSendText(
+          phone,
+          "Recebi mais uma referência. Deseja ajustar algo com base nela ou posso seguir para o orçamento?"
+        );
+        return;
+      }
 
       session.stage = "aguardando_info";
 
@@ -1342,6 +1445,24 @@ async function processMergedInbound(phone, merged) {
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
 
       scheduleFollowup30min(phone, session, "aguardando info (sem região/tamanho)");
+      return;
+    }
+
+    if (session.bodyRegion && session.sizeLocation) {
+      const desc = await buildWorkDescription(session.imageDataUrl, session.bodyRegion, session.sizeLocation);
+      session.descriptionText = desc;
+      session.descriptionConfirmed = false;
+      session.pendingDescChanges = "";
+      session.stage = "aguardando_confirmacao_descricao";
+
+      await zapiSendText(
+        phone,
+        desc +
+          "\n\nAntes de eu te passar valores, confirma pra mim: está exatamente como você imaginou?\n" +
+          "Se quiser adicionar/remover algo, ou mandar outra referência, pode falar.\n" +
+          "Se estiver tudo certo, responda 'tá certo' e eu sigo para o orçamento."
+      );
+
       return;
     }
 
@@ -1378,49 +1499,89 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
+  if (session.stage === "aguardando_confirmacao_descricao") {
+    const lowerMsg = message.toLowerCase();
+    const confirms = ["ta certo", "tá certo", "sim", "isso", "perfeito", "ok", "fechado", "pode seguir"];
+    const wantsChange = ["nao", "não", "mudar", "alterar", "trocar", "adicionar", "remover", "ajustar"];
+
+    if (confirms.some((w) => lowerMsg.includes(w))) {
+      session.descriptionConfirmed = true;
+      session.stage = "aguardando_resposta_orcamento";
+      await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
+      await sendQuoteFlow(phone, session, message);
+      return;
+    }
+
+    if (wantsChange.some((w) => lowerMsg.includes(w))) {
+      session.stage = "aguardando_ajustes_descricao";
+      await zapiSendText(
+        phone,
+        "Perfeito. Me diga o que deseja adicionar/remover. Se quiser mandar outra referência também posso integrar."
+      );
+      return;
+    }
+
+    await zapiSendText(phone, "Show! Só confirma: está tudo certo com a descrição ou deseja ajustar algo?");
+    return;
+  }
+
+  if (session.stage === "aguardando_ajustes_descricao") {
+    const lowerMsg = message.toLowerCase();
+    const finish = ["pode seguir", "segue", "ta certo", "tá certo", "sim"];
+
+    if (finish.some((w) => lowerMsg.includes(w))) {
+      if (session.pendingDescChanges.trim()) {
+        session.descriptionText = [
+          session.descriptionText,
+          "",
+          "Ajustes solicitados:",
+          session.pendingDescChanges.trim(),
+        ]
+          .filter(Boolean)
+          .join("\n");
+        session.pendingDescChanges = "";
+      }
+      session.stage = "aguardando_confirmacao_descricao";
+      await zapiSendText(phone, `${session.descriptionText}\n\nConfirma que é isso mesmo?`);
+      return;
+    }
+
+    session.pendingDescChanges += `\n${message}`;
+    await zapiSendText(phone, "Fechado, já anotei. Quer ajustar mais algo ou posso seguir para o orçamento?");
+    return;
+  }
+
   // -------------------- ETAPA: DÚVIDAS --------------------
   if (session.stage === "aguardando_duvidas") {
     // se o cliente disse que não tem dúvidas / OK -> gera orçamento
+    if (!session.descriptionConfirmed) {
+      const prematurely = ["ok", "aceito", "fechado", "bora", "quero"];
+      if (prematurely.some((w) => lower.includes(w))) {
+        if (!session.descriptionText && session.imageDataUrl && session.bodyRegion && session.sizeLocation) {
+          const desc = await buildWorkDescription(session.imageDataUrl, session.bodyRegion, session.sizeLocation);
+          session.descriptionText = desc;
+        }
+
+        if (session.descriptionText) {
+          session.stage = "aguardando_confirmacao_descricao";
+          await zapiSendText(
+            phone,
+            session.descriptionText +
+              "\n\nAntes de eu te passar valores, confirma pra mim: está exatamente como você imaginou?"
+          );
+          return;
+        }
+
+        await zapiSendText(phone, "Antes de prosseguir, preciso que você confirme a descrição do projeto.");
+        return;
+      }
+    }
+
     if (answeredNoDoubts(message) || /^ok$/i.test(lower)) {
       session.doubtsResolved = true;
 
-      // exige imagem + info mínima
-      if (!session.imageDataUrl || (!session.sizeLocation && !session.bodyRegion)) {
-        const reply = msgPedirLocalOuTamanhoMaisHumano(message);
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.stage = "aguardando_info";
-        return;
-      }
-
-      // estima horas (interno), calcula preço e sessões (interno) e envia orçamento
-      try {
-        const info = session.sizeLocation || session.bodyRegion || "não informado";
-        const hours = await estimateHoursInternal(session.imageDataUrl, info, session.isCoverup);
-
-        const valor = calcPriceFromHours(hours);
-        const sessoes = sessionsFromHours(hours);
-
-        const quote = msgOrcamentoCompleto(valor, sessoes);
-        if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
-
-        session.sentQuote = true;
-        session.stage = "pos_orcamento";
-
-        // inicia prazo 12h (a partir do envio do orçamento)
-        session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
-        session.sentDepositDeadlineInfo = true;
-        session.waitingReceipt = false;
-
-        // follow-up 30min pós-orçamento (se sumir)
-        scheduleFollowup30min(phone, session, "pós orçamento");
-        return;
-      } catch (e) {
-        console.error("[QUOTE ERROR]", e?.message || e);
-
-        // se der erro na estimativa, manda handoff manual (sem travar)
-        await handoffToManual(phone, session, "erro ao estimar orçamento", message);
-        return;
-      }
+      await sendQuoteFlow(phone, session, message);
+      return;
     }
 
     // se ele mandou uma dúvida de verdade, responde com GPT e mantém na etapa
