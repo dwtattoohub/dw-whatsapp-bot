@@ -591,11 +591,13 @@ function startOfDay(date) {
 }
 
 function fmtDateBR(date) {
-  const d = new Date(date);
-  const dd = String(d.getDate()).padStart(2, "0");
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const yy = d.getFullYear();
-  return `${dd}/${mm}/${yy}`;
+  const formatter = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: GCAL_TZ,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
+  return formatter.format(new Date(date));
 }
 
 function dayOfWeek(date) {
@@ -623,16 +625,12 @@ function overlapsBusy(slotStartISO, slotEndISO, busyRanges) {
 }
 
 function dayOfWeekName(date) {
-  const names = [
-    "domingo",
-    "segunda-feira",
-    "terça-feira",
-    "quarta-feira",
-    "quinta-feira",
-    "sexta-feira",
-    "sábado",
-  ];
-  return names[dayOfWeek(date)];
+  const formatter = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: GCAL_TZ,
+    weekday: "long",
+  });
+  const name = formatter.format(new Date(date));
+  return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
 function buildSuggestionFromDate(slotStart, timeHM) {
@@ -1141,12 +1139,12 @@ function msgPerguntaAgenda() {
 
 function msgOpcoesAgendamentoComDatasDW(suggestions) {
   const lines = [];
-  lines.push("Fechado ✅ Vamos pro *agendamento*.");
-  lines.push("Escolhe uma opção (responde 1, 2 ou 3):");
-  lines.push("");
+  lines.push("Tenho estes horários disponíveis:");
   (suggestions || []).slice(0, 3).forEach((s, idx) => {
     lines.push(`${idx + 1}) ${s.label}`);
   });
+  lines.push("Se algum desses horários ficar bom pra você, me fala 1, 2 ou 3.");
+  lines.push("Se quiser um dia/horário específico, pode mandar também (ex: 15/01/2026 16:00).");
   return lines.join("\n");
 }
 
@@ -1316,14 +1314,7 @@ function msgConfirmacaoDescricao() {
 function msgOrcamentoCompleto(valor, sessoes) {
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
-    `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.\n\n` +
-    "Se o investimento estiver dentro do que você esperava, tenho horários disponíveis para essa semana.\n" +
-    "Aqui estão algumas opções:\n" +
-    "• Pela manhã: 09h — Terça ou Quinta\n" +
-    "• À tarde: 14h — Terça, Quinta ou Sexta\n" +
-    "• À noite: 19h — Terça ou Sexta\n" +
-    "Se algum desses horários ficar bom para você, me avisa.\n" +
-    "Caso prefira um dia ou horário específico, me diz que analiso minha agenda e vejo como encaixar você."
+    `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.`
   );
 }
 
@@ -1345,8 +1336,31 @@ async function sendQuoteFlow(phone, session, message) {
     const quote = msgOrcamentoCompleto(valor, sessoes);
     if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
 
+    const durationMin = session.durationMin || 180;
+    const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
+
+    if (suggestions.length < 3) {
+      const reply = msgVouVerificarAgendaSemData();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      await notifyOwner(
+        [
+          "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
+          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+          "• Ação: verificar agenda manualmente",
+        ].join("\n")
+      );
+      session.manualHandoff = true;
+      session.stage = "manual_pendente";
+    } else {
+      session.suggestedSlots = suggestions;
+      session.waitingSchedule = true;
+      session.stage = "aguardando_escolha_agendamento";
+
+      const reply = msgOpcoesAgendamentoComDatasDW(suggestions);
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    }
+
     session.sentQuote = true;
-    session.stage = "pos_orcamento";
     session.waitingReceipt = false;
 
     // follow-up 30min pós-orçamento (se sumir)
