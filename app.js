@@ -1161,14 +1161,14 @@ function msgAgendamentoPreReserva(resumo) {
 }
 
 function msgPedirSinalPixDepoisAgendar() {
-  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
   return (
-    "Perfeito! Pra garantir o seu horário, o sinal é:\n" +
-    "R$ 50,00\n\n" +
+    "Show! Para finalizar seu agendamento e garantir seu horário, o sinal é de R$ 50,00.\n" +
+    "Esse valor é totalmente abatido no total da tattoo no dia.\n\n" +
     "Chave Pix:\n" +
-    `${pixLine}\n\n` +
-    "Assim que fizer o Pix, me manda o comprovante aqui pra eu confirmar o agendamento ✅\n\n" +
-    depositDeadlineLine()
+    "dwtattooshop@gmail.com\n\n" +
+    "Assim que fizer o Pix, só me enviar o comprovante aqui.\n" +
+    "O prazo para envio é de 4 horas — após isso, o agendamento é cancelado automaticamente pra manter tudo organizado na agenda.\n\n" +
+    "Qualquer coisa, estou aqui."
   );
 }
 
