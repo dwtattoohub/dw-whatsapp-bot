@@ -64,8 +64,12 @@ function getSession(phone) {
       pendingDescChanges: "",
       imageSummary: null,
       sizeLocation: null,
+      sizeCm: null,
       bodyRegion: null,
+      bodyPart: null,
       isCoverup: false,
+      referenceImageUrl: null,
+      hasReferenceImage: false,
 
       // ordem / flags
       greeted: false,
@@ -110,6 +114,8 @@ function getSession(phone) {
       // anti spam/loop
       lastReply: null,
       lastReplyAt: 0,
+      lastQuoteSizeCm: null,
+      lastQuotePrice: null,
 
       // buffer p/ juntar mensagens (imagem + local, etc)
       pending: {
@@ -158,18 +164,13 @@ function normalizeText(input) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
     .trim();
 }
 
 function detectRegionOrSizeHint(text) {
-  const t = (text || "").toLowerCase();
-  return (
-    /(antebra[cç]o|bra[cç]o|ombro|peito|costela|perna|coxa|panturrilha|canela|m[aã]o|pesco[cç]o|nuca|costas|esc[aá]pula|coluna|rosto|cabe[cç]a|tornozelo|punho|dedo)/i.test(
-      t
-    ) ||
-    /(\d+\s*(cm|cent[ií]metro|centimetro|mm|mil[ií]metro|milimetro)|\d+\s*x\s*\d+)/i.test(t)
-  );
+  const t = text || "";
+  return Boolean(parseBodyPart(t) || parseSizeCm(t)) ||
+    /(\d+\s*x\s*\d+)/i.test(t);
 }
 
 function stageIsDoubts(stage) {
@@ -430,61 +431,71 @@ function detectCoverup(text) {
   return /cobertura|cover\s?up|tapar|tampar|por cima|cover/i.test(t);
 }
 
+function parseSizeCm(text) {
+  const t = normalizeText(text);
+
+  let m = t.match(/(\d{1,2})\s*(cm|centimetros|centimetro)\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 60) return n;
+  }
+
+  const hasContext = /\b(tamanho|aprox|aproximado|mais ou menos|uns|cerca|medida)\b/.test(t);
+  if (hasContext) {
+    m = t.match(/\b(\d{1,2})\b/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n >= 1 && n <= 60) return n;
+    }
+  }
+
+  return null;
+}
+
+function parseBodyPart(text) {
+  const t = normalizeText(text);
+  const parts = [
+    { match: /antebraco/, label: "antebraço" },
+    { match: /\bbraco\b/, label: "braço" },
+    { match: /\bombro\b/, label: "ombro" },
+    { match: /\bcostas\b/, label: "costas" },
+    { match: /\bpeito\b/, label: "peito" },
+    { match: /\bperna\b/, label: "perna" },
+    { match: /\bpanturrilha\b/, label: "panturrilha" },
+    { match: /\bcanela\b/, label: "canela" },
+    { match: /\bcoxa\b/, label: "coxa" },
+    { match: /\bjoelho\b/, label: "joelho" },
+    { match: /\bvirilha\b/, label: "virilha" },
+    { match: /\bcostela\b/, label: "costela" },
+    { match: /\bpescoco\b/, label: "pescoço" },
+    { match: /\bmao\b/, label: "mão" },
+    { match: /\bpunho\b/, label: "punho" },
+    { match: /\bdedo\b/, label: "dedo" },
+    { match: /\bpe\b/, label: "pé" },
+    { match: /\btornozelo\b/, label: "tornozelo" },
+    { match: /\bnuca\b/, label: "nuca" },
+    { match: /\bescapula\b/, label: "escápula" },
+    { match: /\bcoluna\b/, label: "coluna" },
+    { match: /\brosto\b/, label: "rosto" },
+    { match: /\bcabeca\b/, label: "cabeça" },
+  ];
+
+  for (const part of parts) {
+    if (part.match.test(t)) return part.label;
+  }
+  return null;
+}
+
 function extractSizeLocation(text) {
+  const size = parseSizeCm(text);
+  if (size !== null) return `${size} cm`;
   const t = (text || "").trim();
-  if (!t) return null;
-  if (!/\d/.test(t)) return null;
+  if (!t || !/\d/.test(t)) return null;
   return t;
 }
 
 function extractBodyRegion(text) {
-  const t = (text || "").toLowerCase();
-
-  const regions = [
-    "mão",
-    "mao",
-    "dedo",
-    "punho",
-    "antebraço",
-    "antebraco",
-    "braço",
-    "braco",
-    "ombro",
-    "peito",
-    "costela",
-    "pescoço",
-    "pescoco",
-    "nuca",
-    "pé",
-    "pe",
-    "tornozelo",
-    "panturrilha",
-    "canela",
-    "coxa",
-    "joelho",
-    "virilha",
-    "costas",
-    "escápula",
-    "escapula",
-    "coluna",
-    "rosto",
-    "cabeça",
-    "cabeca",
-  ];
-
-  for (const r of regions) {
-    if (t.includes(r)) {
-      if (r === "mao") return "mão";
-      if (r === "pescoco") return "pescoço";
-      if (r === "pe") return "pé";
-      if (r === "antebraco") return "antebraço";
-      if (r === "braco") return "braço";
-      if (r === "escapula") return "escápula";
-      if (r === "cabeca") return "cabeça";
-      return r;
-    }
-  }
-  return null;
+  return parseBodyPart(text);
 }
 
 function askedPix(text) {
@@ -878,6 +889,85 @@ function sessionsFromHours(hours) {
   return Math.ceil(h / 7);
 }
 
+function roundToNearest10(n) {
+  return Math.round(n / 10) * 10;
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function computeQuote({ sizeCm, bodyPart, analysis }) {
+  if (!sizeCm) {
+    return { ok: false, reason: "missing_size" };
+  }
+
+  const base = 220;
+  const perCm = 28;
+  let price = base + sizeCm * perCm;
+
+  const regionMultMap = {
+    "antebraço": 1.0,
+    "braço": 1.0,
+    "ombro": 1.05,
+    "perna": 1.05,
+    "coxa": 1.08,
+    "panturrilha": 1.08,
+    "peito": 1.15,
+    "costela": 1.18,
+    "costas": 1.22,
+    "pescoço": 1.12,
+    "mão": 1.12,
+  };
+  const regionMult = regionMultMap[bodyPart] || 1.06;
+  price *= regionMult;
+
+  let complexityMult = 1.0;
+  if (analysis) {
+    const d = analysis.detailLevel || "medio";
+    const bg = analysis.hasBackground === true;
+
+    if (d === "baixo") complexityMult *= 0.98;
+    if (d === "medio") complexityMult *= 1.06;
+    if (d === "alto") complexityMult *= 1.14;
+    if (d === "incerto") complexityMult *= 1.02;
+
+    if (bg) complexityMult *= 1.08;
+
+    const shade = analysis.shadingComplexity || "medio";
+    if (shade === "alto") complexityMult *= 1.08;
+    if (shade === "incerto") complexityMult *= 1.01;
+  } else {
+    complexityMult *= 1.03;
+  }
+  price *= complexityMult;
+
+  price = roundToNearest10(price);
+  price = clamp(price, 350, 2500);
+
+  let sessions = 1;
+  if (sizeCm <= 12) sessions = 1;
+  else if (sizeCm <= 18) sessions = 1;
+  else sessions = 2;
+
+  if (
+    sessions === 1 &&
+    sizeCm >= 14 &&
+    analysis &&
+    analysis.detailLevel === "alto" &&
+    analysis.shadingComplexity === "alto"
+  ) {
+    sessions = 2;
+  }
+
+  return {
+    ok: true,
+    price,
+    sessions,
+    breakdown: { base, perCm, regionMult, complexityMult },
+  };
+}
+
 // -------------------- OpenAI prompts --------------------
 const BASE_SYSTEM = (ENV.SYSTEM_PROMPT || `
 Você é o DW Tattooer, tatuador profissional atendendo no WhatsApp (tom humano, direto e profissional).
@@ -968,6 +1058,112 @@ async function buildWorkDescription(imageDataUrl, bodyRegion, sizeLocation) {
     ]
       .filter(Boolean)
       .join("\n");
+  }
+}
+
+function buildHeuristicAnalysis({ sizeCm, bodyPart, notes }) {
+  const t = normalizeText(notes);
+  const detailHigh = /\b(realismo|retrato|muito detalhado|detalhado|micro|hiperreal|textura|mandala)\b/.test(t);
+  const detailLow = /\b(minimal|simples|linha|tra(c|ç)o leve)\b/.test(t);
+  const hasBackground = /\b(fundo|background|paisagem|cenario|preenchido)\b/.test(t);
+  const shadeHigh = /\b(muita sombra|sombra pesada|preto solido|contraste alto)\b/.test(t);
+  const shadeMedium = /\b(sombra|esfumado|degrade|transicao|whip)\b/.test(t);
+  const lineDense = /\b(linework|linhas finas|tra(c|ç)o fino|ornamento)\b/.test(t);
+
+  let detailLevel = "medio";
+  if (detailHigh) detailLevel = "alto";
+  if (detailLow) detailLevel = "baixo";
+
+  let shadingComplexity = "medio";
+  if (shadeHigh) shadingComplexity = "alto";
+  if (!shadeHigh && !shadeMedium) shadingComplexity = "baixo";
+
+  let lineworkDensity = "medio";
+  if (lineDense) lineworkDensity = "alto";
+  if (detailLow && !lineDense) lineworkDensity = "baixo";
+
+  const elementsCount = /\b(duas|dois|tres|tr[eê]s|quatro|varios|v[áa]rios|muitos|multiplos)\b/.test(t) ? 2 : 1;
+  const sizeLine = sizeCm ? `${sizeCm} cm` : "tamanho a confirmar";
+  const placeLine = bodyPart || "local a confirmar";
+
+  const notesHuman =
+    `Pelo texto, parece um projeto com ${detailLevel} nível de detalhe` +
+    (hasBackground ? " e algum fundo/ornamento" : "") +
+    `. Tamanho ${sizeLine} no ${placeLine}.`;
+
+  return {
+    detailLevel,
+    hasBackground,
+    lineworkDensity,
+    shadingComplexity,
+    elementsCount,
+    notesHuman,
+  };
+}
+
+function normalizeAnalysisPayload(payload, fallback) {
+  const safe = { ...fallback, ...payload };
+  const allowed = ["baixo", "medio", "alto", "incerto"];
+  if (!allowed.includes(safe.detailLevel)) safe.detailLevel = fallback.detailLevel;
+  if (!allowed.includes(safe.lineworkDensity)) safe.lineworkDensity = fallback.lineworkDensity;
+  if (!allowed.includes(safe.shadingComplexity)) safe.shadingComplexity = fallback.shadingComplexity;
+  safe.hasBackground = Boolean(safe.hasBackground);
+  const count = parseInt(safe.elementsCount, 10);
+  safe.elementsCount = Number.isFinite(count) ? count : fallback.elementsCount;
+  safe.notesHuman = String(safe.notesHuman || fallback.notesHuman || "").trim();
+  return safe;
+}
+
+async function buildArtAnalysis({ sizeCm, bodyPart, notes, imageUrl }) {
+  const fallback = buildHeuristicAnalysis({ sizeCm, bodyPart, notes });
+  if (!ENV.OPENAI_API_KEY || !imageUrl) {
+    return fallback;
+  }
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Você é um tatuador experiente analisando referências. " +
+            "Descreva somente o que está claramente visível. " +
+            "Não invente elementos. Se algo não estiver claro, use 'incerto'. " +
+            "Responda apenas com JSON válido.",
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Analise a referência e devolva apenas este JSON curto:\n" +
+                "{\n" +
+                '  "detailLevel": "baixo|medio|alto|incerto",\n' +
+                '  "hasBackground": true|false,\n' +
+                '  "lineworkDensity": "baixo|medio|alto|incerto",\n' +
+                '  "shadingComplexity": "baixo|medio|alto|incerto",\n' +
+                '  "elementsCount": number,\n' +
+                '  "notesHuman": "1-2 frases humanas resumindo sem inventar"\n' +
+                "}\n" +
+                "Se não tiver certeza, use 'incerto' nos níveis e descreva a dúvida nas notesHuman.",
+            },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+    });
+
+    const raw = resp.choices?.[0]?.message?.content?.trim();
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return normalizeAnalysisPayload(parsed, fallback);
+  } catch (e) {
+    console.error("[ART ANALYSIS ERROR]", e?.message || e);
+    return fallback;
   }
 }
 
@@ -1340,11 +1536,11 @@ function msgConfirmacaoDescricao() {
   return "Só me confirma se você quer adicionar ou remover alguma coisa nessa arte da referência. Se estiver tudo certinho, eu já sigo pro orçamento.";
 }
 
-function msgOrcamentoCompleto(valor, hours) {
-  const hasOneSession = Number(hours) <= 7;
+function msgOrcamentoCompleto(valor, sessions) {
+  const hasOneSession = Number(sessions) <= 1;
   const sessionLine = hasOneSession
     ? "Esse trabalho a gente faz em 1 única sessão, pra ficar bem executado e cicatrizar bem."
-    : "Se for um trabalho maior que passe de 7h, a gente realiza em 2 sessões pra ficar bem executado e cicatrizar bem.";
+    : "Se for um trabalho maior e passar de ~7h, a gente divide em 2 sessões pra manter o nível e cicatrização redonda.";
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
     "Formas de pagamento:\n" +
@@ -1356,19 +1552,67 @@ function msgOrcamentoCompleto(valor, hours) {
 }
 
 async function sendQuoteFlow(phone, session, message) {
-  if (!session.imageDataUrl || (!session.sizeLocation && !session.bodyRegion)) {
-    const reply = msgPedirLocalOuTamanhoMaisHumano(message);
+  if (!session.sizeCm) {
+    const reply =
+      "Me diz só o tamanho aproximado em cm (ex: 10cm, 15cm, 18cm) pra eu fechar o orçamento certinho.";
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     session.stage = "aguardando_info";
     return false;
   }
 
   try {
-    const info = session.sizeLocation || session.bodyRegion || "não informado";
-    const hours = await estimateHoursInternal(session.imageDataUrl, info, session.isCoverup);
+    const notes = [session.descriptionText, message].filter(Boolean).join(" ");
+    const imageForAnalysis = session.referenceImageUrl || session.imageDataUrl;
+    const analysis = await buildArtAnalysis({
+      sizeCm: session.sizeCm,
+      bodyPart: session.bodyPart || session.bodyRegion,
+      notes,
+      imageUrl: session.hasReferenceImage ? imageForAnalysis : null,
+    });
 
-    const valor = calcPriceFromHours(hours);
-    const quote = msgOrcamentoCompleto(valor, hours);
+    const quoteResult = computeQuote({
+      sizeCm: session.sizeCm,
+      bodyPart: session.bodyPart || session.bodyRegion,
+      analysis,
+    });
+
+    if (!quoteResult.ok) {
+      const reply =
+        "Me diz só o tamanho aproximado em cm (ex: 10cm, 15cm, 18cm) pra eu fechar o orçamento certinho.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.stage = "aguardando_info";
+      return false;
+    }
+
+    let finalPrice = quoteResult.price;
+    if (
+      session.lastQuoteSizeCm &&
+      session.lastQuotePrice &&
+      session.sizeCm !== session.lastQuoteSizeCm &&
+      finalPrice === session.lastQuotePrice
+    ) {
+      finalPrice += 50;
+    }
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `[QUOTE] sizeCm=${session.sizeCm} bodyPart=${session.bodyPart || session.bodyRegion || "n/a"} price=${finalPrice} ` +
+          `breakdown=${JSON.stringify(quoteResult.breakdown)}`
+      );
+    }
+
+    const analysisLines = [
+      "Fechado. Pra eu te passar um valor bem fiel, eu considerei:",
+      `• Tamanho: ${session.sizeCm} cm`,
+      `• Local: ${session.bodyPart || session.bodyRegion || "a confirmar"}`,
+      analysis?.notesHuman ? `• Detalhes: ${analysis.notesHuman}` : null,
+      "Isso influencia direto no tempo de sessão e na quantidade de sombra/detalhe pra ficar bem executado e cicatrizar redondo.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (!antiRepeat(session, analysisLines)) await zapiSendText(phone, analysisLines);
+
+    const quote = msgOrcamentoCompleto(finalPrice, quoteResult.sessions);
     if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
 
     const durationMin = session.durationMin || 180;
@@ -1397,6 +1641,8 @@ async function sendQuoteFlow(phone, session, message) {
 
     session.sentQuote = true;
     session.waitingReceipt = false;
+    session.lastQuoteSizeCm = session.sizeCm;
+    session.lastQuotePrice = finalPrice;
 
     // follow-up 30min pós-orçamento (se sumir)
     scheduleFollowup30min(phone, session, "pós orçamento");
@@ -1601,11 +1847,20 @@ async function processMergedInbound(phone, merged) {
   if (detectCoverup(message)) session.isCoverup = true;
   const askedCreation = /cria|criação|desenho|autor|exclusiv/i.test(lower);
 
-  const maybeRegion = extractBodyRegion(message);
-  if (!session.bodyRegion && maybeRegion) session.bodyRegion = maybeRegion;
+  const maybeRegion = parseBodyPart(message);
+  if (maybeRegion) {
+    session.bodyPart = maybeRegion;
+    session.bodyRegion = maybeRegion;
+  }
+
+  const maybeSizeCm = parseSizeCm(message);
+  if (maybeSizeCm !== null) {
+    session.sizeCm = maybeSizeCm;
+    session.sizeLocation = `${maybeSizeCm} cm`;
+  }
 
   const maybeSizeLoc = extractSizeLocation(message);
-  if (!session.sizeLocation && maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
+  if (maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
 
   // se recebeu info nova, limpa follow-up (não precisa mais)
   if (maybeRegion || maybeSizeLoc || imageUrl) {
@@ -1796,6 +2051,8 @@ async function processMergedInbound(phone, merged) {
   // ✅ imagem referência chegou -> salva + analisa
   if (imageUrl && !isReceiptImage) {
     try {
+      session.referenceImageUrl = imageUrl;
+      session.hasReferenceImage = true;
       const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
       session.imageDataUrl = dataUrl;
       session.descriptionText = null;
