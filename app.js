@@ -152,6 +152,15 @@ function isSimpleAck(text) {
   return /^(ok|blz|beleza|fechou|show|top|tmj|valeu|isso|sim|não|nao)$/i.test(t);
 }
 
+function normalizeText(input) {
+  return String(input || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function detectRegionOrSizeHint(text) {
   const t = (text || "").toLowerCase();
   return (
@@ -593,20 +602,6 @@ function dayOfWeek(date) {
   return new Date(date).getDay(); // 0 dom ... 6 sab
 }
 
-function pickPreferredDaysQueue() {
-  // Ter(2), Qui(4), Sex(5), Sab(6) -> 4 opções
-  return [2, 4, 5, 6];
-}
-
-function pickTimeWindows() {
-  // manhã / tarde / noite (ajuste conforme necessário)
-  return [
-    { label: "Manhã", timeHM: "09:30" },
-    { label: "Tarde", timeHM: "14:30" },
-    { label: "Noite", timeHM: "19:30" },
-  ];
-}
-
 // Espera existir integração Google Calendar (free/busy). Se já existir, adapte para usar a sua.
 async function calendarFreeBusy({ timeMinISO, timeMaxISO }) {
   if (typeof getCalendarBusyRanges === "function") {
@@ -627,50 +622,103 @@ function overlapsBusy(slotStartISO, slotEndISO, busyRanges) {
   return false;
 }
 
+function dayOfWeekName(date) {
+  const names = [
+    "domingo",
+    "segunda-feira",
+    "terça-feira",
+    "quarta-feira",
+    "quinta-feira",
+    "sexta-feira",
+    "sábado",
+  ];
+  return names[dayOfWeek(date)];
+}
+
+function buildSuggestionFromDate(slotStart, timeHM) {
+  return {
+    dateBR: fmtDateBR(slotStart),
+    dateISO: slotStart.toISOString().slice(0, 10),
+    timeHM,
+    label: `${dayOfWeekName(slotStart)}, ${fmtDateBR(slotStart)} – ${timeHM}`,
+    startISO: slotStart.toISOString(),
+  };
+}
+
 async function buildNextAvailableSuggestionsDW({ durationMin = 180 }) {
-  const preferredDays = pickPreferredDaysQueue(); // [Ter,Qui,Sex,Sab]
-  const windows = pickTimeWindows(); // 3 janelas
   const now = new Date();
-  const horizonDays = 21; // procura nas próximas 3 semanas
+  const horizonDays = 60;
 
   const timeMinISO = startOfDay(now).toISOString();
   const timeMaxISO = addDays(startOfDay(now), horizonDays).toISOString();
-  const busyRanges = await calendarFreeBusy({ timeMinISO, timeMaxISO });
+  const busyRanges = GCAL_ENABLED ? await calendarFreeBusy({ timeMinISO, timeMaxISO }) : [];
 
+  const usedDates = new Set();
   const suggestions = [];
 
-  for (let i = 1; i <= horizonDays && suggestions.length < 4; i += 1) {
-    const d = addDays(now, i);
-    const dow = dayOfWeek(d);
-    if (!preferredDays.includes(dow)) continue;
+  const findWeekdaySlot = (timeHM) => {
+    for (let i = 1; i <= horizonDays; i += 1) {
+      const d = addDays(now, i);
+      const dow = dayOfWeek(d);
+      if (dow === 0 || dow === 6) continue;
 
-    for (const w of windows) {
       const slotStart = new Date(d);
-      const [hh, mm] = w.timeHM.split(":").map(Number);
+      const [hh, mm] = timeHM.split(":").map(Number);
       slotStart.setHours(hh, mm, 0, 0);
+
+      if (slotStart.getTime() < now.getTime()) continue;
+
+      const dateISO = slotStart.toISOString().slice(0, 10);
+      if (usedDates.has(dateISO)) continue;
 
       const slotEnd = new Date(slotStart);
       slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
 
-      if (slotStart.getTime() < now.getTime()) continue;
-
-      const slotStartISO = slotStart.toISOString();
-      const slotEndISO = slotEnd.toISOString();
-
-      if (!overlapsBusy(slotStartISO, slotEndISO, busyRanges)) {
-        suggestions.push({
-          dateBR: fmtDateBR(slotStart),
-          dateISO: slotStartISO.slice(0, 10),
-          timeHM: w.timeHM,
-          label: `${w.label} (${w.timeHM})`,
-          startISO: slotStartISO,
-          endISO: slotEndISO,
-          dow,
-        });
-        break;
+      if (!overlapsBusy(slotStart.toISOString(), slotEnd.toISOString(), busyRanges)) {
+        usedDates.add(dateISO);
+        return buildSuggestionFromDate(slotStart, timeHM);
       }
     }
-  }
+    return null;
+  };
+
+  const findWeekendSlot = () => {
+    for (let i = 1; i <= horizonDays; i += 1) {
+      const d = addDays(now, i);
+      const dow = dayOfWeek(d);
+      let timeHM = "";
+      if (dow === 6) timeHM = "10:00";
+      if (dow === 0) timeHM = "14:00";
+      if (!timeHM) continue;
+
+      const slotStart = new Date(d);
+      const [hh, mm] = timeHM.split(":").map(Number);
+      slotStart.setHours(hh, mm, 0, 0);
+
+      if (slotStart.getTime() < now.getTime()) continue;
+
+      const dateISO = slotStart.toISOString().slice(0, 10);
+      if (usedDates.has(dateISO)) continue;
+
+      const slotEnd = new Date(slotStart);
+      slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
+
+      if (!overlapsBusy(slotStart.toISOString(), slotEnd.toISOString(), busyRanges)) {
+        usedDates.add(dateISO);
+        return buildSuggestionFromDate(slotStart, timeHM);
+      }
+    }
+    return null;
+  };
+
+  const option1 = findWeekdaySlot("14:00");
+  if (option1) suggestions.push(option1);
+
+  const option2 = findWeekdaySlot("19:00");
+  if (option2) suggestions.push(option2);
+
+  const option3 = findWeekendSlot();
+  if (option3) suggestions.push(option3);
 
   return suggestions;
 }
@@ -693,10 +741,10 @@ async function upsertCalendarHoldOrEvent({ session, phone, dateISO, timeHM, dura
   return { ok: true, fallback: true };
 }
 
-function parseChoice1to4(text) {
+function parseChoice1to3(text) {
   const t = (text || "").trim();
-  if (/^[1-4]$/.test(t)) return Number(t);
-  const m = t.match(/\b([1-4])\b/);
+  if (/^[1-3]$/.test(t)) return Number(t);
+  const m = t.match(/\b([1-3])\b/);
   return m ? Number(m[1]) : null;
 }
 
@@ -1094,13 +1142,11 @@ function msgPerguntaAgenda() {
 function msgOpcoesAgendamentoComDatasDW(suggestions) {
   const lines = [];
   lines.push("Fechado ✅ Vamos pro *agendamento*.");
-  lines.push("Escolhe uma opção (responde 1, 2, 3 ou 4):");
+  lines.push("Escolhe uma opção (responde 1, 2 ou 3):");
   lines.push("");
-  (suggestions || []).slice(0, 4).forEach((s, idx) => {
-    lines.push(`${idx + 1}) *${s.dateBR}* — ${s.label}`);
+  (suggestions || []).slice(0, 3).forEach((s, idx) => {
+    lines.push(`${idx + 1}) ${s.label}`);
   });
-  lines.push("");
-  lines.push("Se você tiver *dia e horário específico*, pode mandar também (ex: 29/01 às 16:00).");
   return lines.join("\n");
 }
 
@@ -1139,6 +1185,53 @@ function msgVouVerificarAgendaComData() {
   );
 }
 
+async function isSlotAvailable({ date, timeHM, durationMin }) {
+  const slotStart = new Date(date);
+  const [hh, mm] = timeHM.split(":").map(Number);
+  slotStart.setHours(hh, mm, 0, 0);
+  const slotEnd = new Date(slotStart);
+  slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
+
+  const timeMinISO = startOfDay(slotStart).toISOString();
+  const timeMaxISO = addDays(startOfDay(slotStart), 1).toISOString();
+  const busyRanges = GCAL_ENABLED ? await calendarFreeBusy({ timeMinISO, timeMaxISO }) : [];
+  return !overlapsBusy(slotStart.toISOString(), slotEnd.toISOString(), busyRanges);
+}
+
+async function confirmScheduleSelection({ session, phone, slot }) {
+  const durationMin = session.durationMin || 180;
+  const calRes = await upsertCalendarHoldOrEvent({
+    session,
+    phone,
+    dateISO: slot.dateISO,
+    timeHM: slot.timeHM,
+    durationMin,
+    title: buildCalendarTitle(session, phone),
+  });
+
+  if (!calRes?.ok) return false;
+
+  session.scheduleConfirmed = true;
+  session.waitingSchedule = false;
+  session.stage = "agendamento_confirmado";
+
+  const resumo = `• ${slot.dateBR} às ${slot.timeHM}`;
+  const msgOk = msgAgendamentoConfirmado(resumo);
+  if (!antiRepeat(session, msgOk)) await zapiSendText(phone, msgOk);
+
+  const msgPix = msgPedirSinalPixDepoisAgendar();
+  if (!antiRepeat(session, msgPix) && !session.sentDepositRequest) {
+    await zapiSendText(phone, msgPix);
+    session.sentDepositRequest = true;
+  }
+
+  session.depositDeadlineAt = Date.now() + 4 * 60 * 60 * 1000;
+  session.sentDepositDeadlineInfo = true;
+  session.waitingReceipt = true;
+  session.stage = "aguardando_comprovante";
+  return true;
+}
+
 function msgCuidadosPreSessao() {
   return (
     "Antes da sessão:\n\n" +
@@ -1149,12 +1242,75 @@ function msgCuidadosPreSessao() {
   );
 }
 
+function parseSpecificDateTime(text) {
+  const normalized = normalizeText(text);
+  const timeMatch = normalized.match(/(\d{1,2})\s*:\s*(\d{2})|\b(\d{1,2})\s*h\b/);
+  if (!timeMatch) return null;
+
+  const hour = timeMatch[1] ? Number(timeMatch[1]) : Number(timeMatch[3]);
+  const minute = timeMatch[2] ? Number(timeMatch[2]) : 0;
+  if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
+  if (hour > 23 || minute > 59) return null;
+
+  const dateMatch = normalized.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+  const dowMap = {
+    domingo: 0,
+    segunda: 1,
+    "segunda-feira": 1,
+    terca: 2,
+    "terca-feira": 2,
+    quarta: 3,
+    "quarta-feira": 3,
+    quinta: 4,
+    "quinta-feira": 4,
+    sexta: 5,
+    "sexta-feira": 5,
+    sabado: 6,
+    "sabado-feira": 6,
+  };
+
+  const now = new Date();
+
+  if (dateMatch) {
+    const day = Number(dateMatch[1]);
+    const month = Number(dateMatch[2]) - 1;
+    const yearRaw = dateMatch[3];
+    let year = yearRaw ? Number(yearRaw) : now.getFullYear();
+    if (year < 100) year += 2000;
+
+    let candidate = new Date(year, month, day, hour, minute, 0, 0);
+    if (candidate.getTime() < now.getTime() && !yearRaw) {
+      candidate = new Date(year + 1, month, day, hour, minute, 0, 0);
+    }
+    return { date: candidate, timeHM: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
+  }
+
+  for (const [label, dow] of Object.entries(dowMap)) {
+    if (!normalized.includes(label)) continue;
+    const candidate = new Date(now);
+    const currentDow = candidate.getDay();
+    let diff = (dow - currentDow + 7) % 7;
+    if (diff === 0 && (candidate.getHours() > hour || (candidate.getHours() === hour && candidate.getMinutes() >= minute))) {
+      diff = 7;
+    }
+    candidate.setDate(candidate.getDate() + diff);
+    candidate.setHours(hour, minute, 0, 0);
+    return { date: candidate, timeHM: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
+  }
+
+  return null;
+}
+
 function msgChecagemDuvidas() {
   return (
     "Antes de eu te passar o investimento:\n\n" +
     "Ficou alguma dúvida sobre o atendimento?\n" +
     "Se estiver tudo certo, me responde *OK* que eu já te mando o valor e as formas de pagamento."
   );
+}
+
+function msgConfirmacaoDescricao() {
+  return "Só me confirma se você quer adicionar ou remover alguma coisa nessa arte da referência. Se estiver tudo certinho, eu já sigo pro orçamento.";
 }
 
 function msgOrcamentoCompleto(valor, sessoes) {
@@ -1567,7 +1723,18 @@ async function processMergedInbound(phone, merged) {
       ].join("\n")
     );
 
-    const reply = "Comprovante recebido ✅ Qualquer dúvida até o dia, é só me chamar.";
+    const reply =
+      "Fechou! Agendamento confirmado ✔️\n" +
+      "Vou te mandar algumas orientações pra você seguir antes da nossa sessão:\n\n" +
+      "• Beba bastante água no dia anterior.\n" +
+      "• Evite álcool nas 24h antes da sessão.\n" +
+      "• Passe creme hidratante na região (quanto antes começar, melhor).\n" +
+      "• Coma antes da sessão, não venha de estômago vazio.\n" +
+      "• Use roupa confortável.\n\n" +
+      "Reagendamento:\n" +
+      "• Se precisar remarcar, só avisar com até 24h de antecedência.\n" +
+      "• Depois disso não consigo ajustar porque o horário já fica separado pra você e eu não consigo reagendar.\n\n" +
+      "Qualquer coisa até o dia, é só chamar. Tamo junto!";
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
@@ -1647,9 +1814,8 @@ async function processMergedInbound(phone, merged) {
       await zapiSendText(
         phone,
         desc +
-          "\n\nAntes de eu te passar valores, confirma pra mim: está exatamente como você imaginou?\n" +
-          "Se quiser adicionar/remover algo, ou mandar outra referência, pode falar.\n" +
-          "Se estiver tudo certo, responda 'tá certo' e eu sigo para o orçamento."
+          "\n\n" +
+          msgConfirmacaoDescricao()
       );
 
       return;
@@ -1689,28 +1855,28 @@ async function processMergedInbound(phone, merged) {
   }
 
   if (session.stage === "aguardando_confirmacao_descricao") {
-    const lowerMsg = message.toLowerCase();
+    const normalizedMsg = normalizeText(message);
     const confirms = [
       "sim",
-      "certo",
-      "certinho",
-      "tá certo",
-      "ta certo",
-      "tudo certo",
       "ok",
-      "pode ser",
-      "isso",
+      "certo",
+      "ta certo",
+      "certinho",
+      "tudo certo",
+      "pode seguir",
+      "segue",
+      "fechado",
+      "fechou",
       "perfeito",
       "beleza",
-      "tranquilo",
-      "fechado",
-      "isso mesmo",
-      "tá tranquilo",
-      "ta tranquilo",
+      "pode ser",
+      "ta bom",
+      "isso",
+      "exatamente",
     ];
     const wantsChange = ["nao", "não", "mudar", "alterar", "trocar", "adicionar", "remover", "ajustar"];
 
-    if (confirms.some((w) => lowerMsg.includes(w))) {
+    if (confirms.some((w) => normalizedMsg.includes(w))) {
       session.descriptionConfirmed = true;
       session.stage = "aguardando_resposta_orcamento";
       await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
@@ -1718,7 +1884,7 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    if (wantsChange.some((w) => lowerMsg.includes(w))) {
+    if (wantsChange.some((w) => normalizedMsg.includes(normalizeText(w)))) {
       session.stage = "aguardando_ajustes_descricao";
       await zapiSendText(
         phone,
@@ -1727,7 +1893,7 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    await zapiSendText(phone, "Show! Está tudo certo com a descrição ou deseja ajustar algo?");
+    await zapiSendText(phone, msgConfirmacaoDescricao());
     return;
   }
 
@@ -1767,7 +1933,7 @@ async function processMergedInbound(phone, merged) {
         session.pendingDescChanges = "";
       }
       session.stage = "aguardando_confirmacao_descricao";
-      await zapiSendText(phone, `${session.descriptionText}\n\nConfirma que é isso mesmo?`);
+      await zapiSendText(phone, `${session.descriptionText}\n\n${msgConfirmacaoDescricao()}`);
       return;
     }
 
@@ -1792,7 +1958,8 @@ async function processMergedInbound(phone, merged) {
           await zapiSendText(
             phone,
             session.descriptionText +
-              "\n\nAntes de eu te passar valores, confirma pra mim: está exatamente como você imaginou?"
+              "\n\n" +
+              msgConfirmacaoDescricao()
           );
           return;
         }
@@ -1836,9 +2003,42 @@ async function processMergedInbound(phone, merged) {
     /* STAGE: CONVIDAR_AGENDAMENTO_START */
     if (detectHasSpecificDate(message) || detectNoSpecificDate(message) || /marcar|agenda|hor[aá]rio|data/i.test(lower)) {
       const durationMin = session.durationMin || 180;
+      const specificRequest = parseSpecificDateTime(message);
+      if (specificRequest) {
+        const slot = {
+          dateBR: fmtDateBR(specificRequest.date),
+          dateISO: specificRequest.date.toISOString().slice(0, 10),
+          timeHM: specificRequest.timeHM,
+        };
+        const isFree = await isSlotAvailable({
+          date: specificRequest.date,
+          timeHM: specificRequest.timeHM,
+          durationMin,
+        });
+
+        if (isFree) {
+          const ok = await confirmScheduleSelection({ session, phone, slot });
+          if (!ok) {
+            const fallback = msgVouVerificarAgendaComData();
+            if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
+            await notifyOwner(
+              [
+                "📅 HORÁRIO ESPECÍFICO INDISPONÍVEL (bot)",
+                `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+                `• Pedido: ${message.slice(0, 200)}`,
+                "• Ação: verificar agenda manualmente",
+              ].join("\n")
+            );
+            session.manualHandoff = true;
+            session.stage = "manual_pendente";
+          }
+          return;
+        }
+      }
+
       const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
 
-      if (!suggestions.length) {
+      if (suggestions.length < 3) {
         const reply = msgVouVerificarAgendaSemData();
         if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
         await notifyOwner(
@@ -1877,40 +2077,93 @@ async function processMergedInbound(phone, merged) {
   if (session.stage === "aguardando_escolha_agendamento") {
     const txt = (message?.text || message?.body || message || "").trim();
 
-    // 3.1) Se cliente mandou dia/horário específico, mantém fluxo existente se existir
-    if (typeof isSpecificDayTime === "function" && isSpecificDayTime(txt)) {
-      session.stage = "validar_agendamento_especifico";
-      session.pendingScheduleText = txt;
-      const reply = "Entendi ✅ Vou conferir na agenda e já te confirmo esse dia e horário.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      if (typeof handleSpecificScheduleRequest === "function") {
-        await handleSpecificScheduleRequest({ session, phone, text: txt });
+    // 3.1) Se cliente mandou dia/horário específico
+    const specificRequest = parseSpecificDateTime(txt);
+    if (specificRequest) {
+      const durationMin = session.durationMin || 180;
+      const slot = {
+        dateBR: fmtDateBR(specificRequest.date),
+        dateISO: specificRequest.date.toISOString().slice(0, 10),
+        timeHM: specificRequest.timeHM,
+      };
+      const isFree = await isSlotAvailable({
+        date: specificRequest.date,
+        timeHM: specificRequest.timeHM,
+        durationMin,
+      });
+
+      if (isFree) {
+        const ok = await confirmScheduleSelection({ session, phone, slot });
+        if (!ok) {
+          const retry = msgVouVerificarAgendaComData();
+          if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+          await notifyOwner(
+            [
+              "📅 HORÁRIO ESPECÍFICO INDISPONÍVEL (bot)",
+              `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+              `• Pedido: ${txt.slice(0, 200)}`,
+              "• Ação: verificar agenda manualmente",
+            ].join("\n")
+          );
+          session.manualHandoff = true;
+          session.stage = "manual_pendente";
+        }
+        return;
       }
+
+      const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
+      if (suggestions.length < 3) {
+        const reply = msgVouVerificarAgendaSemData();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        await notifyOwner(
+          [
+            "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
+            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+            "• Ação: verificar agenda manualmente",
+          ].join("\n")
+        );
+        session.manualHandoff = true;
+        session.stage = "manual_pendente";
+        return;
+      }
+
+      session.suggestedSlots = suggestions;
+      session.waitingSchedule = true;
+      session.stage = "aguardando_escolha_agendamento";
+
+      const reply = msgOpcoesAgendamentoComDatasDW(suggestions);
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
-    // 3.2) Escolha 1-4
-    const choice = parseChoice1to4(txt);
+    // 3.2) Escolha 1-3
+    const choice = parseChoice1to3(txt);
     if (!choice || !session.suggestedSlots || !session.suggestedSlots[choice - 1]) {
-      const retry = "Me diz só *1, 2, 3 ou 4* ✅ (ou manda um dia/horário específico).";
+      const retry = "Me diz só *1, 2 ou 3* ✅ (ou manda um dia/horário específico).";
       if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
       return;
     }
 
     const slot = session.suggestedSlots[choice - 1];
-    const durationMin = session.durationMin || 180;
-
-    const calRes = await upsertCalendarHoldOrEvent({
-      session,
-      phone,
-      dateISO: slot.dateISO,
-      timeHM: slot.timeHM,
-      durationMin,
-      title: buildCalendarTitle(session, phone),
-    });
-
-    if (!calRes?.ok) {
+    const ok = await confirmScheduleSelection({ session, phone, slot });
+    if (!ok) {
+      const durationMin = session.durationMin || 180;
       const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
+      if (suggestions.length < 3) {
+        const reply = msgVouVerificarAgendaSemData();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        await notifyOwner(
+          [
+            "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
+            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+            "• Ação: verificar agenda manualmente",
+          ].join("\n")
+        );
+        session.manualHandoff = true;
+        session.stage = "manual_pendente";
+        return;
+      }
+
       session.suggestedSlots = suggestions;
       const reply =
         "Esse horário acabou de ficar indisponível. Te mando outras opções livres ✅\n\n" +
@@ -1918,25 +2171,6 @@ async function processMergedInbound(phone, merged) {
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
-
-    session.scheduleConfirmed = true;
-    session.waitingSchedule = false;
-    session.stage = "agendamento_confirmado";
-
-    const resumo = `• ${slot.dateBR} às ${slot.timeHM}`;
-    const msgOk = msgAgendamentoConfirmado(resumo);
-    if (!antiRepeat(session, msgOk)) await zapiSendText(phone, msgOk);
-
-    const msgPix = msgPedirSinalPixDepoisAgendar();
-    if (!antiRepeat(session, msgPix) && !session.sentDepositRequest) {
-      await zapiSendText(phone, msgPix);
-      session.sentDepositRequest = true;
-    }
-
-    session.depositDeadlineAt = Date.now() + 4 * 60 * 60 * 1000;
-    session.sentDepositDeadlineInfo = true;
-    session.waitingReceipt = true;
-    session.stage = "aguardando_comprovante";
     return;
   }
   /* STAGE: AGUARDANDO_ESCOLHA_AGENDAMENTO_END */
