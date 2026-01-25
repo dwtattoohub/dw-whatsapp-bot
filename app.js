@@ -14,6 +14,11 @@ import OpenAI from "openai";
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
+/* DW_RULES_AGENDAMENTO
+ * - Nunca pedir Pix/sinal antes de: (a) orçamento entregue e (b) agendamento confirmado no Calendar.
+ * - Sugestões de agenda devem usar Google Calendar free/busy para não colidir com eventos existentes.
+ */
+
 // -------------------- ENV --------------------
 const ENV = {
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
@@ -68,6 +73,11 @@ function getSession(phone) {
       depositConfirmed: false,
       askedSchedule: false,
       scheduleCaptured: false,
+      scheduleConfirmed: false,
+      suggestedSlots: null,
+      durationMin: null,
+      sentDepositRequest: false,
+      waitingSchedule: false,
       manualHandoff: false,
 
       // controle
@@ -77,7 +87,7 @@ function getSession(phone) {
 
       // prazo comprovante (12h)
       depositDeadlineAt: 0, // timestamp (ms)
-      sentDepositDeadlineInfo: false, // falou das 12h pelo menos 1x (no orçamento)
+      sentDepositDeadlineInfo: false, // falou das 12h pelo menos 1x (no agendamento)
       waitingReceipt: false, // cliente disse "já já mando"
 
       // follow-up 30min (pra “vou ver e te aviso” ou sumiço pós-orçamento)
@@ -523,7 +533,7 @@ function detectHasSpecificDate(text) {
   );
 }
 
-// comprovante confirmado só com FOTO (imageUrl) após orçamento
+// comprovante confirmado só com FOTO (imageUrl) após agendamento
 function detectDepositTextOnly(text) {
   const t = (text || "").toLowerCase();
   return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(
@@ -544,10 +554,142 @@ function detectWillSendReceipt(text) {
 function detectReceiptContext(session, message) {
   // evita o bot tentar analisar comprovante como "referência"
   const t = (message || "").toLowerCase();
-  if (session.stage === "pos_orcamento" || session.sentQuote) return true;
+  if (session.scheduleConfirmed || session.stage === "aguardando_comprovante") return true;
+  if (session.waitingReceipt) return true;
   if (session.depositDeadlineAt && session.depositDeadlineAt > 0) return true;
   if (/comprovante|pix|sinal|pagamento|transfer/i.test(t)) return true;
   return false;
+}
+
+function addDays(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function startOfDay(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function fmtDateBR(date) {
+  const d = new Date(date);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yy = d.getFullYear();
+  return `${dd}/${mm}/${yy}`;
+}
+
+function dayOfWeek(date) {
+  return new Date(date).getDay(); // 0 dom ... 6 sab
+}
+
+function pickPreferredDaysQueue() {
+  // Ter(2), Qui(4), Sex(5), Sab(6) -> 4 opções
+  return [2, 4, 5, 6];
+}
+
+function pickTimeWindows() {
+  // manhã / tarde / noite (ajuste conforme necessário)
+  return [
+    { label: "Manhã", timeHM: "09:30" },
+    { label: "Tarde", timeHM: "14:30" },
+    { label: "Noite", timeHM: "19:30" },
+  ];
+}
+
+// Espera existir integração Google Calendar (free/busy). Se já existir, adapte para usar a sua.
+async function calendarFreeBusy({ timeMinISO, timeMaxISO }) {
+  if (typeof getCalendarBusyRanges === "function") {
+    return await getCalendarBusyRanges({ timeMinISO, timeMaxISO });
+  }
+  console.warn("[calendarFreeBusy] Integração não configurada; retornando agenda livre.");
+  return [];
+}
+
+function overlapsBusy(slotStartISO, slotEndISO, busyRanges) {
+  const s = new Date(slotStartISO).getTime();
+  const e = new Date(slotEndISO).getTime();
+  for (const b of busyRanges || []) {
+    const bs = new Date(b.startISO || b.start).getTime();
+    const be = new Date(b.endISO || b.end).getTime();
+    if (Math.max(s, bs) < Math.min(e, be)) return true;
+  }
+  return false;
+}
+
+async function buildNextAvailableSuggestionsDW({ durationMin = 180 }) {
+  const preferredDays = pickPreferredDaysQueue(); // [Ter,Qui,Sex,Sab]
+  const windows = pickTimeWindows(); // 3 janelas
+  const now = new Date();
+  const horizonDays = 21; // procura nas próximas 3 semanas
+
+  const timeMinISO = startOfDay(now).toISOString();
+  const timeMaxISO = addDays(startOfDay(now), horizonDays).toISOString();
+  const busyRanges = await calendarFreeBusy({ timeMinISO, timeMaxISO });
+
+  const suggestions = [];
+
+  for (let i = 1; i <= horizonDays && suggestions.length < 4; i += 1) {
+    const d = addDays(now, i);
+    const dow = dayOfWeek(d);
+    if (!preferredDays.includes(dow)) continue;
+
+    for (const w of windows) {
+      const slotStart = new Date(d);
+      const [hh, mm] = w.timeHM.split(":").map(Number);
+      slotStart.setHours(hh, mm, 0, 0);
+
+      const slotEnd = new Date(slotStart);
+      slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
+
+      if (slotStart.getTime() < now.getTime()) continue;
+
+      const slotStartISO = slotStart.toISOString();
+      const slotEndISO = slotEnd.toISOString();
+
+      if (!overlapsBusy(slotStartISO, slotEndISO, busyRanges)) {
+        suggestions.push({
+          dateBR: fmtDateBR(slotStart),
+          dateISO: slotStartISO.slice(0, 10),
+          timeHM: w.timeHM,
+          label: `${w.label} (${w.timeHM})`,
+          startISO: slotStartISO,
+          endISO: slotEndISO,
+          dow,
+        });
+        break;
+      }
+    }
+  }
+
+  return suggestions;
+}
+
+function buildCalendarTitle(session, phone) {
+  const name = session?.pending?.lastContactName || "Cliente";
+  return `Tattoo - ${name} (${String(phone).replace(/\D/g, "")})`;
+}
+
+async function upsertCalendarHoldOrEvent({ session, phone, dateISO, timeHM, durationMin, title }) {
+  if (typeof createCalendarHold === "function") {
+    return await createCalendarHold({ session, phone, dateISO, timeHM, durationMin, title });
+  }
+  if (typeof createCalendarEvent === "function") {
+    return await createCalendarEvent({ session, phone, dateISO, timeHM, durationMin, title });
+  }
+
+  console.warn("[calendar] Integração não configurada; armazenando hold local.");
+  session.calendarHold = { dateISO, timeHM, durationMin, title };
+  return { ok: true, fallback: true };
+}
+
+function parseChoice1to4(text) {
+  const t = (text || "").trim();
+  if (/^[1-4]$/.test(t)) return Number(t);
+  const m = t.match(/\b([1-4])\b/);
+  return m ? Number(m[1]) : null;
 }
 
 // desconto / “tem como melhorar?” pós-orçamento
@@ -897,7 +1039,7 @@ function msgEndereco() {
 
 function depositDeadlineLine() {
   return (
-    "• Depois do orçamento, você tem até *12 horas* pra enviar a foto do comprovante.\n" +
+    "• Depois do agendamento, você tem até *12 horas* pra enviar a foto do comprovante.\n" +
     "Se não enviar nesse prazo, o agendamento é *cancelado* e o horário volta pra agenda."
   );
 }
@@ -914,9 +1056,9 @@ function msgAguardandoComprovante() {
   const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
   return (
     "Certo.\n\n" +
-    "• Pra eu confirmar o agendamento, eu preciso da *foto do comprovante* aqui no Whats.\n" +
+    "• Pra eu confirmar a reserva do horário, eu preciso da *foto do comprovante* aqui no Whats.\n" +
     pixLine +
-    "Assim que chegar, eu sigo com a agenda."
+    "Assim que chegar, fica tudo confirmado."
   );
 }
 
@@ -936,6 +1078,38 @@ function msgPerguntaAgenda() {
     "Pra eu agendar do melhor jeito:\n" +
     "• você prefere horário comercial ou pós-comercial?\n" +
     "• tem alguma data específica livre?"
+  );
+}
+
+function msgOpcoesAgendamentoComDatasDW(suggestions) {
+  const lines = [];
+  lines.push("Fechado ✅ Vamos pro *agendamento*.");
+  lines.push("Escolhe uma opção (responde 1, 2, 3 ou 4):");
+  lines.push("");
+  (suggestions || []).slice(0, 4).forEach((s, idx) => {
+    lines.push(`${idx + 1}) *${s.dateBR}* — ${s.label}`);
+  });
+  lines.push("");
+  lines.push("Se você tiver *dia e horário específico*, pode mandar também (ex: 29/01 às 16:00).");
+  return lines.join("\n");
+}
+
+function msgAgendamentoConfirmado(resumo) {
+  return (
+    "Agendamento confirmado ✅\n\n" +
+    "Resumo:\n" +
+    `${resumo}\n\n` +
+    "Se precisar ajustar algo, me chama."
+  );
+}
+
+function msgPedirSinalPixDepoisAgendar() {
+  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+  return (
+    "Pra garantir o horário, eu peço um *sinal de R$ 50*.\n" +
+    pixLine +
+    "Depois me manda a *foto do comprovante* aqui no Whats.\n\n" +
+    depositDeadlineLine()
   );
 }
 
@@ -972,16 +1146,12 @@ function msgChecagemDuvidas() {
 }
 
 function msgOrcamentoCompleto(valor, sessoes) {
-  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
     `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.\n` +
     "• Pagamento: Pix, débito ou crédito em até 12x.\n" +
     "• Inclui *1 retoque* (se necessário) entre 40 e 50 dias.\n\n" +
-    "Pra reservar o horário eu peço um *sinal de R$ 50*.\n" +
-    pixLine +
-    "Depois me manda a *foto do comprovante* aqui.\n\n" +
-    depositDeadlineLine()
+    "Quando você quiser agendar, me chama que eu te mando opções de datas e horários disponíveis."
   );
 }
 
@@ -1005,10 +1175,6 @@ async function sendQuoteFlow(phone, session, message) {
 
     session.sentQuote = true;
     session.stage = "pos_orcamento";
-
-    // inicia prazo 12h (a partir do envio do orçamento)
-    session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
-    session.sentDepositDeadlineInfo = true;
     session.waitingReceipt = false;
 
     // follow-up 30min pós-orçamento (se sumir)
@@ -1159,7 +1325,15 @@ async function processMergedInbound(phone, merged) {
 
   // ✅ pix
   if (askedPix(message)) {
-    const reply = msgPixDireto();
+    if (session.scheduleConfirmed) {
+      const reply = msgPixDireto();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    const reply =
+      "Pra liberar a chave Pix eu preciso confirmar o horário primeiro.\n\n" +
+      "Se quiser, já te mando opções de datas disponíveis agora.";
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
@@ -1347,9 +1521,9 @@ async function processMergedInbound(phone, merged) {
 
   // ✅ comprovante por texto sem foto (depois do orçamento)
   const depositTextOnly = detectDepositTextOnly(message);
-  const isAfterQuote = session.stage === "pos_orcamento" || session.sentQuote;
+  const isAfterSchedule = session.scheduleConfirmed || session.stage === "aguardando_comprovante";
 
-  if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterQuote) {
+  if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterSchedule) {
     // “já já mando”
     if (detectWillSendReceipt(message)) {
       session.waitingReceipt = true;
@@ -1365,20 +1539,19 @@ async function processMergedInbound(phone, merged) {
 
   // ✅ FOTO do comprovante
   const isReceiptImage = Boolean(imageUrl) && detectReceiptContext(session, message);
-  if (!session.depositConfirmed && isReceiptImage && isAfterQuote) {
+  if (!session.depositConfirmed && isReceiptImage && isAfterSchedule) {
     session.depositConfirmed = true;
-    session.stage = "agenda";
-    session.askedSchedule = true;
+    session.stage = "agendamento_confirmado";
 
     await notifyOwner(
       [
-        "⚠️ COMPROVANTE RECEBIDO (bot)",
+        "💸 COMPROVANTE RECEBIDO (bot)",
         `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-        "• Próximo passo: você confirma agenda manualmente",
+        "• Agendamento já confirmado no calendário",
       ].join("\n")
     );
 
-    const reply = msgPerguntaAgenda();
+    const reply = "Comprovante recebido ✅ Qualquer dúvida até o dia, é só me chamar.";
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
@@ -1608,28 +1781,113 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    // cliente quer marcar data sem pagar sinal
+    /* STAGE: CONVIDAR_AGENDAMENTO_START */
     if (detectHasSpecificDate(message) || detectNoSpecificDate(message) || /marcar|agenda|hor[aá]rio|data/i.test(lower)) {
-      const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
-      const reply =
-        "Fechado.\n\n" +
-        "Pra eu reservar o horário pra você, eu preciso do *sinal de R$ 50*.\n" +
-        pixLine +
-        "Depois é só me mandar a *foto do comprovante* aqui no Whats que eu já sigo com a agenda.\n\n" +
-        (session.sentDepositDeadlineInfo ? depositDeadlineLine() : "");
+      const durationMin = session.durationMin || 180;
+      const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
+
+      if (!suggestions.length) {
+        const reply = msgVouVerificarAgendaSemData();
+        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+        await notifyOwner(
+          [
+            "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
+            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
+            "• Ação: verificar agenda manualmente",
+          ].join("\n")
+        );
+        session.manualHandoff = true;
+        session.stage = "manual_pendente";
+        return;
+      }
+
+      session.suggestedSlots = suggestions;
+      session.waitingSchedule = true;
+      session.stage = "aguardando_escolha_agendamento";
+
+      const reply = msgOpcoesAgendamentoComDatasDW(suggestions);
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
+    /* STAGE: CONVIDAR_AGENDAMENTO_END */
 
     // se cliente agradecer depois do orçamento, responde curto (não finaliza)
     if (detectThanks(message)) {
       const reply =
         "Tamo junto.\n\n" +
-        "Se quiser seguir, é só enviar o sinal e a foto do comprovante aqui. Qualquer dúvida, me chama.";
+        "Se quiser seguir, me fala que eu já te mando opções de datas e horários. Qualquer dúvida, me chama.";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
   }
+
+  /* STAGE: AGUARDANDO_ESCOLHA_AGENDAMENTO_START */
+  if (session.stage === "aguardando_escolha_agendamento") {
+    const txt = (message?.text || message?.body || message || "").trim();
+
+    // 3.1) Se cliente mandou dia/horário específico, mantém fluxo existente se existir
+    if (typeof isSpecificDayTime === "function" && isSpecificDayTime(txt)) {
+      session.stage = "validar_agendamento_especifico";
+      session.pendingScheduleText = txt;
+      const reply = "Entendi ✅ Vou conferir na agenda e já te confirmo esse dia e horário.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (typeof handleSpecificScheduleRequest === "function") {
+        await handleSpecificScheduleRequest({ session, phone, text: txt });
+      }
+      return;
+    }
+
+    // 3.2) Escolha 1-4
+    const choice = parseChoice1to4(txt);
+    if (!choice || !session.suggestedSlots || !session.suggestedSlots[choice - 1]) {
+      const retry = "Me diz só *1, 2, 3 ou 4* ✅ (ou manda um dia/horário específico).";
+      if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+      return;
+    }
+
+    const slot = session.suggestedSlots[choice - 1];
+    const durationMin = session.durationMin || 180;
+
+    const calRes = await upsertCalendarHoldOrEvent({
+      session,
+      phone,
+      dateISO: slot.dateISO,
+      timeHM: slot.timeHM,
+      durationMin,
+      title: buildCalendarTitle(session, phone),
+    });
+
+    if (!calRes?.ok) {
+      const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
+      session.suggestedSlots = suggestions;
+      const reply =
+        "Esse horário acabou de ficar indisponível. Te mando outras opções livres ✅\n\n" +
+        msgOpcoesAgendamentoComDatasDW(suggestions);
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
+
+    session.scheduleConfirmed = true;
+    session.waitingSchedule = false;
+    session.stage = "agendamento_confirmado";
+
+    const resumo = `• ${slot.dateBR} às ${slot.timeHM}`;
+    const msgOk = msgAgendamentoConfirmado(resumo);
+    if (!antiRepeat(session, msgOk)) await zapiSendText(phone, msgOk);
+
+    const msgPix = msgPedirSinalPixDepoisAgendar();
+    if (!antiRepeat(session, msgPix) && !session.sentDepositRequest) {
+      await zapiSendText(phone, msgPix);
+      session.sentDepositRequest = true;
+    }
+
+    session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
+    session.sentDepositDeadlineInfo = true;
+    session.waitingReceipt = true;
+    session.stage = "aguardando_comprovante";
+    return;
+  }
+  /* STAGE: AGUARDANDO_ESCOLHA_AGENDAMENTO_END */
 
   // -------------------- ETAPA: AGENDA (após comprovante) --------------------
   if (session.stage === "agenda") {
