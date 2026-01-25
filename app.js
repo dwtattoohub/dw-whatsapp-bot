@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json({ limit: "25mb" }));
 
 /* DW_RULES_AGENDAMENTO
- * - Nunca pedir Pix/sinal antes de: (a) orçamento entregue e (b) agendamento confirmado no Calendar.
+ * - Nunca pedir Pix/sinal antes de: (a) orçamento entregue e (b) horário pré-reservado.
  * - Sugestões de agenda devem usar Google Calendar free/busy para não colidir com eventos existentes.
  */
 
@@ -83,6 +83,7 @@ function getSession(phone) {
       scheduleCaptured: false,
       scheduleConfirmed: false,
       suggestedSlots: null,
+      pendingSlot: null,
       durationMin: null,
       sentDepositRequest: false,
       waitingSchedule: false,
@@ -1092,18 +1093,11 @@ function msgEndereco() {
 }
 
 function depositDeadlineLine() {
-  return (
-    "• Depois do agendamento, você tem até *4 horas* pra enviar a foto do comprovante.\n" +
-    "Se não enviar nesse prazo, o agendamento é *cancelado* e o horário volta pra agenda."
-  );
+  return "• A partir dessa mensagem, você tem 4 horas pra realizar o pagamento e enviar o comprovante.";
 }
 
 function msgFicoNoAguardoComprovante() {
-  return (
-    "Fechado.\n\n" +
-    "• Fico no aguardo da *foto do comprovante* aqui no Whats.\n" +
-    "• Qualquer dúvida, é só me chamar."
-  );
+  return "Perfeito, fico no aguardo do comprovante ✅";
 }
 
 function msgAguardandoComprovante() {
@@ -1119,12 +1113,12 @@ function msgAguardandoComprovante() {
 function msgPixDireto() {
   const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
   return (
-    "Perfeito! Para garantir o seu horário, o sinal é:\n" +
+    "Perfeito! Pra garantir o seu horário, o sinal é:\n" +
     "R$ 50,00\n\n" +
     "Chave Pix:\n" +
     `${pixLine}\n\n` +
-    "A partir dessa mensagem, você tem 4 horas para realizar o pagamento e enviar o comprovante.\n" +
-    "Caso o pagamento não seja enviado dentro desse período, o horário não será reservado."
+    "Assim que fizer o Pix, me manda o comprovante aqui pra eu confirmar o agendamento ✅\n\n" +
+    depositDeadlineLine()
   );
 }
 
@@ -1157,15 +1151,24 @@ function msgAgendamentoConfirmado(resumo) {
   );
 }
 
+function msgAgendamentoPreReserva(resumo) {
+  return (
+    "Fechado ✅ Separei esse horário pra você.\n" +
+    "Pra garantir, agora é só fazer o sinal e me mandar o comprovante.\n\n" +
+    "Resumo:\n" +
+    `${resumo}`
+  );
+}
+
 function msgPedirSinalPixDepoisAgendar() {
   const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
   return (
-    "Perfeito! Para garantir o seu horário, o sinal é:\n" +
+    "Perfeito! Pra garantir o seu horário, o sinal é:\n" +
     "R$ 50,00\n\n" +
     "Chave Pix:\n" +
     `${pixLine}\n\n` +
-    "A partir dessa mensagem, você tem 4 horas para realizar o pagamento e enviar o comprovante.\n" +
-    "Caso o pagamento não seja enviado dentro desse período, o horário não será reservado."
+    "Assim que fizer o Pix, me manda o comprovante aqui pra eu confirmar o agendamento ✅\n\n" +
+    depositDeadlineLine()
   );
 }
 
@@ -1197,24 +1200,12 @@ async function isSlotAvailable({ date, timeHM, durationMin }) {
 }
 
 async function confirmScheduleSelection({ session, phone, slot }) {
-  const durationMin = session.durationMin || 180;
-  const calRes = await upsertCalendarHoldOrEvent({
-    session,
-    phone,
-    dateISO: slot.dateISO,
-    timeHM: slot.timeHM,
-    durationMin,
-    title: buildCalendarTitle(session, phone),
-  });
-
-  if (!calRes?.ok) return false;
-
-  session.scheduleConfirmed = true;
+  session.pendingSlot = slot;
+  session.scheduleConfirmed = false;
   session.waitingSchedule = false;
-  session.stage = "agendamento_confirmado";
 
   const resumo = `• ${slot.dateBR} às ${slot.timeHM}`;
-  const msgOk = msgAgendamentoConfirmado(resumo);
+  const msgOk = msgAgendamentoPreReserva(resumo);
   if (!antiRepeat(session, msgOk)) await zapiSendText(phone, msgOk);
 
   const msgPix = msgPedirSinalPixDepoisAgendar();
@@ -1228,6 +1219,44 @@ async function confirmScheduleSelection({ session, phone, slot }) {
   session.waitingReceipt = true;
   session.stage = "aguardando_comprovante";
   return true;
+}
+
+function msgCuidadosFinal() {
+  return (
+    "Vou te mandar algumas orientações pra você seguir antes da nossa sessão:\n\n" +
+    "• Beba bastante água no dia anterior.\n" +
+    "• Evite álcool nas 24h antes da sessão.\n" +
+    "• Passe creme hidratante na região (quanto antes começar, melhor).\n" +
+    "• Coma antes da sessão, não venha de estômago vazio.\n" +
+    "• Use roupa confortável.\n\n" +
+    "Reagendamento:\n" +
+    "• Se precisar remarcar, só avisar com até 24h de antecedência.\n" +
+    "• Depois disso não consigo ajustar porque o horário já fica separado pra você e eu não consigo reagendar.\n\n" +
+    "Qualquer coisa até o dia, é só chamar. Tamo junto!"
+  );
+}
+
+async function confirmCalendarEventAfterReceipt({ session, phone, slot }) {
+  if (!GCAL_ENABLED || !slot) return { ok: true, skipped: true };
+  const durationMin = session.durationMin || 180;
+  if (typeof createCalendarEvent === "function") {
+    return await createCalendarEvent({
+      session,
+      phone,
+      dateISO: slot.dateISO,
+      timeHM: slot.timeHM,
+      durationMin,
+      title: buildCalendarTitle(session, phone),
+    });
+  }
+  return await upsertCalendarHoldOrEvent({
+    session,
+    phone,
+    dateISO: slot.dateISO,
+    timeHM: slot.timeHM,
+    durationMin,
+    title: buildCalendarTitle(session, phone),
+  });
 }
 
 function msgCuidadosPreSessao() {
@@ -1311,10 +1340,18 @@ function msgConfirmacaoDescricao() {
   return "Só me confirma se você quer adicionar ou remover alguma coisa nessa arte da referência. Se estiver tudo certinho, eu já sigo pro orçamento.";
 }
 
-function msgOrcamentoCompleto(valor, sessoes) {
+function msgOrcamentoCompleto(valor, hours) {
+  const hasOneSession = Number(hours) <= 7;
+  const sessionLine = hasOneSession
+    ? "Esse trabalho a gente faz em 1 única sessão, pra ficar bem executado e cicatrizar bem."
+    : "Se for um trabalho maior que passe de 7h, a gente realiza em 2 sessões pra ficar bem executado e cicatrizar bem.";
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
-    `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.`
+    "Formas de pagamento:\n" +
+    "• Pix\n" +
+    "• Débito\n" +
+    "• Crédito em até 12x (+ acréscimo da máquina)\n\n" +
+    sessionLine
   );
 }
 
@@ -1331,9 +1368,7 @@ async function sendQuoteFlow(phone, session, message) {
     const hours = await estimateHoursInternal(session.imageDataUrl, info, session.isCoverup);
 
     const valor = calcPriceFromHours(hours);
-    const sessoes = sessionsFromHours(hours);
-
-    const quote = msgOrcamentoCompleto(valor, sessoes);
+    const quote = msgOrcamentoCompleto(valor, hours);
     if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
 
     const durationMin = session.durationMin || 180;
@@ -1511,7 +1546,7 @@ async function processMergedInbound(phone, merged) {
 
   // ✅ pix
   if (askedPix(message)) {
-    if (session.scheduleConfirmed) {
+    if (session.scheduleConfirmed || session.stage === "aguardando_comprovante" || session.pendingSlot) {
       const reply = msgPixDireto();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
@@ -1727,29 +1762,34 @@ async function processMergedInbound(phone, merged) {
   const isReceiptImage = Boolean(imageUrl) && detectReceiptContext(session, message);
   if (!session.depositConfirmed && isReceiptImage && isAfterSchedule) {
     session.depositConfirmed = true;
-    session.stage = "agendamento_confirmado";
+    const slot = session.pendingSlot || session.calendarHold;
+    const slotLabel = slot ? `${slot.dateBR || slot.dateISO} ${slot.timeHM}` : "não informado";
 
     await notifyOwner(
       [
         "💸 COMPROVANTE RECEBIDO (bot)",
         `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-        "• Agendamento já confirmado no calendário",
+        `• Slot escolhido: ${slotLabel}`,
+        "• Mensagem: Comprovante recebido. Confirmar no Google Agenda.",
       ].join("\n")
     );
 
-    const reply =
-      "Fechou! Agendamento confirmado ✔️\n" +
-      "Vou te mandar algumas orientações pra você seguir antes da nossa sessão:\n\n" +
-      "• Beba bastante água no dia anterior.\n" +
-      "• Evite álcool nas 24h antes da sessão.\n" +
-      "• Passe creme hidratante na região (quanto antes começar, melhor).\n" +
-      "• Coma antes da sessão, não venha de estômago vazio.\n" +
-      "• Use roupa confortável.\n\n" +
-      "Reagendamento:\n" +
-      "• Se precisar remarcar, só avisar com até 24h de antecedência.\n" +
-      "• Depois disso não consigo ajustar porque o horário já fica separado pra você e eu não consigo reagendar.\n\n" +
-      "Qualquer coisa até o dia, é só chamar. Tamo junto!";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    await confirmCalendarEventAfterReceipt({ session, phone, slot });
+
+    session.scheduleConfirmed = true;
+    session.stage = "agendamento_confirmado";
+    session.pendingSlot = null;
+
+    if (slot) {
+      const resumo = `• ${slot.dateBR || slot.dateISO} às ${slot.timeHM}`;
+      const confirmMsg = msgAgendamentoConfirmado(resumo);
+      if (!antiRepeat(session, confirmMsg)) await zapiSendText(phone, confirmMsg);
+    } else {
+      if (!antiRepeat(session, "Agendamento confirmado ✅")) await zapiSendText(phone, "Agendamento confirmado ✅");
+    }
+
+    const cuidados = msgCuidadosFinal();
+    if (!antiRepeat(session, cuidados)) await zapiSendText(phone, cuidados);
     return;
   }
 
