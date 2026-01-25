@@ -11,6 +11,14 @@
 import express from "express";
 import OpenAI from "openai";
 
+const GCAL_ENABLED = process.env.GCAL_ENABLED === "true";
+const GCAL_CALENDAR_ID = process.env.GCAL_CALENDAR_ID || "";
+const GCAL_SERVICE_ACCOUNT_JSON_BASE64 = process.env.GCAL_SERVICE_ACCOUNT_JSON_BASE64 || "";
+const GCAL_SLOT_MINUTES = parseInt(process.env.GCAL_SLOT_MINUTES || "60");
+const GCAL_TZ = process.env.GCAL_TZ || "America/Sao_Paulo";
+const GCAL_WORK_HOURS_WEEKDAY = process.env.GCAL_WORK_HOURS_WEEKDAY || "0-23";
+const GCAL_WORK_HOURS_WEEKEND = process.env.GCAL_WORK_HOURS_WEEKEND || "0-23";
+
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
@@ -85,9 +93,9 @@ function getSession(phone) {
       finished: false,
       lastOwnerNotifyAt: 0,
 
-      // prazo comprovante (12h)
+      // prazo comprovante (4h)
       depositDeadlineAt: 0, // timestamp (ms)
-      sentDepositDeadlineInfo: false, // falou das 12h pelo menos 1x (no agendamento)
+      sentDepositDeadlineInfo: false, // falou das 4h pelo menos 1x (no agendamento)
       waitingReceipt: false, // cliente disse "já já mando"
 
       // follow-up 30min (pra “vou ver e te aviso” ou sumiço pós-orçamento)
@@ -1039,7 +1047,7 @@ function msgEndereco() {
 
 function depositDeadlineLine() {
   return (
-    "• Depois do agendamento, você tem até *12 horas* pra enviar a foto do comprovante.\n" +
+    "• Depois do agendamento, você tem até *4 horas* pra enviar a foto do comprovante.\n" +
     "Se não enviar nesse prazo, o agendamento é *cancelado* e o horário volta pra agenda."
   );
 }
@@ -1063,12 +1071,14 @@ function msgAguardandoComprovante() {
 }
 
 function msgPixDireto() {
-  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "(chave pix não configurada no momento)";
+  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
   return (
-    "Aqui está:\n\n" +
-    `• Chave Pix: ${pixLine}\n` +
-    "• Sinal para reserva: *R$ 50*\n\n" +
-    "Depois me manda a *foto do comprovante* aqui."
+    "Perfeito! Para garantir o seu horário, o sinal é:\n" +
+    "R$ 50,00\n\n" +
+    "Chave Pix:\n" +
+    `${pixLine}\n\n` +
+    "A partir dessa mensagem, você tem 4 horas para realizar o pagamento e enviar o comprovante.\n" +
+    "Caso o pagamento não seja enviado dentro desse período, o horário não será reservado."
   );
 }
 
@@ -1104,12 +1114,14 @@ function msgAgendamentoConfirmado(resumo) {
 }
 
 function msgPedirSinalPixDepoisAgendar() {
-  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
   return (
-    "Pra garantir o horário, eu peço um *sinal de R$ 50*.\n" +
-    pixLine +
-    "Depois me manda a *foto do comprovante* aqui no Whats.\n\n" +
-    depositDeadlineLine()
+    "Perfeito! Para garantir o seu horário, o sinal é:\n" +
+    "R$ 50,00\n\n" +
+    "Chave Pix:\n" +
+    `${pixLine}\n\n` +
+    "A partir dessa mensagem, você tem 4 horas para realizar o pagamento e enviar o comprovante.\n" +
+    "Caso o pagamento não seja enviado dentro desse período, o horário não será reservado."
   );
 }
 
@@ -1148,10 +1160,14 @@ function msgChecagemDuvidas() {
 function msgOrcamentoCompleto(valor, sessoes) {
   return (
     `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
-    `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.\n` +
-    "• Pagamento: Pix, débito ou crédito em até 12x.\n" +
-    "• Inclui *1 retoque* (se necessário) entre 40 e 50 dias.\n\n" +
-    "Quando você quiser agendar, me chama que eu te mando opções de datas e horários disponíveis."
+    `• Eu organizo em *${sessoes} sessão(ões)* pra ficar bem executado e cicatrizar redondo.\n\n` +
+    "Se o investimento estiver dentro do que você esperava, tenho horários disponíveis para essa semana.\n" +
+    "Aqui estão algumas opções:\n" +
+    "• Pela manhã: 09h — Terça ou Quinta\n" +
+    "• À tarde: 14h — Terça, Quinta ou Sexta\n" +
+    "• À noite: 19h — Terça ou Sexta\n" +
+    "Se algum desses horários ficar bom para você, me avisa.\n" +
+    "Caso prefira um dia ou horário específico, me diz que analiso minha agenda e vejo como encaixar você."
   );
 }
 
@@ -1674,7 +1690,24 @@ async function processMergedInbound(phone, merged) {
 
   if (session.stage === "aguardando_confirmacao_descricao") {
     const lowerMsg = message.toLowerCase();
-    const confirms = ["ta certo", "tá certo", "sim", "isso", "perfeito", "ok", "fechado", "pode seguir"];
+    const confirms = [
+      "sim",
+      "certo",
+      "certinho",
+      "tá certo",
+      "ta certo",
+      "tudo certo",
+      "ok",
+      "pode ser",
+      "isso",
+      "perfeito",
+      "beleza",
+      "tranquilo",
+      "fechado",
+      "isso mesmo",
+      "tá tranquilo",
+      "ta tranquilo",
+    ];
     const wantsChange = ["nao", "não", "mudar", "alterar", "trocar", "adicionar", "remover", "ajustar"];
 
     if (confirms.some((w) => lowerMsg.includes(w))) {
@@ -1694,13 +1727,32 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    await zapiSendText(phone, "Show! Só confirma: está tudo certo com a descrição ou deseja ajustar algo?");
+    await zapiSendText(phone, "Show! Está tudo certo com a descrição ou deseja ajustar algo?");
     return;
   }
 
   if (session.stage === "aguardando_ajustes_descricao") {
     const lowerMsg = message.toLowerCase();
-    const finish = ["pode seguir", "segue", "ta certo", "tá certo", "sim"];
+    const finish = [
+      "sim",
+      "certo",
+      "certinho",
+      "tá certo",
+      "ta certo",
+      "tudo certo",
+      "ok",
+      "pode ser",
+      "isso",
+      "perfeito",
+      "beleza",
+      "tranquilo",
+      "fechado",
+      "isso mesmo",
+      "tá tranquilo",
+      "ta tranquilo",
+      "pode seguir",
+      "segue",
+    ];
 
     if (finish.some((w) => lowerMsg.includes(w))) {
       if (session.pendingDescChanges.trim()) {
@@ -1881,7 +1933,7 @@ async function processMergedInbound(phone, merged) {
       session.sentDepositRequest = true;
     }
 
-    session.depositDeadlineAt = Date.now() + 12 * 60 * 60 * 1000;
+    session.depositDeadlineAt = Date.now() + 4 * 60 * 60 * 1000;
     session.sentDepositDeadlineInfo = true;
     session.waitingReceipt = true;
     session.stage = "aguardando_comprovante";
