@@ -56,8 +56,9 @@ function getSession(phone) {
       // first-contact gate
       askedFirstContact: false,
       firstContactResolved: false,
-      firstContactReprompted: false,
+      firstContactAskedOnce: false,
       flowMode: null,
+      pollContext: null,
 
       // referência / info
       imageDataUrl: null,
@@ -66,7 +67,7 @@ function getSession(phone) {
       pendingDescChanges: "",
       adjustNotes: "",
       imageSummary: null,
-      refChangeReprompted: false,
+      refChangeAskedOnce: false,
       sizeLocation: null,
       sizeCm: null,
       bodyRegion: null,
@@ -182,6 +183,44 @@ function norm(s = "") {
     .replace(/[^\w\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizePollAnswer(input) {
+  let t = normalizeText(input);
+  if (!t) return "";
+  t = t.replace(/^option\s*:\s*/i, "");
+  t = t.replace(/^opcao\s*:\s*/i, "");
+  return t.trim();
+}
+
+function matchesOption(text, options) {
+  return options.some((option) => text === option || text.includes(option));
+}
+
+function isYes(message) {
+  const t = normalizePollAnswer(message);
+  return t ? matchesOption(t, YES_OPTIONS) : false;
+}
+
+function isNo(message) {
+  const t = normalizePollAnswer(message);
+  return t ? matchesOption(t, NO_OPTIONS) : false;
+}
+
+function isNewQuote(message) {
+  const t = normalizePollAnswer(message);
+  return t ? matchesOption(t, NEW_QUOTE_OPTIONS) : false;
+}
+
+function isOngoingQuote(message) {
+  const t = normalizePollAnswer(message);
+  return t ? matchesOption(t, ONGOING_QUOTE_OPTIONS) : false;
+}
+
+function isNumericChoice(message, value) {
+  const raw = String(message || "").trim();
+  if (!raw) return false;
+  return new RegExp(`^${value}\\b`).test(raw);
 }
 
 function hasAny(t, arr) {
@@ -487,6 +526,89 @@ const CONTINUE_INTENT = [
   "da última vez",
 ].map((value) => norm(value));
 
+const YES_OPTIONS = [
+  "sim",
+  "s",
+  "claro",
+  "isso",
+  "pode",
+  "pode sim",
+  "com certeza",
+  "quero",
+  "quero sim",
+  "bora",
+  "fechado",
+  "fechou",
+  "confirmo",
+  "ok",
+  "okay",
+  "certo",
+  "certinho",
+  "tudo certo",
+  "segue",
+  "pode seguir",
+  "pode mandar",
+  "manda",
+  "vamos",
+].map((value) => normalizeText(value));
+
+const NO_OPTIONS = [
+  "nao",
+  "não",
+  "n",
+  "negativo",
+  "nem",
+  "nada",
+  "nada nao",
+  "nada não",
+  "deixa assim",
+  "assim mesmo",
+  "do jeito que ta",
+  "do jeito que tá",
+  "sem mudar",
+  "nao quero",
+  "não quero",
+  "sem alteracao",
+  "sem alteração",
+  "pode ir",
+  "pode seguir",
+  "segue assim",
+].map((value) => normalizeText(value));
+
+const NEW_QUOTE_OPTIONS = [
+  "orcamento novo",
+  "orçamento novo",
+  "novo",
+  "novo orçamento",
+  "novo orcamento",
+  "primeiro contato",
+  "primeira vez",
+  "quero orcamento",
+  "quero orçamento",
+  "quero fazer um orçamento",
+  "quero fazer orcamento",
+  "comecar do zero",
+  "começar do zero",
+  "do zero",
+  "iniciar",
+].map((value) => normalizeText(value));
+
+const ONGOING_QUOTE_OPTIONS = [
+  "em andamento",
+  "andamento",
+  "continuar",
+  "ja tenho",
+  "já tenho",
+  "ja tenho um orcamento",
+  "já tenho um orçamento",
+  "retomar",
+  "dar continuidade",
+  "continuacao",
+  "continuação",
+  "orcamento em andamento",
+  "orçamento em andamento",
+].map((value) => normalizeText(value));
+
 function textHasAnyPhrase(text, phrases, options = {}) {
   const t = normalizeText(text);
   if (!t) return false;
@@ -527,6 +649,24 @@ function isConfirmOk(text) {
 function wantsChange(text) {
   const t = normalizeText(text);
   if (!t) return false;
+  if (isNo(t) && /mudar|alterar|adicionar|remover|ajustar|trocar|tirar|colocar/.test(t)) {
+    return false;
+  }
+  const negatedPhrases = [
+    "nao quero mudar nada",
+    "não quero mudar nada",
+    "nao quero adicionar nada",
+    "não quero adicionar nada",
+    "sem alteracao",
+    "sem alteração",
+    "deixa assim",
+    "assim mesmo",
+    "do jeito que ta",
+    "do jeito que tá",
+  ].map((phrase) => normalizeText(phrase));
+  if (negatedPhrases.some((phrase) => t.includes(phrase))) {
+    return false;
+  }
   const phrases = [
     "quero mudar",
     "quero alterar",
@@ -827,11 +967,38 @@ async function zapiPost(path, body) {
   return respBody;
 }
 
-async function sendZapiPollYesNo(to, text, yesId, noId, yesTitle = "Sim", noTitle = "Não") {
-  return sendButtons(to, text, [
-    { id: yesId, title: yesTitle },
-    { id: noId, title: noTitle },
-  ]);
+async function sendPollZapi(phone, title, options, multipleAnswers = false) {
+  const url = `${zapiBaseUrl()}/send-poll`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "client-token": ENV.ZAPI_CLIENT_TOKEN,
+      },
+      body: JSON.stringify({
+        phone: String(phone).replace(/\D/g, ""),
+        title: String(title || ""),
+        options: (options || []).map((opt) => String(opt)),
+        multipleAnswers: Boolean(multipleAnswers),
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      await resp.text().catch(() => "");
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // -------------------- OWNER notify --------------------
@@ -2104,7 +2271,7 @@ function msgChecagemDuvidas() {
 }
 
 function msgConfirmacaoDescricao() {
-  return "Você quer adicionar/remover alguma coisa nessa referência?";
+  return "Você quer alterar algo na referência?";
 }
 
 function msgOrcamentoNovo() {
@@ -2510,31 +2677,61 @@ async function processMergedInbound(phone, merged) {
     const greetingIntent = intentGreeting(message);
 
     if (budgetIntent || imageUrl) {
-      session.stage = "first_contact_poll";
-      session.firstContactReprompted = false;
-      await sendZapiPollYesNo(phone, "Pra eu te direcionar certinho: é seu primeiro contato comigo?", "FIRST_YES", "FIRST_NO");
+      session.stage = "await_first_contact_poll";
+      session.pollContext = "first_contact";
+      session.firstContactAskedOnce = false;
+      const pollSent = await sendPollZapi(phone, "É seu primeiro contato comigo?", [
+        "Sim — orçamento novo",
+        "Não — já tenho um orçamento em andamento",
+      ]);
+      if (!pollSent) {
+        await zapiSendText(
+          phone,
+          "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
+        );
+      }
       return;
     }
 
     const normalized = norm(message);
     const isAmbiguous = !normalized || (!budgetIntent && normalized.split(" ").length <= 2);
     if (isGenericGreeting(message) || isAmbiguous || greetingIntent) {
-      session.stage = "first_contact_poll";
-      session.firstContactReprompted = false;
-      await sendZapiPollYesNo(phone, "Pra eu te direcionar certinho: é seu primeiro contato comigo?", "FIRST_YES", "FIRST_NO");
+      session.stage = "await_first_contact_poll";
+      session.pollContext = "first_contact";
+      session.firstContactAskedOnce = false;
+      const pollSent = await sendPollZapi(phone, "É seu primeiro contato comigo?", [
+        "Sim — orçamento novo",
+        "Não — já tenho um orçamento em andamento",
+      ]);
+      if (!pollSent) {
+        await zapiSendText(
+          phone,
+          "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
+        );
+      }
       return;
     }
   }
 
   // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (session.stage === "first_contact_poll" || session.stage === "aguardando_primeiro_contato") {
-    const replyId = getInteractiveReplyId(payload);
-    const wantsNew = replyId === "FIRST_YES" || isAffirmative(message);
-    const wantsContinue = replyId === "FIRST_NO" || isNegative(message);
+  if (
+    session.stage === "await_first_contact_poll" ||
+    session.stage === "first_contact_poll" ||
+    session.stage === "aguardando_primeiro_contato"
+  ) {
+    const wantsNew =
+      isNumericChoice(message, 1) ||
+      isNewQuote(message) ||
+      (!isOngoingQuote(message) && isYes(message));
+    const wantsContinue =
+      isNumericChoice(message, 2) ||
+      isOngoingQuote(message) ||
+      (!isNewQuote(message) && isNo(message));
 
     if (wantsNew) {
       session.flowMode = "NEW_BUDGET";
       session.firstContactResolved = true;
+      session.pollContext = null;
       session.stage = "aguardando_referencia";
       const reply = msgOrcamentoNovo();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -2544,20 +2741,31 @@ async function processMergedInbound(phone, merged) {
 
     if (wantsContinue) {
       session.flowMode = "IN_PROGRESS";
+      session.pollContext = null;
       await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
       return;
     }
 
-    if (!session.firstContactReprompted) {
-      session.firstContactReprompted = true;
-      const retry = "Me responde clicando em uma opção aí embaixo 🙂";
+    if (!session.firstContactAskedOnce) {
+      session.firstContactAskedOnce = true;
+      const retry = "Só pra eu te direcionar certinho: é orçamento novo (Sim) ou você já tem um em andamento (Não)?";
       if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
-      await sendZapiPollYesNo(phone, "Pra eu te direcionar certinho: é seu primeiro contato comigo?", "FIRST_YES", "FIRST_NO");
+      const pollSent = await sendPollZapi(phone, "É seu primeiro contato comigo?", [
+        "Sim — orçamento novo",
+        "Não — já tenho um orçamento em andamento",
+      ]);
+      if (!pollSent) {
+        await zapiSendText(
+          phone,
+          "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
+        );
+      }
       return;
     }
 
     session.flowMode = "NEW_BUDGET";
     session.firstContactResolved = true;
+    session.pollContext = null;
     session.stage = "aguardando_referencia";
     const reply = msgOrcamentoNovo();
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
@@ -2670,6 +2878,7 @@ async function processMergedInbound(phone, merged) {
       session.sentQuote = false;
 
       if (
+        session.stage === "await_change_poll" ||
         session.stage === "change_poll" ||
         session.stage === "collect_changes" ||
         session.stage === "aguardando_confirmacao_descricao" ||
@@ -2722,11 +2931,15 @@ async function processMergedInbound(phone, merged) {
       session.pendingDescChanges = "";
       session.adjustNotes = "";
       session.confirmationAskedOnce = false;
-      session.stage = "change_poll";
-      session.refChangeReprompted = false;
+      session.stage = "await_change_poll";
+      session.pollContext = "change_reference";
+      session.refChangeAskedOnce = false;
 
       await zapiSendText(phone, desc);
-      await sendZapiPollYesNo(phone, msgConfirmacaoDescricao(), "CHANGE_YES", "CHANGE_NO");
+      const pollSent = await sendPollZapi(phone, msgConfirmacaoDescricao(), ["Sim", "Não"]);
+      if (!pollSent) {
+        await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
+      }
 
       return;
     }
@@ -2764,22 +2977,17 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
-  if (session.stage === "change_poll" || session.stage === "aguardando_confirmacao_descricao") {
-    const replyId = getInteractiveReplyId(payload);
+  if (session.stage === "await_change_poll" || session.stage === "change_poll" || session.stage === "aguardando_confirmacao_descricao") {
     const t = message;
 
-    const choseYes =
-      replyId === "CHANGE_YES" ||
-      wantsChange(t);
-    const choseNo =
-      replyId === "CHANGE_NO" ||
-      isNegative(t) ||
-      isAffirmative(t);
+    const choseYes = isNumericChoice(t, 1) || wantsChange(t) || isYes(t);
+    const choseNo = isNumericChoice(t, 2) || isNo(t);
 
     if (choseYes) {
       session.wantsChange = true;
       session.stage = "collect_changes";
-      await zapiSendText(phone, "Fechado. Me diz exatamente o que você quer adicionar/remover (pode mandar em tópicos).");
+      session.pollContext = null;
+      await zapiSendText(phone, "Fechou. Me descreve rapidinho o que você quer adicionar/remover/ajustar (pode mandar em tópicos).");
       return;
     }
 
@@ -2787,20 +2995,25 @@ async function processMergedInbound(phone, merged) {
       session.wantsChange = false;
       session.adjustNotes = "";
       session.stage = "aguardando_resposta_orcamento";
+      session.pollContext = null;
       await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
       await sendQuoteFlow(phone, session, message);
       return;
     }
 
-    if (!session.refChangeReprompted) {
-      session.refChangeReprompted = true;
-      await zapiSendText(phone, "Só pra eu não errar: clica em Sim ou Não 🙂");
-      await sendZapiPollYesNo(phone, msgConfirmacaoDescricao(), "CHANGE_YES", "CHANGE_NO");
+    if (!session.refChangeAskedOnce) {
+      session.refChangeAskedOnce = true;
+      await zapiSendText(phone, "Só confirma pra mim: quer alterar algo? (Sim/Não)");
+      const pollSent = await sendPollZapi(phone, msgConfirmacaoDescricao(), ["Sim", "Não"]);
+      if (!pollSent) {
+        await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
+      }
       return;
     }
 
     session.adjustNotes = "";
     session.stage = "aguardando_resposta_orcamento";
+    session.pollContext = null;
     await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
     await sendQuoteFlow(phone, session, message);
     return;
@@ -2828,10 +3041,14 @@ async function processMergedInbound(phone, merged) {
         }
 
         if (session.descriptionText) {
-          session.stage = "change_poll";
-          session.refChangeReprompted = false;
+          session.stage = "await_change_poll";
+          session.pollContext = "change_reference";
+          session.refChangeAskedOnce = false;
           await zapiSendText(phone, session.descriptionText);
-          await sendZapiPollYesNo(phone, msgConfirmacaoDescricao(), "CHANGE_YES", "CHANGE_NO");
+          const pollSent = await sendPollZapi(phone, msgConfirmacaoDescricao(), ["Sim", "Não"]);
+          if (!pollSent) {
+            await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
+          }
           return;
         }
 
@@ -3084,7 +3301,9 @@ async function processMergedInbound(phone, merged) {
   if (
     !session.imageDataUrl &&
     session.stage !== "inicio" &&
+    session.stage !== "await_first_contact_poll" &&
     session.stage !== "first_contact_poll" &&
+    session.stage !== "await_change_poll" &&
     session.stage !== "change_poll" &&
     session.stage !== "collect_changes"
   ) {
