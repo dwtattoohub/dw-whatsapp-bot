@@ -57,6 +57,7 @@ function getSession(phone) {
       askedFirstContact: false,
       firstContactResolved: false,
       firstContactReprompted: false,
+      flowMode: null,
 
       // referência / info
       imageDataUrl: null,
@@ -169,7 +170,6 @@ function normalizeText(input) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -525,7 +525,150 @@ function isConfirmOk(text) {
 }
 
 function wantsChange(text) {
-  return textHasAnyPhrase(text, WANTS_CHANGE_PHRASES);
+  const t = normalizeText(text);
+  if (!t) return false;
+  const phrases = [
+    "quero mudar",
+    "quero alterar",
+    "alterar",
+    "mudar",
+    "ajustar",
+    "trocar",
+    "adicionar",
+    "remover",
+    "tirar",
+    "colocar",
+    "faz",
+    "faz assim",
+    "pode mudar",
+    "pode alterar",
+    "da pra mudar",
+    "dá pra mudar",
+    "quero diferente",
+    "quero outro",
+    "inclui",
+    "inclua",
+    "retira",
+    "retire",
+  ];
+  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
+}
+
+function isAffirmative(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  const phrases = [
+    "sim",
+    "s",
+    "ss",
+    "ok",
+    "okk",
+    "certo",
+    "ta certo",
+    "tá certo",
+    "certinho",
+    "tudo certo",
+    "tudo ok",
+    "ok pode",
+    "pode",
+    "pode sim",
+    "pode ser",
+    "fechado",
+    "fechou",
+    "beleza",
+    "blz",
+    "tranquilo",
+    "suave",
+    "show",
+    "top",
+    "perfeito",
+    "maravilha",
+    "exatamente",
+    "isso",
+    "isso mesmo",
+    "do jeito que ta",
+    "do jeito que tá",
+    "assim mesmo",
+    "pode seguir",
+    "segue",
+    "pode continuar",
+    "continua",
+    "manda bala",
+    "vai",
+    "bora",
+    "boraa",
+    "pode ir",
+    "sem mudar",
+    "sem mudanca",
+    "sem mudança",
+    "sem alterações",
+    "sem alteracoes",
+    "nao precisa mudar",
+    "não precisa mudar",
+    "não quero mudar nada",
+    "nao quero mudar nada",
+    "não quero mudar",
+    "nao quero mudar",
+    "não quero adicionar nada",
+    "nao quero adicionar nada",
+    "pode manter",
+    "mantem",
+    "mantém",
+    "deixa assim",
+    "deixa do jeito que esta",
+    "deixa do jeito que tá",
+  ];
+  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
+}
+
+function isNegative(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  const phrases = [
+    "nao",
+    "não",
+    "n",
+    "negativo",
+    "prefiro nao",
+    "prefiro não",
+    "deixa",
+    "deixa assim",
+    "sem",
+    "nao quero",
+    "não quero",
+    "nao precisa",
+    "não precisa",
+    "melhor nao",
+    "melhor não",
+  ];
+  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
+}
+
+function intentBudget(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  const phrases = [
+    "orcamento",
+    "orçamento",
+    "valor",
+    "preco",
+    "preço",
+    "quanto fica",
+    "quanto custa",
+    "quero tatuar",
+    "quero fazer",
+    "tatuagem",
+    "agendar",
+    "agenda",
+  ];
+  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
+}
+
+function intentGreeting(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  const phrases = ["boa noite", "bom dia", "boa tarde", "oi", "olá", "ola", "eai", "e aí", "salve"];
+  return phrases.some((phrase) => t.startsWith(normalizeText(phrase)) || t.includes(normalizeText(phrase)));
 }
 
 function wantsNewBudget(rawText) {
@@ -550,13 +693,18 @@ function isNeutralOrQuestion(text) {
   return !isConfirmOk(text) && !wantsChange(text);
 }
 
-function getButtonReplyId(incomingPayload) {
+function getInteractiveReplyId(incomingPayload) {
   return (
     incomingPayload?.buttonId ||
+    incomingPayload?.selectedButtonId ||
     incomingPayload?.buttonReply?.id ||
     incomingPayload?.interactive?.button_reply?.id ||
-    incomingPayload?.message?.buttonsResponseMessage?.selectedButtonId ||
-    incomingPayload?.selectedId ||
+    incomingPayload?.interactive?.list_reply?.id ||
+    incomingPayload?.listReply?.id ||
+    incomingPayload?.payload?.buttonId ||
+    incomingPayload?.data?.buttonId ||
+    incomingPayload?.message?.buttonId ||
+    incomingPayload?.message?.interactive?.button_reply?.id ||
     null
   );
 }
@@ -644,49 +792,46 @@ function zapiBaseUrl() {
 }
 
 async function zapiSendText(phone, message) {
-  const url = `${zapiBaseUrl()}/send-text`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "client-token": ENV.ZAPI_CLIENT_TOKEN,
-    },
-    body: JSON.stringify({
-      phone: String(phone).replace(/\D/g, ""),
-      message: String(message || ""),
-    }),
+  return zapiPost("/send-text", {
+    phone: String(phone).replace(/\D/g, ""),
+    message: String(message || ""),
   });
-
-  const body = await resp.text().catch(() => "");
-  if (!resp.ok) throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${body}`);
-  return body;
 }
 
 async function sendButtons(phone, text, buttons) {
-  const url = `${zapiBaseUrl()}/send-button`;
+  return zapiPost("/send-button", {
+    phone: String(phone).replace(/\D/g, ""),
+    message: String(text || ""),
+    buttonList: {
+      buttons: (buttons || []).map((btn) => ({
+        id: String(btn.id),
+        label: String(btn.title),
+      })),
+    },
+  });
+}
 
+async function zapiPost(path, body) {
+  const url = `${zapiBaseUrl()}${path}`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "client-token": ENV.ZAPI_CLIENT_TOKEN,
     },
-    body: JSON.stringify({
-      phone: String(phone).replace(/\D/g, ""),
-      message: String(text || ""),
-      buttonList: {
-        buttons: (buttons || []).map((btn) => ({
-          id: String(btn.id),
-          label: String(btn.title),
-        })),
-      },
-    }),
+    body: JSON.stringify(body || {}),
   });
 
-  const body = await resp.text().catch(() => "");
-  if (!resp.ok) throw new Error(`[ZAPI BUTTON FAILED] ${resp.status} ${body}`);
-  return body;
+  const respBody = await resp.text().catch(() => "");
+  if (!resp.ok) throw new Error(`[ZAPI POST FAILED] ${resp.status} ${respBody}`);
+  return respBody;
+}
+
+async function sendZapiPollYesNo(to, text, yesId, noId, yesTitle = "Sim", noTitle = "Não") {
+  return sendButtons(to, text, [
+    { id: yesId, title: yesTitle },
+    { id: noId, title: noTitle },
+  ]);
 }
 
 // -------------------- OWNER notify --------------------
@@ -1959,7 +2104,7 @@ function msgChecagemDuvidas() {
 }
 
 function msgConfirmacaoDescricao() {
-  return "Só me confirma se você quer adicionar ou remover alguma coisa nessa arte da referência. Se estiver tudo certinho, eu já sigo pro orçamento.";
+  return "Você quer adicionar/remover alguma coisa nessa referência?";
 }
 
 function msgOrcamentoNovo() {
@@ -2361,47 +2506,34 @@ async function processMergedInbound(phone, merged) {
   // -------------------- PRIMEIRO CONTATO (saudação + intents) --------------------
   const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
   if (isFreshStart) {
-    if (wantsNewBudget(message)) {
-      session.firstContactResolved = true;
-      session.stage = "aguardando_referencia";
-      const budgetReply = msgOrcamentoNovo();
-      if (!antiRepeat(session, budgetReply)) await zapiSendText(phone, budgetReply);
-      scheduleFollowup30min(phone, session, "gate resolvido, aguardando referência");
-      return;
-    }
+    const budgetIntent = intentBudget(message);
+    const greetingIntent = intentGreeting(message);
 
-    if (wantsContinueBudget(message)) {
-      await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
+    if (budgetIntent || imageUrl) {
+      session.stage = "first_contact_poll";
+      session.firstContactReprompted = false;
+      await sendZapiPollYesNo(phone, "Pra eu te direcionar certinho: é seu primeiro contato comigo?", "FIRST_YES", "FIRST_NO");
       return;
     }
 
     const normalized = norm(message);
-    const isAmbiguous = !normalized || (!wantsNewBudget(message) && !wantsContinueBudget(message) && normalized.split(" ").length <= 2);
-    if (isGenericGreeting(message) || isAmbiguous) {
-      session.stage = "primeiro_contato_choice";
+    const isAmbiguous = !normalized || (!budgetIntent && normalized.split(" ").length <= 2);
+    if (isGenericGreeting(message) || isAmbiguous || greetingIntent) {
+      session.stage = "first_contact_poll";
       session.firstContactReprompted = false;
-      const pollText = "Só pra eu te direcionar certinho 👇\nÉ seu primeiro contato comigo?";
-      const buttons = [
-        { id: "pc_yes_new", title: "Sim — orçamento novo" },
-        { id: "pc_no_running", title: "Não — já tenho orçamento" },
-      ];
-      await sendButtons(phone, pollText, buttons);
+      await sendZapiPollYesNo(phone, "Pra eu te direcionar certinho: é seu primeiro contato comigo?", "FIRST_YES", "FIRST_NO");
       return;
     }
   }
 
   // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (session.stage === "primeiro_contato_choice" || session.stage === "aguardando_primeiro_contato") {
-    const btn = getButtonReplyId(payload);
-    const t = norm(message);
-    const wantsNew =
-      btn === "pc_yes_new" ||
-      hasAny(t, ["1", "sim", "primeira vez", "primeiro contato", "do zero", "novo"].map((value) => norm(value)));
-    const wantsContinue =
-      btn === "pc_no_running" ||
-      hasAny(t, ["2", "nao", "não", "em andamento", "continuar", "ja tenho"].map((value) => norm(value)));
+  if (session.stage === "first_contact_poll" || session.stage === "aguardando_primeiro_contato") {
+    const replyId = getInteractiveReplyId(payload);
+    const wantsNew = replyId === "FIRST_YES" || isAffirmative(message);
+    const wantsContinue = replyId === "FIRST_NO" || isNegative(message);
 
     if (wantsNew) {
+      session.flowMode = "NEW_BUDGET";
       session.firstContactResolved = true;
       session.stage = "aguardando_referencia";
       const reply = msgOrcamentoNovo();
@@ -2411,6 +2543,7 @@ async function processMergedInbound(phone, merged) {
     }
 
     if (wantsContinue) {
+      session.flowMode = "IN_PROGRESS";
       await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
       return;
     }
@@ -2418,15 +2551,12 @@ async function processMergedInbound(phone, merged) {
     if (!session.firstContactReprompted) {
       session.firstContactReprompted = true;
       const retry = "Me responde clicando em uma opção aí embaixo 🙂";
-      const buttons = [
-        { id: "pc_yes_new", title: "Sim — orçamento novo" },
-        { id: "pc_no_running", title: "Não — já tenho orçamento" },
-      ];
       if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
-      await sendButtons(phone, "Só pra eu te direcionar certinho 👇\nÉ seu primeiro contato comigo?", buttons);
+      await sendZapiPollYesNo(phone, "Pra eu te direcionar certinho: é seu primeiro contato comigo?", "FIRST_YES", "FIRST_NO");
       return;
     }
 
+    session.flowMode = "NEW_BUDGET";
     session.firstContactResolved = true;
     session.stage = "aguardando_referencia";
     const reply = msgOrcamentoNovo();
@@ -2540,12 +2670,12 @@ async function processMergedInbound(phone, merged) {
       session.sentQuote = false;
 
       if (
-        session.stage === "ref_change_choice" ||
-        session.stage === "coletar_ajustes_referencia" ||
+        session.stage === "change_poll" ||
+        session.stage === "collect_changes" ||
         session.stage === "aguardando_confirmacao_descricao" ||
         session.stage === "aguardando_ajustes_descricao"
       ) {
-        session.stage = "coletar_ajustes_referencia";
+        session.stage = "collect_changes";
         await zapiSendText(
           phone,
           "Recebi mais uma referência. Me diz o que você quer incorporar dela (ou o que quer remover) e já sigo pro orçamento."
@@ -2592,19 +2722,11 @@ async function processMergedInbound(phone, merged) {
       session.pendingDescChanges = "";
       session.adjustNotes = "";
       session.confirmationAskedOnce = false;
-      session.stage = "ref_change_choice";
+      session.stage = "change_poll";
       session.refChangeReprompted = false;
 
-      await zapiSendText(
-        phone,
-        desc +
-          "\n\n" +
-          msgConfirmacaoDescricao()
-      );
-      await sendButtons(phone, "Você quer alterar algo nessa referência?", [
-        { id: "ref_change_yes", title: "Sim — quero alterar" },
-        { id: "ref_change_no", title: "Não — tá tudo certo" },
-      ]);
+      await zapiSendText(phone, desc);
+      await sendZapiPollYesNo(phone, msgConfirmacaoDescricao(), "CHANGE_YES", "CHANGE_NO");
 
       return;
     }
@@ -2642,75 +2764,27 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
-  if (session.stage === "ref_change_choice" || session.stage === "aguardando_confirmacao_descricao") {
-    const btn = getButtonReplyId(payload);
-    const t = norm(message);
-    const NO_NO_CHANGE = [
-      "nao",
-      "não",
-      "n",
-      "negativo",
-      "deixa assim",
-      "assim mesmo",
-      "do jeito que ta",
-      "do jeito que está",
-      "ta bom",
-      "tá bom",
-      "ok",
-      "certo",
-      "certinho",
-      "tudo certo",
-      "tudo ok",
-      "perfeito assim",
-      "pode seguir",
-      "segue",
-      "pode ir",
-      "manda bala",
-      "fechado",
-      "fechou",
-      "beleza",
-      "tranquilo",
-      "suave",
-      "nao quero mudar",
-      "não quero mudar",
-      "nao quero alterar",
-      "não quero alterar",
-      "nao quero remover",
-      "não quero remover",
-      "nao quero adicionar",
-      "não quero adicionar",
-      "sem ajustes",
-      "sem mudanca",
-      "sem mudança",
-    ].map((value) => norm(value));
+  if (session.stage === "change_poll" || session.stage === "aguardando_confirmacao_descricao") {
+    const replyId = getInteractiveReplyId(payload);
+    const t = message;
 
-    const YES_WANTS_CHANGE = [
-      "sim",
-      "s",
-      "quero",
-      "quero sim",
-      "pode",
-      "pode sim",
-      "mudar",
-      "alterar",
-      "trocar",
-      "ajustar",
-      "corrigir",
-      "refazer",
-      "rever",
-      "adicionar",
-      "colocar",
-      "incluir",
-      "remover",
-      "tirar",
-      "apagar",
-      "sem isso",
-    ].map((value) => norm(value));
+    const choseYes =
+      replyId === "CHANGE_YES" ||
+      wantsChange(t);
+    const choseNo =
+      replyId === "CHANGE_NO" ||
+      isNegative(t) ||
+      isAffirmative(t);
 
-    const choseNo = btn === "ref_change_no" || hasAny(t, NO_NO_CHANGE);
-    const choseYes = btn === "ref_change_yes" || hasAny(t, YES_WANTS_CHANGE);
+    if (choseYes) {
+      session.wantsChange = true;
+      session.stage = "collect_changes";
+      await zapiSendText(phone, "Fechado. Me diz exatamente o que você quer adicionar/remover (pode mandar em tópicos).");
+      return;
+    }
 
     if (choseNo) {
+      session.wantsChange = false;
       session.adjustNotes = "";
       session.stage = "aguardando_resposta_orcamento";
       await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
@@ -2718,22 +2792,10 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    if (choseYes) {
-      session.stage = "coletar_ajustes_referencia";
-      await zapiSendText(
-        phone,
-        "Fechou. Me diz certinho o que você quer alterar, adicionar ou remover nessa referência."
-      );
-      return;
-    }
-
     if (!session.refChangeReprompted) {
       session.refChangeReprompted = true;
-      await zapiSendText(phone, "Só pra eu não errar: você quer alterar algo? Clica em Sim ou Não 🙂");
-      await sendButtons(phone, "Você quer alterar algo nessa referência?", [
-        { id: "ref_change_yes", title: "Sim — quero alterar" },
-        { id: "ref_change_no", title: "Não — tá tudo certo" },
-      ]);
+      await zapiSendText(phone, "Só pra eu não errar: clica em Sim ou Não 🙂");
+      await sendZapiPollYesNo(phone, msgConfirmacaoDescricao(), "CHANGE_YES", "CHANGE_NO");
       return;
     }
 
@@ -2744,7 +2806,7 @@ async function processMergedInbound(phone, merged) {
     return;
   }
 
-  if (session.stage === "coletar_ajustes_referencia" || session.stage === "aguardando_ajustes_descricao") {
+  if (session.stage === "collect_changes" || session.stage === "aguardando_ajustes_descricao") {
     if (message) {
       session.adjustNotes = session.adjustNotes ? `${session.adjustNotes}\n${message}` : message;
       await zapiSendText(phone, "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.");
@@ -2766,18 +2828,10 @@ async function processMergedInbound(phone, merged) {
         }
 
         if (session.descriptionText) {
-          session.stage = "ref_change_choice";
+          session.stage = "change_poll";
           session.refChangeReprompted = false;
-          await zapiSendText(
-            phone,
-            session.descriptionText +
-              "\n\n" +
-              msgConfirmacaoDescricao()
-          );
-          await sendButtons(phone, "Você quer alterar algo nessa referência?", [
-            { id: "ref_change_yes", title: "Sim — quero alterar" },
-            { id: "ref_change_no", title: "Não — tá tudo certo" },
-          ]);
+          await zapiSendText(phone, session.descriptionText);
+          await sendZapiPollYesNo(phone, msgConfirmacaoDescricao(), "CHANGE_YES", "CHANGE_NO");
           return;
         }
 
@@ -3030,10 +3084,9 @@ async function processMergedInbound(phone, merged) {
   if (
     !session.imageDataUrl &&
     session.stage !== "inicio" &&
-    session.stage !== "aguardando_primeiro_contato" &&
-    session.stage !== "primeiro_contato_choice" &&
-    session.stage !== "ref_change_choice" &&
-    session.stage !== "coletar_ajustes_referencia"
+    session.stage !== "first_contact_poll" &&
+    session.stage !== "change_poll" &&
+    session.stage !== "collect_changes"
   ) {
     const reply =
       "Pra eu te atender certinho, me manda uma *referência em imagem* e me diz *onde no corpo + tamanho aproximado*.";
