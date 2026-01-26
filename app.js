@@ -55,6 +55,7 @@ function getSession(phone) {
 
       // first-contact gate
       askedFirstContact: false,
+      firstContactRetry: false,
       firstContactResolved: false,
       flowMode: null,
 
@@ -75,6 +76,7 @@ function getSession(phone) {
 
       // ordem / flags
       greeted: false,
+      sentGreeting: false,
       greetVariant: null,
       closingVariant: null,
 
@@ -119,6 +121,8 @@ function getSession(phone) {
       lastReplyAt: 0,
       lastQuoteSizeCm: null,
       lastQuotePrice: null,
+      lastInteractiveKey: null,
+      lastInteractiveAt: 0,
 
       // buffer p/ juntar mensagens (imagem + local, etc)
       pending: {
@@ -788,31 +792,40 @@ function isNeutralOrQuestion(text) {
 
 const BTN = {
   // Gate 1: primeiro contato
-  FIRST_NEW: "new_budget",
-  FIRST_ONGOING: "in_progress",
+  FIRST_NEW: "fc_new",
+  FIRST_ONGOING: "fc_ongoing",
 
   // Gate 2: alterar referência?
-  CHG_YES: "change_yes",
-  CHG_NO: "change_no",
+  CHG_YES: "chg_yes",
+  CHG_NO: "chg_no",
 };
 
 function getInteractiveReplyId(incomingPayload) {
   return (
     incomingPayload?.buttonId ||
+    incomingPayload?.selectedId ||
     incomingPayload?.selectedButtonId ||
+    incomingPayload?.optionId ||
     incomingPayload?.buttonReply?.id ||
     incomingPayload?.interactive?.button_reply?.id ||
     incomingPayload?.interactive?.list_reply?.id ||
     incomingPayload?.listReply?.id ||
     incomingPayload?.payload?.buttonId ||
+    incomingPayload?.data?.selectedId ||
+    incomingPayload?.data?.selectedButtonId ||
     incomingPayload?.data?.buttonId ||
+    incomingPayload?.data?.optionId ||
     incomingPayload?.message?.buttonId ||
+    incomingPayload?.message?.interactive?.list_reply?.id ||
     incomingPayload?.message?.interactive?.button_reply?.id ||
     null
   );
 }
 
 function getIncomingText(incomingPayload) {
+  const buttonId = getInteractiveReplyId(incomingPayload);
+  if (buttonId) return buttonId;
+
   return (
     incomingPayload?.text ||
     incomingPayload?.body ||
@@ -839,9 +852,11 @@ function resolveFirstContactChoice({ buttonId, message }) {
   const t = String(message || "");
   const wantsNew =
     isNumericChoice(t, 1) ||
+    isYes(t) ||
     /novo|orcamento novo|do zero/i.test(t);
   const wantsContinue =
     isNumericChoice(t, 2) ||
+    isNo(t) ||
     /andamento|ja tenho|já tenho|continuar/i.test(t);
 
   if (wantsNew) return "NEW";
@@ -931,17 +946,27 @@ async function zapiSendText(phone, message) {
   });
 }
 
-async function sendButtons(phone, text, buttons) {
-  return zapiPost("/send-button", {
-    phone: String(phone).replace(/\D/g, ""),
-    message: String(text || ""),
-    buttonList: {
-      buttons: (buttons || []).map((btn) => ({
-        id: String(btn.id),
-        label: String(btn.title),
-      })),
-    },
-  });
+async function sendButtonsZapi(phone, text, buttons) {
+  try {
+    await zapiPost("/send-button", {
+      phone: String(phone).replace(/\D/g, ""),
+      message: String(text || ""),
+      buttonList: {
+        buttons: (buttons || []).map((btn) => ({
+          id: String(btn.id),
+          label: String(btn.label ?? btn.title ?? ""),
+        })),
+      },
+    });
+    return true;
+  } catch (error) {
+    const list = (buttons || [])
+      .map((btn, idx) => `${idx + 1}) ${btn.label ?? btn.title ?? ""}`)
+      .join("\n");
+    const fallback = list ? `${text}\n\n${list}` : text;
+    await zapiSendText(phone, fallback);
+    return false;
+  }
 }
 
 async function zapiPost(path, body) {
@@ -960,25 +985,38 @@ async function zapiPost(path, body) {
   return respBody;
 }
 
-async function sendFirstContactButtons(phone, session) {
-  session.stage = "await_first_contact_buttons";
+async function sendFirstContactButtons(phone, session, options = {}) {
+  const interactiveKey = "first_contact_buttons";
+  if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
 
-  await sendButtons(
+  session.stage = "await_first_contact_button";
+  session.lastInteractiveKey = interactiveKey;
+  session.lastInteractiveAt = Date.now();
+  session.askedFirstContact = true;
+  session.firstContactRetry = false;
+
+  return sendButtonsZapi(
     phone,
-    "Só pra eu te direcionar certinho: você quer um orçamento novo ou já tem um em andamento?",
+    "Pra eu te direcionar certinho: é seu primeiro contato comigo?",
     [
-      { id: BTN.FIRST_NEW, title: "Orçamento novo" },
-      { id: BTN.FIRST_ONGOING, title: "Em andamento" },
+      { id: BTN.FIRST_NEW, label: "Sim — orçamento novo" },
+      { id: BTN.FIRST_ONGOING, label: "Não — já tenho um em andamento" },
     ]
   );
 }
 
-async function sendChangeReferenceButtons(phone, session) {
-  session.stage = "await_change_buttons";
+async function sendChangeReferenceButtons(phone, session, options = {}) {
+  const interactiveKey = "change_buttons";
+  if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
 
-  await sendButtons(phone, "Você quer alterar algo na referência?", [
-    { id: BTN.CHG_YES, title: "Sim" },
-    { id: BTN.CHG_NO, title: "Não" },
+  session.stage = "await_change_button";
+  session.lastInteractiveKey = interactiveKey;
+  session.lastInteractiveAt = Date.now();
+  session.confirmationAskedOnce = false;
+
+  return sendButtonsZapi(phone, "Você quer alterar algo na referência?", [
+    { id: BTN.CHG_YES, label: "Sim" },
+    { id: BTN.CHG_NO, label: "Não" },
   ]);
 }
 
@@ -1050,6 +1088,27 @@ function parseZapiInbound(body) {
     body?.data?.contact?.name ||
     null;
 
+  const buttonId =
+    body?.buttonId ||
+    body?.selectedId ||
+    body?.selectedButtonId ||
+    body?.optionId ||
+    body?.data?.buttonId ||
+    body?.data?.selectedId ||
+    body?.data?.selectedButtonId ||
+    body?.data?.optionId ||
+    body?.interactive?.button_reply?.id ||
+    body?.interactive?.list_reply?.id ||
+    body?.message?.interactive?.button_reply?.id ||
+    body?.message?.interactive?.list_reply?.id ||
+    null;
+
+  const interactiveType =
+    body?.interactive?.type ||
+    body?.message?.interactive?.type ||
+    body?.data?.interactive?.type ||
+    (buttonId ? "button" : null);
+
   return {
     phone: phone ? String(phone) : null,
     message: String(message || "").trim(),
@@ -1058,6 +1117,8 @@ function parseZapiInbound(body) {
     fromMe,
     messageType: String(messageType || ""),
     contactName: contactName ? String(contactName).trim() : null,
+    buttonId: buttonId ? String(buttonId) : null,
+    interactiveType: interactiveType ? String(interactiveType) : null,
     raw: body,
   };
 }
@@ -2532,12 +2593,11 @@ async function processMergedInbound(phone, merged) {
     resetSession(phone);
     const s2 = getSession(phone);
     const greet = chooseGreetingOnce(s2, contactName);
-    await zapiSendText(phone, greet);
-    s2.stage = "await_first_contact_buttons";
-    await sendButtons(phone, "Só pra eu te direcionar certinho: orçamento novo ou em andamento?", [
-      { id: BTN.FIRST_NEW, title: "Orçamento novo" },
-      { id: BTN.FIRST_ONGOING, title: "Em andamento" },
-    ]);
+    if (!s2.sentGreeting) {
+      await zapiSendText(phone, greet);
+      s2.sentGreeting = true;
+    }
+    await sendFirstContactButtons(phone, s2);
     return;
   }
 
@@ -2679,17 +2739,21 @@ async function processMergedInbound(phone, merged) {
   const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
   if (isFreshStart) {
     const greet = chooseGreetingOnce(session, contactName);
-    await zapiSendText(phone, greet);
+    if (!session.sentGreeting) {
+      await zapiSendText(phone, greet);
+      session.sentGreeting = true;
+    }
     session.greeted = true;
     await sendFirstContactButtons(phone, session);
     return;
   }
 
   // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (session.stage === "await_first_contact_buttons") {
+  if (session.stage === "await_first_contact_button") {
     const choice = resolveFirstContactChoice({ buttonId: btnId, message });
 
     if (choice === "NEW") {
+      session.lastInteractiveKey = null;
       session.flowMode = "NEW_BUDGET";
       session.firstContactResolved = true;
       session.stage = "aguardando_referencia";
@@ -2700,12 +2764,25 @@ async function processMergedInbound(phone, merged) {
     }
 
     if (choice === "ONGOING") {
+      session.lastInteractiveKey = null;
       session.flowMode = "IN_PROGRESS";
       await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
       return;
     }
 
-    await zapiSendText(phone, "Clica em uma opção pra eu te direcionar ✅");
+    if (!session.firstContactRetry) {
+      session.firstContactRetry = true;
+      await sendFirstContactButtons(phone, session, { force: true });
+      return;
+    }
+
+    session.flowMode = "NEW_BUDGET";
+    session.lastInteractiveKey = null;
+    session.firstContactResolved = true;
+    session.stage = "aguardando_referencia";
+    const reply = msgOrcamentoNovo();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    scheduleFollowup30min(phone, session, "fallback gate primeiro contato");
     return;
   }
 
@@ -2814,7 +2891,7 @@ async function processMergedInbound(phone, merged) {
       session.sentQuote = false;
 
       if (
-        session.stage === "await_change_buttons" ||
+        session.stage === "await_change_button" ||
         session.stage === "collect_changes" ||
         session.stage === "aguardando_ajustes_descricao"
       ) {
@@ -2905,10 +2982,11 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
-  if (session.stage === "await_change_buttons") {
+  if (session.stage === "await_change_button") {
     const choice = resolveChangeChoice({ buttonId: btnId, message });
 
     if (choice === "YES") {
+      session.lastInteractiveKey = null;
       session.wantsChange = true;
       session.stage = "collect_changes";
       await zapiSendText(phone, "Fechou. Me descreve rapidinho o que você quer adicionar/remover/ajustar (pode mandar em tópicos).");
@@ -2916,6 +2994,7 @@ async function processMergedInbound(phone, merged) {
     }
 
     if (choice === "NO") {
+      session.lastInteractiveKey = null;
       session.wantsChange = false;
       session.adjustNotes = "";
       session.stage = "aguardando_resposta_orcamento";
@@ -2924,7 +3003,18 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    await zapiSendText(phone, "Clica em Sim ou Não ✅");
+    if (!session.confirmationAskedOnce) {
+      session.confirmationAskedOnce = true;
+      await sendChangeReferenceButtons(phone, session, { force: true });
+      return;
+    }
+
+    session.wantsChange = false;
+    session.lastInteractiveKey = null;
+    session.adjustNotes = "";
+    session.stage = "aguardando_resposta_orcamento";
+    await zapiSendText(phone, "Perfeito! Vou calcular o investimento pra você.");
+    await sendQuoteFlow(phone, session, message);
     return;
   }
 
@@ -3204,8 +3294,8 @@ async function processMergedInbound(phone, merged) {
   if (
     !session.imageDataUrl &&
     session.stage !== "inicio" &&
-    session.stage !== "await_first_contact_buttons" &&
-    session.stage !== "await_change_buttons" &&
+    session.stage !== "await_first_contact_button" &&
+    session.stage !== "await_change_button" &&
     session.stage !== "collect_changes"
   ) {
     const reply =
