@@ -62,6 +62,7 @@ function getSession(phone) {
       descriptionText: null,
       descriptionConfirmed: false,
       pendingDescChanges: "",
+      adjustNotes: "",
       imageSummary: null,
       sizeLocation: null,
       sizeCm: null,
@@ -80,6 +81,7 @@ function getSession(phone) {
       askedDoubts: false,
       doubtsResolved: false,
       sentQuote: false,
+      confirmationAskedOnce: false,
 
       // sinal / agenda
       depositConfirmed: false,
@@ -164,7 +166,290 @@ function normalizeText(input) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
     .trim();
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const GREETING_PHRASES = [
+  "oi",
+  "ola",
+  "olá",
+  "oie",
+  "oiee",
+  "eai",
+  "e aí",
+  "iai",
+  "iae",
+  "salve",
+  "opa",
+  "opaa",
+  "bom dia",
+  "boa tarde",
+  "boa noite",
+  "tudo bem",
+  "td bem",
+  "tudo certo",
+  "tudo bom",
+  "beleza",
+  "blz",
+  "tranquilo",
+  "tranq",
+  "suave",
+  "de boa",
+  "deboas",
+  "fala",
+  "fala ai",
+  "fala aí",
+  "fala mano",
+  "fala meu mano",
+  "fala irmão",
+  "fala irmao",
+  "fala bro",
+  "fala chefe",
+  "bom",
+  "boa",
+  "noite",
+  "dia",
+  "tarde",
+];
+
+const BUDGET_INTENT_PHRASES = [
+  "quero orcamento",
+  "quero fazer um orcamento",
+  "quero fazer orcamento",
+  "quero um orcamento",
+  "orcamento",
+  "orçamento",
+  "valor",
+  "preco",
+  "preço",
+  "quanto fica",
+  "quanto custa",
+  "quanto sai",
+  "qual valor",
+  "qual o valor",
+  "me passa o valor",
+  "me passa o preco",
+  "me passa o preço",
+  "investimento",
+];
+
+const SCHEDULE_INTENT_PHRASES = [
+  "agendar",
+  "agendamento",
+  "horario",
+  "horário",
+  "marcar",
+  "marcacao",
+  "marcação",
+  "agenda",
+  "data",
+  "hora",
+  "disponibilidade",
+];
+
+const CONFIRM_OK_PHRASES = [
+  "sim",
+  "s",
+  "ss",
+  "uhum",
+  "aham",
+  "ok",
+  "okay",
+  "okey",
+  "certo",
+  "certinho",
+  "tudo certo",
+  "tudo certinho",
+  "ta certo",
+  "tá certo",
+  "ta certinho",
+  "tá certinho",
+  "ta ok",
+  "tá ok",
+  "ta bom",
+  "tá bom",
+  "tá ótimo",
+  "ta otimo",
+  "perfeito",
+  "perfeita",
+  "top",
+  "show",
+  "fechado",
+  "fechou",
+  "blz",
+  "beleza",
+  "tranquilo",
+  "suave",
+  "de boa",
+  "deboas",
+  "pode",
+  "pode ser",
+  "pode seguir",
+  "pode continuar",
+  "segue",
+  "segue ai",
+  "segue aí",
+  "pode ir",
+  "vai",
+  "manda",
+  "manda ver",
+  "pode mandar",
+  "segue o baile",
+  "segue o jogo",
+  "toca",
+  "toca ficha",
+  "bora",
+  "bora seguir",
+  "do jeito que ta",
+  "do jeito que tá",
+  "do jeito que esta",
+  "do jeito que está",
+  "assim mesmo",
+  "desse jeito mesmo",
+  "pode deixar assim",
+  "deixa assim",
+  "mantem assim",
+  "mantém assim",
+  "nao muda nada",
+  "não muda nada",
+  "nao quero mudar nada",
+  "não quero mudar nada",
+  "nao precisa mudar",
+  "não precisa mudar",
+  "sem alteracoes",
+  "sem alterações",
+  "sem mudancas",
+  "sem mudanças",
+  "sem ajuste",
+  "sem ajustes",
+  "nao quero adicionar nada",
+  "não quero adicionar nada",
+  "nao quero remover nada",
+  "não quero remover nada",
+  "ta perfeito",
+  "tá perfeito",
+  "ta perfeita",
+  "tá perfeita",
+  "ta lindo",
+  "tá lindo",
+  "ta linda",
+  "tá linda",
+  "pode seguir pro orcamento",
+  "pode seguir pro orçamento",
+  "pode seguir com o orcamento",
+  "pode seguir com o orçamento",
+  "pode seguir",
+  "pode continuar",
+  "pode dar sequência",
+  "pode dar sequencia",
+  "segue pro valor",
+  "segue pro valor ai",
+];
+
+const WANTS_CHANGE_PHRASES = [
+  "quero mudar",
+  "quero alterar",
+  "quero ajustar",
+  "quero trocar",
+  "quero adicionar",
+  "quero colocar",
+  "quero incluir",
+  "quero remover",
+  "quero tirar",
+  "quero mudar um detalhe",
+  "quero mudar alguns detalhes",
+  "pode mudar",
+  "pode alterar",
+  "pode ajustar",
+  "pode trocar",
+  "pode tirar",
+  "pode remover",
+  "pode adicionar",
+  "pode colocar",
+  "vamos mudar",
+  "vamos alterar",
+  "vamos ajustar",
+  "vamos trocar",
+  "vamos adicionar",
+  "vamos remover",
+  "vamos tirar",
+  "da pra mudar",
+  "dá pra mudar",
+  "da pra ajustar",
+  "dá pra ajustar",
+  "tem como mudar",
+  "tem como ajustar",
+  "nao ta certo",
+  "não tá certo",
+  "nao esta certo",
+  "não está certo",
+  "nao gostei",
+  "não gostei",
+  "ficou ruim",
+  "quero diferente",
+  "quero outro",
+  "quero mais",
+  "quero menos",
+  "muda",
+  "altera",
+  "ajusta",
+  "troca",
+  "remove",
+  "tira",
+  "coloca",
+  "inclui",
+  "adiciona",
+];
+
+function textHasAnyPhrase(text, phrases, options = {}) {
+  const t = normalizeText(text);
+  if (!t) return false;
+
+  for (const rawPhrase of phrases) {
+    const phrase = normalizeText(rawPhrase);
+    if (!phrase) continue;
+
+    if (options.exactOnly?.includes(phrase)) {
+      if (t === phrase) return true;
+      continue;
+    }
+
+    const escaped = escapeRegExp(phrase);
+    const regex = new RegExp(`\\b${escaped}\\b`, "i");
+    if (regex.test(t)) return true;
+  }
+
+  return false;
+}
+
+function hasGreeting(text) {
+  return textHasAnyPhrase(text, GREETING_PHRASES);
+}
+
+function hasBudgetIntent(text) {
+  return textHasAnyPhrase(text, BUDGET_INTENT_PHRASES);
+}
+
+function hasScheduleIntent(text) {
+  return textHasAnyPhrase(text, SCHEDULE_INTENT_PHRASES);
+}
+
+function isConfirmOk(text) {
+  return textHasAnyPhrase(text, CONFIRM_OK_PHRASES, { exactOnly: ["s", "ss"] });
+}
+
+function wantsChange(text) {
+  return textHasAnyPhrase(text, WANTS_CHANGE_PHRASES);
+}
+
+function isNeutralOrQuestion(text) {
+  return !isConfirmOk(text) && !wantsChange(text);
 }
 
 function detectRegionOrSizeHint(text) {
@@ -390,11 +675,11 @@ function safeName(name) {
 // -------------------- GREETINGS / CLOSINGS --------------------
 const GREETINGS = [
   (name) =>
-    `Olá${name ? `, ${name}` : ""}! Oi, aqui é o DW Tattooer, especialista em tatuagens realistas em preto e cinza e whip shading.\n\n` +
+    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\n` +
     `Pra eu te atender do jeito certo, me diz uma coisa rapidinho:\n` +
     `Você já tem um *orçamento em andamento* comigo e quer continuar, ou quer *começar um orçamento novo do zero*?`,
   (name) =>
-    `Oi${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.\n\n` +
+    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\n` +
     `Só pra eu te direcionar certinho:\n` +
     `Você já tem um *orçamento em andamento* comigo (pra continuar), ou é um *orçamento novo do zero*?`,
 ];
@@ -1536,6 +1821,16 @@ function msgConfirmacaoDescricao() {
   return "Só me confirma se você quer adicionar ou remover alguma coisa nessa arte da referência. Se estiver tudo certinho, eu já sigo pro orçamento.";
 }
 
+function msgOrcamentoNovo() {
+  return (
+    "Show! Então vamos montar um orçamento novo bem certinho.\n\n" +
+    "Pra eu te passar um valor bem fiel, me manda:\n" +
+    "• *a referência em imagem* (se tiver)\n" +
+    "• *onde no corpo* você quer fazer + *tamanho aproximado*\n\n" +
+    "Se você tiver alguma ideia de ajuste além da referência, pode falar também."
+  );
+}
+
 function msgOrcamentoCompleto(valor, sessions) {
   const hasOneSession = Number(sessions) <= 1;
   const sessionLine = hasOneSession
@@ -1561,7 +1856,7 @@ async function sendQuoteFlow(phone, session, message) {
   }
 
   try {
-    const notes = [session.descriptionText, message].filter(Boolean).join(" ");
+    const notes = [session.descriptionText, session.adjustNotes, message].filter(Boolean).join(" ");
     const imageForAnalysis = session.referenceImageUrl || session.imageDataUrl;
     const analysis = await buildArtAnalysis({
       sizeCm: session.sizeCm,
@@ -1917,6 +2212,28 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
+  // -------------------- PRIMEIRO CONTATO (saudação + intents) --------------------
+  const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
+  if (isFreshStart && hasGreeting(message)) {
+    const reply = chooseGreetingOnce(session, contactName);
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+
+    session.greeted = true;
+    session.askedFirstContact = true;
+
+    if (hasBudgetIntent(message)) {
+      session.firstContactResolved = true;
+      session.stage = "aguardando_referencia";
+      const budgetReply = msgOrcamentoNovo();
+      if (!antiRepeat(session, budgetReply)) await zapiSendText(phone, budgetReply);
+      scheduleFollowup30min(phone, session, "gate resolvido, aguardando referência");
+      return;
+    }
+
+    session.stage = "aguardando_primeiro_contato";
+    return;
+  }
+
   // -------------------- FLUXO (gate primeiro contato) --------------------
   if (session.stage === "inicio") {
     const reply = chooseGreetingOnce(session, contactName);
@@ -1952,12 +2269,7 @@ async function processMergedInbound(phone, merged) {
       session.firstContactResolved = true;
       session.stage = "aguardando_referencia";
 
-      const reply =
-        "Show! Então vamos montar um orçamento novo bem certinho.\n\n" +
-        "Pra eu te passar um valor bem fiel, me manda:\n" +
-        "• *a referência em imagem* (se tiver)\n" +
-        "• *onde no corpo* você quer fazer + *tamanho aproximado*\n\n" +
-        "Se você tiver alguma ideia de ajuste além da referência, pode falar também.";
+      const reply = msgOrcamentoNovo();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
 
       // follow-up se sumir
@@ -2058,6 +2370,8 @@ async function processMergedInbound(phone, merged) {
       session.descriptionText = null;
       session.descriptionConfirmed = false;
       session.pendingDescChanges = "";
+      session.adjustNotes = "";
+      session.confirmationAskedOnce = false;
 
       session.imageSummary = await describeImageForClient(dataUrl);
 
@@ -2120,6 +2434,8 @@ async function processMergedInbound(phone, merged) {
       session.descriptionText = desc;
       session.descriptionConfirmed = false;
       session.pendingDescChanges = "";
+      session.adjustNotes = "";
+      session.confirmationAskedOnce = false;
       session.stage = "aguardando_confirmacao_descricao";
 
       await zapiSendText(
@@ -2166,41 +2482,42 @@ async function processMergedInbound(phone, merged) {
   }
 
   if (session.stage === "aguardando_confirmacao_descricao") {
-    const normalizedMsg = normalizeText(message);
-    const confirms = [
-      "sim",
-      "ok",
-      "certo",
-      "ta certo",
-      "certinho",
-      "tudo certo",
-      "pode seguir",
-      "segue",
-      "fechado",
-      "fechou",
-      "perfeito",
-      "beleza",
-      "pode ser",
-      "ta bom",
-      "isso",
-      "exatamente",
-    ];
-    const wantsChange = ["nao", "não", "mudar", "alterar", "trocar", "adicionar", "remover", "ajustar"];
-
-    if (confirms.some((w) => normalizedMsg.includes(w))) {
+    if (isConfirmOk(message)) {
       session.descriptionConfirmed = true;
       session.stage = "aguardando_resposta_orcamento";
+      session.confirmationAskedOnce = false;
+      session.adjustNotes = "";
       await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
       await sendQuoteFlow(phone, session, message);
       return;
     }
 
-    if (wantsChange.some((w) => normalizedMsg.includes(normalizeText(w)))) {
+    if (wantsChange(message)) {
       session.stage = "aguardando_ajustes_descricao";
+      session.confirmationAskedOnce = false;
       await zapiSendText(
         phone,
         "Perfeito. Me diga o que deseja adicionar/remover. Se quiser mandar outra referência também posso integrar."
       );
+      return;
+    }
+
+    if (isNeutralOrQuestion(message)) {
+      if (!session.confirmationAskedOnce) {
+        session.confirmationAskedOnce = true;
+        await zapiSendText(
+          phone,
+          "Entendi. Você quer que eu mantenha exatamente como tá na referência ou quer ajustar algum detalhe?"
+        );
+        return;
+      }
+
+      session.confirmationAskedOnce = false;
+      session.adjustNotes = "cliente não respondeu claramente; segui adiante";
+      session.descriptionConfirmed = true;
+      session.stage = "aguardando_resposta_orcamento";
+      await zapiSendText(phone, "Beleza! Vou seguir pro orçamento então.");
+      await sendQuoteFlow(phone, session, message);
       return;
     }
 
@@ -2243,6 +2560,7 @@ async function processMergedInbound(phone, merged) {
           .join("\n");
         session.pendingDescChanges = "";
       }
+      session.confirmationAskedOnce = false;
       session.stage = "aguardando_confirmacao_descricao";
       await zapiSendText(phone, `${session.descriptionText}\n\n${msgConfirmacaoDescricao()}`);
       return;
