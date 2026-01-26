@@ -22,6 +22,8 @@ const ENV = {
   ZAPI_INSTANCE_ID: process.env.ZAPI_INSTANCE_ID || process.env.ID_INSTÂNCIA_ZAPI,
   ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN || process.env.ZAPI_INSTANCE_TOKEN,
   ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || process.env.ZAPI_CLIENT_TOKEN,
+  ZAPI_BUTTONS_PATH: process.env.ZAPI_BUTTONS_PATH || "/send-buttons",
+  ZAPI_LIST_PATH: process.env.ZAPI_LIST_PATH || "/send-list",
 
   OWNER_PHONE: process.env.OWNER_PHONE || process.env.TELEFONE_DO_PROPRIETÁRIO || "",
   PIX_KEY: process.env.PIX_KEY || "",
@@ -80,19 +82,51 @@ async function zapiSendText(phone, message) {
 }
 
 async function sendButtonsZapi(phone, text, buttons) {
-  try {
-    const resp = await zapiFetch("/send-buttons", {
-      phone,
-      message: text,
-      buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
-    });
-    const respPreview = typeof resp === "string" ? resp.slice(0, 240) : JSON.stringify(resp).slice(0, 240);
-    console.log("[ZAPI BUTTONS] ok", { phone, respPreview });
-    return true;
-  } catch (err) {
-    console.error("[ZAPI BUTTONS] fail", err?.message || err);
-    return false;
+  const buttonPayload = {
+    phone,
+    message: text,
+    buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
+  };
+
+  const listPayload = {
+    phone,
+    message: text,
+    title: "Selecione uma opção",
+    buttonText: "Escolher",
+    sections: [
+      {
+        title: "Opções",
+        rows: buttons.map((button) => ({
+          id: button.id,
+          title: button.title,
+          description: "",
+        })),
+      },
+    ],
+  };
+
+  const attempts = [
+    { path: ENV.ZAPI_BUTTONS_PATH, payload: buttonPayload, label: "buttons" },
+    { path: "/send-button-list", payload: listPayload, label: "button-list" },
+    { path: ENV.ZAPI_LIST_PATH, payload: listPayload, label: "list" },
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const resp = await zapiFetch(attempt.path, attempt.payload);
+      const respString = typeof resp === "string" ? resp : JSON.stringify(resp || {});
+      if (/NOT_FOUND|error/i.test(respString)) {
+        throw new Error(`ZAPI response indicates error: ${respString.slice(0, 240)}`);
+      }
+      const respPreview = respString.slice(0, 240);
+      console.log("[ZAPI BUTTONS] success on", attempt.path, { phone, label: attempt.label, respPreview });
+      return true;
+    } catch (err) {
+      console.error("[ZAPI BUTTONS] fail on", attempt.path, err?.message || err);
+    }
   }
+
+  return false;
 }
 
 async function notifyOwner(text) {
@@ -630,9 +664,17 @@ async function handleInbound(phone, inbound) {
     }
   }
 
-  const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
+  const isFreshStart = session.stage === "start" || session.stage === "inicio";
+  const greetCooldownMs = 10 * 60 * 1000;
+  const inGreetCooldown =
+    session.greeted && session.greetedAt && Date.now() - session.greetedAt < greetCooldownMs;
 
   if (isFreshStart) {
+    if (inGreetCooldown) {
+      const reply = "Me responde 1 ou 2 pra eu te direcionar certinho.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
+    }
     await sendFirstContactButtons(phone, session, session.name || "");
     return;
   }
@@ -645,6 +687,10 @@ async function handleInbound(phone, inbound) {
     if (buttonId === "first_continue_budget") choice = 2;
 
     if (!choice) choice = parseChoice12(message);
+    if (!choice) {
+      if (/(orcamento|orçamento|fazer um orçamento|novo)/.test(lower)) choice = 1;
+      if (/(andamento|continuar|ja tenho|já tenho)/.test(lower)) choice = 2;
+    }
 
     if (choice === 1) {
       session.flowMode = "NEW_BUDGET";
@@ -663,7 +709,7 @@ async function handleInbound(phone, inbound) {
       return;
     }
 
-    if (!buttonId) {
+    if (!buttonId && !inGreetCooldown) {
       const cooldownMs = 15000;
       const canResend =
         !session.firstContactButtonsResent &&
@@ -674,7 +720,8 @@ async function handleInbound(phone, inbound) {
         return;
       }
     }
-    const retry = "Só pra eu te direcionar certinho: é orçamento novo (1) ou em andamento (2)?";
+    const retry =
+      "Só pra eu te direcionar certinho: é orçamento novo (1) ou em andamento (2)?";
     if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
     return;
   }
