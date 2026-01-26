@@ -56,6 +56,7 @@ function getSession(phone) {
       // first-contact gate
       askedFirstContact: false,
       firstContactResolved: false,
+      firstContactReprompted: false,
 
       // referência / info
       imageDataUrl: null,
@@ -64,6 +65,7 @@ function getSession(phone) {
       pendingDescChanges: "",
       adjustNotes: "",
       imageSummary: null,
+      refChangeReprompted: false,
       sizeLocation: null,
       sizeCm: null,
       bodyRegion: null,
@@ -127,6 +129,7 @@ function getSession(phone) {
         imageUrl: null,
         imageMime: "image/jpeg",
         messageType: "",
+        payload: null,
       },
     };
   }
@@ -169,6 +172,20 @@ function normalizeText(input) {
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function norm(s = "") {
+  return String(s)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasAny(t, arr) {
+  return arr.some((k) => t.includes(k));
 }
 
 function escapeRegExp(text) {
@@ -407,6 +424,69 @@ const WANTS_CHANGE_PHRASES = [
   "adiciona",
 ];
 
+const GREETINGS = [
+  "oi",
+  "ola",
+  "oie",
+  "opa",
+  "salve",
+  "e ai",
+  "eai",
+  "bom dia",
+  "boa tarde",
+  "boa noite",
+  "tudo bem",
+  "td bem",
+  "beleza",
+  "blz",
+  "tranquilo",
+  "suave",
+].map((value) => norm(value));
+
+const NEW_BUDGET_INTENT = [
+  "orcamento",
+  "orçamento",
+  "quero orcamento",
+  "quero fazer um orcamento",
+  "queria um orcamento",
+  "preciso de um orcamento",
+  "quanto fica",
+  "quanto custa",
+  "qual o valor",
+  "valor",
+  "preco",
+  "preço",
+  "investimento",
+  "me passa o valor",
+  "me passa valores",
+  "me passa o preco",
+  "me passa o preço",
+  "quero tatuar",
+  "quero fazer tattoo",
+  "quero fazer uma tattoo",
+  "quero fazer tatuagem",
+  "tatuagem",
+  "tattoo",
+].map((value) => norm(value));
+
+const CONTINUE_INTENT = [
+  "orcamento em andamento",
+  "orçamento em andamento",
+  "ja tenho orcamento",
+  "já tenho orçamento",
+  "continuar",
+  "dar continuidade",
+  "retomar",
+  "voltar",
+  "onde paramos",
+  "a gente ja conversou",
+  "a gente já conversou",
+  "sobre aquele orcamento",
+  "sobre aquele orçamento",
+  "da ultima vez",
+  "da última vez",
+].map((value) => norm(value));
+
 function textHasAnyPhrase(text, phrases, options = {}) {
   const t = normalizeText(text);
   if (!t) return false;
@@ -448,8 +528,47 @@ function wantsChange(text) {
   return textHasAnyPhrase(text, WANTS_CHANGE_PHRASES);
 }
 
+function wantsNewBudget(rawText) {
+  const t = norm(rawText);
+  if (hasAny(t, CONTINUE_INTENT)) return false;
+  return hasAny(t, NEW_BUDGET_INTENT);
+}
+
+function wantsContinueBudget(rawText) {
+  const t = norm(rawText);
+  return hasAny(t, CONTINUE_INTENT);
+}
+
+function isGenericGreeting(rawText) {
+  const t = norm(rawText);
+  const wordCount = t ? t.split(" ").length : 0;
+  const hasGreet = hasAny(t, GREETINGS);
+  return hasGreet && !wantsNewBudget(rawText) && !wantsContinueBudget(rawText) && wordCount <= 6;
+}
+
 function isNeutralOrQuestion(text) {
   return !isConfirmOk(text) && !wantsChange(text);
+}
+
+function getButtonReplyId(incomingPayload) {
+  return (
+    incomingPayload?.buttonId ||
+    incomingPayload?.buttonReply?.id ||
+    incomingPayload?.interactive?.button_reply?.id ||
+    incomingPayload?.message?.buttonsResponseMessage?.selectedButtonId ||
+    incomingPayload?.selectedId ||
+    null
+  );
+}
+
+function getIncomingText(incomingPayload) {
+  return (
+    incomingPayload?.text ||
+    incomingPayload?.body ||
+    incomingPayload?.message?.text ||
+    incomingPayload?.message?.conversation ||
+    null
+  );
 }
 
 function detectRegionOrSizeHint(text) {
@@ -541,6 +660,32 @@ async function zapiSendText(phone, message) {
 
   const body = await resp.text().catch(() => "");
   if (!resp.ok) throw new Error(`[ZAPI SEND FAILED] ${resp.status} ${body}`);
+  return body;
+}
+
+async function sendButtons(phone, text, buttons) {
+  const url = `${zapiBaseUrl()}/send-button`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "client-token": ENV.ZAPI_CLIENT_TOKEN,
+    },
+    body: JSON.stringify({
+      phone: String(phone).replace(/\D/g, ""),
+      message: String(text || ""),
+      buttonList: {
+        buttons: (buttons || []).map((btn) => ({
+          id: String(btn.id),
+          label: String(btn.title),
+        })),
+      },
+    }),
+  });
+
+  const body = await resp.text().catch(() => "");
+  if (!resp.ok) throw new Error(`[ZAPI BUTTON FAILED] ${resp.status} ${body}`);
   return body;
 }
 
@@ -673,15 +818,11 @@ function safeName(name) {
 }
 
 // -------------------- GREETINGS / CLOSINGS --------------------
-const GREETINGS = [
+const GREETING_MESSAGES = [
   (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\n` +
-    `Pra eu te atender do jeito certo, me diz uma coisa rapidinho:\n` +
-    `Você já tem um *orçamento em andamento* comigo e quer continuar, ou quer *começar um orçamento novo do zero*?`,
+    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.`,
   (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\n` +
-    `Só pra eu te direcionar certinho:\n` +
-    `Você já tem um *orçamento em andamento* comigo (pra continuar), ou é um *orçamento novo do zero*?`,
+    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading. Como posso te ajudar?`,
 ];
 
 const CLOSINGS = [
@@ -700,7 +841,7 @@ const CLOSINGS = [
 ];
 
 function chooseGreetingOnce(session, contactName) {
-  if (!session.greetVariant) session.greetVariant = pickOne(GREETINGS) || GREETINGS[0];
+  if (!session.greetVariant) session.greetVariant = pickOne(GREETING_MESSAGES) || GREETING_MESSAGES[0];
   const nm = safeName(contactName);
   return session.greetVariant(nm);
 }
@@ -1982,6 +2123,7 @@ async function handoffToManual(phone, session, motivo, mensagemCliente) {
 function enqueueInbound(session, inbound) {
   const p = session.pending;
   if (inbound.contactName) p.lastContactName = inbound.contactName;
+  if (inbound.raw) p.payload = inbound.raw;
 
   // guarda partes de texto
   const msg = String(inbound.message || "").trim();
@@ -2004,13 +2146,14 @@ function enqueueInbound(session, inbound) {
   p.timer = setTimeout(() => {
     p.timer = null;
     const mergedText = p.textParts.join("\n").trim();
-    const merged = {
+  const merged = {
       phone: inbound.phone,
       message: mergedText,
       imageUrl: p.imageUrl,
       imageMime: p.imageMime,
       contactName: p.lastContactName,
       messageType: p.messageType,
+      payload: p.payload,
     };
 
     // limpa buffer antes de processar (pra não duplicar)
@@ -2018,6 +2161,7 @@ function enqueueInbound(session, inbound) {
     p.imageUrl = null;
     p.imageMime = "image/jpeg";
     p.messageType = "";
+    p.payload = null;
 
     // processa (async)
     processMergedInbound(merged.phone, merged).catch((e) => {
@@ -2030,7 +2174,9 @@ function enqueueInbound(session, inbound) {
 async function processMergedInbound(phone, merged) {
   const session = getSession(phone);
 
-  const message = String(merged.message || "").trim();
+  const payload = merged.payload || null;
+  const incomingText = getIncomingText(payload);
+  const message = String(incomingText ?? merged.message ?? "").trim();
   const lower = message.toLowerCase();
   const imageUrl = merged.imageUrl || null;
   const imageMime = merged.imageMime || "image/jpeg";
@@ -2214,14 +2360,8 @@ async function processMergedInbound(phone, merged) {
 
   // -------------------- PRIMEIRO CONTATO (saudação + intents) --------------------
   const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
-  if (isFreshStart && hasGreeting(message)) {
-    const reply = chooseGreetingOnce(session, contactName);
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-    session.greeted = true;
-    session.askedFirstContact = true;
-
-    if (hasBudgetIntent(message)) {
+  if (isFreshStart) {
+    if (wantsNewBudget(message)) {
       session.firstContactResolved = true;
       session.stage = "aguardando_referencia";
       const budgetReply = msgOrcamentoNovo();
@@ -2230,57 +2370,68 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    session.stage = "aguardando_primeiro_contato";
-    return;
+    if (wantsContinueBudget(message)) {
+      await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
+      return;
+    }
+
+    const normalized = norm(message);
+    const isAmbiguous = !normalized || (!wantsNewBudget(message) && !wantsContinueBudget(message) && normalized.split(" ").length <= 2);
+    if (isGenericGreeting(message) || isAmbiguous) {
+      session.stage = "primeiro_contato_choice";
+      session.firstContactReprompted = false;
+      const pollText = "Só pra eu te direcionar certinho 👇\nÉ seu primeiro contato comigo?";
+      const buttons = [
+        { id: "pc_yes_new", title: "Sim — orçamento novo" },
+        { id: "pc_no_running", title: "Não — já tenho orçamento" },
+      ];
+      await sendButtons(phone, pollText, buttons);
+      return;
+    }
   }
 
   // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (session.stage === "inicio") {
-    const reply = chooseGreetingOnce(session, contactName);
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+  if (session.stage === "primeiro_contato_choice" || session.stage === "aguardando_primeiro_contato") {
+    const btn = getButtonReplyId(payload);
+    const t = norm(message);
+    const wantsNew =
+      btn === "pc_yes_new" ||
+      hasAny(t, ["1", "sim", "primeira vez", "primeiro contato", "do zero", "novo"].map((value) => norm(value)));
+    const wantsContinue =
+      btn === "pc_no_running" ||
+      hasAny(t, ["2", "nao", "não", "em andamento", "continuar", "ja tenho"].map((value) => norm(value)));
 
-    session.greeted = true;
-    session.askedFirstContact = true;
-    session.stage = "aguardando_primeiro_contato";
-    return;
-  }
-
-  if (session.stage === "aguardando_primeiro_contato") {
-    const ans = detectFirstContactAnswer(message);
-
-    // já tem orçamento em andamento -> avisa dono e para
-    if (ans === "ongoing") {
-      await notifyOwner(
-        [
-          "⚠️ CLIENTE DISSE QUE JÁ TEM ORÇAMENTO EM ANDAMENTO (quer continuar)",
-          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-          `• Mensagem: ${(message || "").slice(0, 400)}`,
-          "• Ação: você assume a conversa (bot parou).",
-        ].join("\n")
-      );
-
-      session.manualHandoff = true;
-      session.stage = "manual_pendente";
-      return; // não responde mais nada
-    }
-
-    // orçamento novo -> segue
-    if (ans === "first") {
+    if (wantsNew) {
       session.firstContactResolved = true;
       session.stage = "aguardando_referencia";
-
       const reply = msgOrcamentoNovo();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-      // follow-up se sumir
       scheduleFollowup30min(phone, session, "gate resolvido, aguardando referência");
       return;
     }
 
-    const retry =
-      "Só pra eu te direcionar certinho:\n" +
-      "Você quer *continuar um orçamento em andamento* comigo, ou quer *começar um orçamento novo do zero*?";
-    if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+    if (wantsContinue) {
+      await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
+      return;
+    }
+
+    if (!session.firstContactReprompted) {
+      session.firstContactReprompted = true;
+      const retry = "Me responde clicando em uma opção aí embaixo 🙂";
+      const buttons = [
+        { id: "pc_yes_new", title: "Sim — orçamento novo" },
+        { id: "pc_no_running", title: "Não — já tenho orçamento" },
+      ];
+      if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+      await sendButtons(phone, "Só pra eu te direcionar certinho 👇\nÉ seu primeiro contato comigo?", buttons);
+      return;
+    }
+
+    session.firstContactResolved = true;
+    session.stage = "aguardando_referencia";
+    const reply = msgOrcamentoNovo();
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    scheduleFollowup30min(phone, session, "fallback gate, seguindo orçamento novo");
     return;
   }
 
@@ -2388,11 +2539,16 @@ async function processMergedInbound(phone, merged) {
       session.doubtsResolved = false;
       session.sentQuote = false;
 
-      if (session.stage === "aguardando_confirmacao_descricao" || session.stage === "aguardando_ajustes_descricao") {
-        session.stage = "aguardando_ajustes_descricao";
+      if (
+        session.stage === "ref_change_choice" ||
+        session.stage === "coletar_ajustes_referencia" ||
+        session.stage === "aguardando_confirmacao_descricao" ||
+        session.stage === "aguardando_ajustes_descricao"
+      ) {
+        session.stage = "coletar_ajustes_referencia";
         await zapiSendText(
           phone,
-          "Recebi mais uma referência. Deseja ajustar algo com base nela ou posso seguir para o orçamento?"
+          "Recebi mais uma referência. Me diz o que você quer incorporar dela (ou o que quer remover) e já sigo pro orçamento."
         );
         return;
       }
@@ -2436,7 +2592,8 @@ async function processMergedInbound(phone, merged) {
       session.pendingDescChanges = "";
       session.adjustNotes = "";
       session.confirmationAskedOnce = false;
-      session.stage = "aguardando_confirmacao_descricao";
+      session.stage = "ref_change_choice";
+      session.refChangeReprompted = false;
 
       await zapiSendText(
         phone,
@@ -2444,6 +2601,10 @@ async function processMergedInbound(phone, merged) {
           "\n\n" +
           msgConfirmacaoDescricao()
       );
+      await sendButtons(phone, "Você quer alterar algo nessa referência?", [
+        { id: "ref_change_yes", title: "Sim — quero alterar" },
+        { id: "ref_change_no", title: "Não — tá tudo certo" },
+      ]);
 
       return;
     }
@@ -2481,93 +2642,115 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
-  if (session.stage === "aguardando_confirmacao_descricao") {
-    if (isConfirmOk(message)) {
-      session.descriptionConfirmed = true;
-      session.stage = "aguardando_resposta_orcamento";
-      session.confirmationAskedOnce = false;
+  if (session.stage === "ref_change_choice" || session.stage === "aguardando_confirmacao_descricao") {
+    const btn = getButtonReplyId(payload);
+    const t = norm(message);
+    const NO_NO_CHANGE = [
+      "nao",
+      "não",
+      "n",
+      "negativo",
+      "deixa assim",
+      "assim mesmo",
+      "do jeito que ta",
+      "do jeito que está",
+      "ta bom",
+      "tá bom",
+      "ok",
+      "certo",
+      "certinho",
+      "tudo certo",
+      "tudo ok",
+      "perfeito assim",
+      "pode seguir",
+      "segue",
+      "pode ir",
+      "manda bala",
+      "fechado",
+      "fechou",
+      "beleza",
+      "tranquilo",
+      "suave",
+      "nao quero mudar",
+      "não quero mudar",
+      "nao quero alterar",
+      "não quero alterar",
+      "nao quero remover",
+      "não quero remover",
+      "nao quero adicionar",
+      "não quero adicionar",
+      "sem ajustes",
+      "sem mudanca",
+      "sem mudança",
+    ].map((value) => norm(value));
+
+    const YES_WANTS_CHANGE = [
+      "sim",
+      "s",
+      "quero",
+      "quero sim",
+      "pode",
+      "pode sim",
+      "mudar",
+      "alterar",
+      "trocar",
+      "ajustar",
+      "corrigir",
+      "refazer",
+      "rever",
+      "adicionar",
+      "colocar",
+      "incluir",
+      "remover",
+      "tirar",
+      "apagar",
+      "sem isso",
+    ].map((value) => norm(value));
+
+    const choseNo = btn === "ref_change_no" || hasAny(t, NO_NO_CHANGE);
+    const choseYes = btn === "ref_change_yes" || hasAny(t, YES_WANTS_CHANGE);
+
+    if (choseNo) {
       session.adjustNotes = "";
+      session.stage = "aguardando_resposta_orcamento";
       await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
       await sendQuoteFlow(phone, session, message);
       return;
     }
 
-    if (wantsChange(message)) {
-      session.stage = "aguardando_ajustes_descricao";
-      session.confirmationAskedOnce = false;
+    if (choseYes) {
+      session.stage = "coletar_ajustes_referencia";
       await zapiSendText(
         phone,
-        "Perfeito. Me diga o que deseja adicionar/remover. Se quiser mandar outra referência também posso integrar."
+        "Fechou. Me diz certinho o que você quer alterar, adicionar ou remover nessa referência."
       );
       return;
     }
 
-    if (isNeutralOrQuestion(message)) {
-      if (!session.confirmationAskedOnce) {
-        session.confirmationAskedOnce = true;
-        await zapiSendText(
-          phone,
-          "Entendi. Você quer que eu mantenha exatamente como tá na referência ou quer ajustar algum detalhe?"
-        );
-        return;
-      }
-
-      session.confirmationAskedOnce = false;
-      session.adjustNotes = "cliente não respondeu claramente; segui adiante";
-      session.descriptionConfirmed = true;
-      session.stage = "aguardando_resposta_orcamento";
-      await zapiSendText(phone, "Beleza! Vou seguir pro orçamento então.");
-      await sendQuoteFlow(phone, session, message);
+    if (!session.refChangeReprompted) {
+      session.refChangeReprompted = true;
+      await zapiSendText(phone, "Só pra eu não errar: você quer alterar algo? Clica em Sim ou Não 🙂");
+      await sendButtons(phone, "Você quer alterar algo nessa referência?", [
+        { id: "ref_change_yes", title: "Sim — quero alterar" },
+        { id: "ref_change_no", title: "Não — tá tudo certo" },
+      ]);
       return;
     }
 
-    await zapiSendText(phone, msgConfirmacaoDescricao());
+    session.adjustNotes = "";
+    session.stage = "aguardando_resposta_orcamento";
+    await zapiSendText(phone, "Perfeito! Vou calcular o investimento para você.");
+    await sendQuoteFlow(phone, session, message);
     return;
   }
 
-  if (session.stage === "aguardando_ajustes_descricao") {
-    const lowerMsg = message.toLowerCase();
-    const finish = [
-      "sim",
-      "certo",
-      "certinho",
-      "tá certo",
-      "ta certo",
-      "tudo certo",
-      "ok",
-      "pode ser",
-      "isso",
-      "perfeito",
-      "beleza",
-      "tranquilo",
-      "fechado",
-      "isso mesmo",
-      "tá tranquilo",
-      "ta tranquilo",
-      "pode seguir",
-      "segue",
-    ];
-
-    if (finish.some((w) => lowerMsg.includes(w))) {
-      if (session.pendingDescChanges.trim()) {
-        session.descriptionText = [
-          session.descriptionText,
-          "",
-          "Ajustes solicitados:",
-          session.pendingDescChanges.trim(),
-        ]
-          .filter(Boolean)
-          .join("\n");
-        session.pendingDescChanges = "";
-      }
-      session.confirmationAskedOnce = false;
-      session.stage = "aguardando_confirmacao_descricao";
-      await zapiSendText(phone, `${session.descriptionText}\n\n${msgConfirmacaoDescricao()}`);
-      return;
+  if (session.stage === "coletar_ajustes_referencia" || session.stage === "aguardando_ajustes_descricao") {
+    if (message) {
+      session.adjustNotes = session.adjustNotes ? `${session.adjustNotes}\n${message}` : message;
+      await zapiSendText(phone, "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.");
+      session.stage = "aguardando_resposta_orcamento";
+      await sendQuoteFlow(phone, session, message);
     }
-
-    session.pendingDescChanges += `\n${message}`;
-    await zapiSendText(phone, "Fechado, já anotei. Quer ajustar mais algo ou posso seguir para o orçamento?");
     return;
   }
 
@@ -2583,13 +2766,18 @@ async function processMergedInbound(phone, merged) {
         }
 
         if (session.descriptionText) {
-          session.stage = "aguardando_confirmacao_descricao";
+          session.stage = "ref_change_choice";
+          session.refChangeReprompted = false;
           await zapiSendText(
             phone,
             session.descriptionText +
               "\n\n" +
               msgConfirmacaoDescricao()
           );
+          await sendButtons(phone, "Você quer alterar algo nessa referência?", [
+            { id: "ref_change_yes", title: "Sim — quero alterar" },
+            { id: "ref_change_no", title: "Não — tá tudo certo" },
+          ]);
           return;
         }
 
@@ -2839,7 +3027,14 @@ async function processMergedInbound(phone, merged) {
 
   // -------------------- FALLBACK --------------------
   // se chegou aqui, tenta guiar conforme o que falta
-  if (!session.imageDataUrl && session.stage !== "inicio" && session.stage !== "aguardando_primeiro_contato") {
+  if (
+    !session.imageDataUrl &&
+    session.stage !== "inicio" &&
+    session.stage !== "aguardando_primeiro_contato" &&
+    session.stage !== "primeiro_contato_choice" &&
+    session.stage !== "ref_change_choice" &&
+    session.stage !== "coletar_ajustes_referencia"
+  ) {
     const reply =
       "Pra eu te atender certinho, me manda uma *referência em imagem* e me diz *onde no corpo + tamanho aproximado*.";
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
