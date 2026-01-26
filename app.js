@@ -498,6 +498,8 @@ function newSession() {
     greeted: false,
     greetedAt: null,
     flowMode: null,
+    awaitingFirstContact: false,
+    firstContactChoiceAt: null,
 
     // data
     name: "",
@@ -549,6 +551,7 @@ async function sendFirstContactButtons(phone, session, contactName) {
   session.stage = "await_first_contact_buttons";
   session.greeted = true;
   session.greetedAt = Date.now();
+  session.awaitingFirstContact = true;
 }
 
 async function askChangeButtons(phone, session) {
@@ -576,8 +579,14 @@ async function askScheduleButtons(phone, session) {
 // --------- decisões por texto do botão (quando não vem buttonId) ----------
 function decideFirstContactFromText(message) {
   const t = norm(message);
-  if (t.includes("orcamento novo") || t.includes("orçamento novo") || t === "1") return 1;
-  if (t.includes("ja tenho") || t.includes("já tenho") || t.includes("em andamento") || t === "2") return 2;
+  if (t.includes("orcamento novo") || t === "1") return 1;
+  if (
+    t.includes("ja tenho orcamento") ||
+    t.includes("tenho orcamento") ||
+    t.includes("orcamento em andamento") ||
+    t === "2"
+  )
+    return 2;
   return null;
 }
 
@@ -674,6 +683,8 @@ async function handleInbound(phone, inbound) {
 
     if (choice === 1) {
       session.flowMode = "NEW_BUDGET";
+      session.awaitingFirstContact = false;
+      session.firstContactChoiceAt = Date.now();
       session.stage = "collect_reference";
       const reply = msgAskNewBudgetBasics();
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
@@ -682,11 +693,14 @@ async function handleInbound(phone, inbound) {
 
     if (choice === 2) {
       session.flowMode = "IN_PROGRESS";
+      session.awaitingFirstContact = false;
+      session.firstContactChoiceAt = Date.now();
       session.stage = "manual_continue";
       await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
       return;
     }
 
+    if (session.firstContactChoiceAt && Date.now() - session.firstContactChoiceAt < 30000) return;
     const retry = "Só pra eu te direcionar certinho: *Orçamento novo* ou *Já tenho orçamento*?";
     if (!antiRepeat(session, retry)) await sendText(phone, retry);
     return;
