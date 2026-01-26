@@ -79,36 +79,20 @@ async function zapiSendText(phone, message) {
   return zapiFetch("/send-text", { phone, message });
 }
 
-// "Send Button" (botões). Implementação depende do endpoint suportado na sua Z-API.
-// Tentamos 2 formatos comuns. Se falhar, retornamos false e caímos no fallback texto.
-async function zapiSendButtons(phone, text, buttons) {
-  // buttons: [{id:"ID", title:"Texto"}]
-  const try1 = async () => {
-    // formato A (muito comum)
-    return zapiFetch("/send-buttons", {
+async function sendButtonsZapi(phone, text, buttons) {
+  try {
+    const resp = await zapiFetch("/send-buttons", {
       phone,
       message: text,
-      buttons: buttons.map((b) => ({ id: b.id, text: b.title })),
+      buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
     });
-  };
-  const try2 = async () => {
-    // formato B (alternativo)
-    return zapiFetch("/send-button-list", {
-      phone,
-      text,
-      buttons: buttons.map((b) => ({ id: b.id, label: b.title })),
-    });
-  };
-
-  try {
-    await try1();
+    const respPreview = typeof resp === "string" ? resp.slice(0, 240) : JSON.stringify(resp).slice(0, 240);
+    console.log("[ZAPI BUTTONS] ok", { phone, respPreview });
     return true;
-  } catch {}
-  try {
-    await try2();
-    return true;
-  } catch {}
-  return false;
+  } catch (err) {
+    console.error("[ZAPI BUTTONS] fail", err?.message || err);
+    return false;
+  }
 }
 
 async function notifyOwner(text) {
@@ -118,7 +102,24 @@ async function notifyOwner(text) {
   } catch {}
 }
 
+async function handoffToManual(phone, session, reason, lastMessage) {
+  const reply = msgAskContinueBudget();
+  if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+  await notifyOwner(`📌 Handoff manual (${reason}): ${phone} | msg: ${lastMessage || "-"}`);
+}
+
 // -------------------- Normalização inbound --------------------
+function getIncomingText(payload) {
+  if (!payload) return "";
+  if (typeof payload === "string") return payload;
+  if (typeof payload === "object") {
+    if (payload.buttonId) return payload.buttonTitle || payload.buttonId;
+    const t = payload.text || payload?.message?.text || payload.msg || "";
+    return typeof t === "string" ? t : JSON.stringify(t);
+  }
+  return String(payload || "");
+}
+
 function parseZapiInbound(body) {
   const phone =
     body?.phone ||
@@ -131,7 +132,7 @@ function parseZapiInbound(body) {
     body?.data?.from ||
     null;
 
-  const message =
+  const rawMessage =
     body?.message ||
     body?.text?.message ||
     body?.text ||
@@ -169,15 +170,52 @@ function parseZapiInbound(body) {
     body?.data?.contact?.name ||
     "";
 
-  return {
+  const bId =
+    body?.buttonId ||
+    body?.callback?.buttonId ||
+    body?.data?.buttonId ||
+    body?.message?.button?.id ||
+    body?.message?.interactive?.button_reply?.id ||
+    body?.message?.button_reply?.id ||
+    body?.message?.buttonsResponseMessage?.selectedButtonId ||
+    body?.messages?.[0]?.button?.payload ||
+    null;
+
+  const bTitle =
+    body?.buttonTitle ||
+    body?.callback?.buttonTitle ||
+    body?.data?.buttonTitle ||
+    body?.message?.button?.title ||
+    body?.message?.interactive?.button_reply?.title ||
+    body?.message?.button_reply?.title ||
+    body?.message?.buttonsResponseMessage?.selectedDisplayText ||
+    null;
+
+  const inbound = {
     phone: phone ? String(phone) : null,
-    message: String(message || "").trim(),
+    message: getIncomingText(rawMessage).trim(),
     imageUrl: imageUrl ? String(imageUrl) : null,
     imageMime: String(imageMime || "image/jpeg"),
     fromMe,
     contactName: String(contactName || "").trim(),
+    buttonId: null,
+    buttonTitle: null,
+    messageType: "",
     raw: body,
   };
+
+  if (bId) {
+    inbound.buttonId = String(bId);
+    inbound.buttonTitle = bTitle ? String(bTitle) : "";
+    inbound.messageType = "button";
+    inbound.message = inbound.buttonTitle || inbound.buttonId;
+  }
+
+  if (!inbound.messageType) {
+    inbound.messageType = inbound.imageUrl ? "image" : "text";
+  }
+
+  return inbound;
 }
 
 // -------------------- Util --------------------
@@ -294,9 +332,10 @@ function calcPriceFromSize(sizeCm, bodyPart, complexity = "medio") {
 }
 
 // -------------------- Mensagens --------------------
-function msgGreeting(name) {
+function msgSaudacaoPrimeiroContato(name) {
   const nm = safeName(name);
-  return `Olá${nm ? `, ${nm}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.`;
+  const greet = nm ? `Oi, ${nm}!` : "Oi!";
+  return `${greet} Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\nPra eu te direcionar certinho, escolhe uma opção abaixo:`;
 }
 
 function msgAddress() {
@@ -319,10 +358,6 @@ function msgSoBlackGrey() {
     "• Não faço tatuagem totalmente colorida.\n\n" +
     "Se você curtir em preto e cinza, eu sigo e deixo bem forte."
   );
-}
-
-function msgFirstContactQuestion() {
-  return "É seu primeiro contato comigo?";
 }
 
 function msgAskNewBudgetBasics() {
@@ -425,6 +460,10 @@ function newSession() {
   return {
     stage: "start",
     greeted: false,
+    greetedAt: null,
+    flowMode: null,
+    lastFirstContactButtonsAt: null,
+    firstContactButtonsResent: false,
 
     // data
     name: "",
@@ -468,18 +507,24 @@ function antiRepeat(session, text) {
 }
 
 // -------------------- Buttons helpers --------------------
-async function askFirstContactButtons(phone, session) {
-  const text = msgFirstContactQuestion();
+async function sendFirstContactButtons(phone, session, contactName) {
+  const text = msgSaudacaoPrimeiroContato(contactName);
   const buttons = [
-    { id: "FIRST_NEW", title: "Sim — orçamento novo" },
-    { id: "FIRST_CONTINUE", title: "Não — já tenho em andamento" },
+    { id: "first_new_budget", title: "Orçamento novo (do zero)" },
+    { id: "first_continue_budget", title: "Continuar orçamento em andamento" },
   ];
-  const sent = await zapiSendButtons(phone, text, buttons);
+  const sent = await sendButtonsZapi(phone, text, buttons);
   if (!sent) {
-    await zapiSendText(phone, `${text}\n1) Sim — orçamento novo\n2) Não — já tenho em andamento\nResponde 1 ou 2.`);
+    await zapiSendText(
+      phone,
+      `${text}\n1) Orçamento novo (do zero)\n2) Continuar orçamento em andamento\nResponde 1 ou 2.`
+    );
   }
+  session.stage = "await_first_contact_buttons";
   session.awaitingFirstContact = true;
-  session.stage = "await_first_contact";
+  session.greeted = true;
+  session.greetedAt = Date.now();
+  session.lastFirstContactButtonsAt = Date.now();
 }
 
 async function askChangeButtons(phone, session) {
@@ -488,7 +533,7 @@ async function askChangeButtons(phone, session) {
     { id: "CHG_YES", title: "Sim" },
     { id: "CHG_NO", title: "Não" },
   ];
-  const sent = await zapiSendButtons(phone, text, buttons);
+  const sent = await sendButtonsZapi(phone, text, buttons);
   if (!sent) {
     await zapiSendText(phone, `${text}\n1) Sim\n2) Não\nResponde 1 ou 2.`);
   }
@@ -502,28 +547,12 @@ async function askScheduleButtons(phone, session) {
     { id: "SCHED_YES", title: "Sim" },
     { id: "SCHED_NO", title: "Não" },
   ];
-  const sent = await zapiSendButtons(phone, text, buttons);
+  const sent = await sendButtonsZapi(phone, text, buttons);
   if (!sent) {
     await zapiSendText(phone, `${text}\n1) Sim\n2) Não\nResponde 1 ou 2.`);
   }
   session.awaitingScheduleConfirm = true;
   session.stage = "await_schedule_confirm";
-}
-
-// Detect button selection in inbound (varia conforme Z-API)
-function extractButtonId(raw) {
-  // tentativas comuns
-  return (
-    raw?.buttonId ||
-    raw?.data?.buttonId ||
-    raw?.selectedButtonId ||
-    raw?.data?.selectedButtonId ||
-    raw?.interactive?.button_reply?.id ||
-    raw?.data?.interactive?.button_reply?.id ||
-    raw?.listReply?.id ||
-    raw?.data?.listReply?.id ||
-    ""
-  );
 }
 
 function parseChoice12(text) {
@@ -541,11 +570,19 @@ async function handleInbound(phone, inbound) {
 
   const message = inbound.message || "";
   const lower = norm(message);
-  const buttonId = extractButtonId(inbound.raw);
+  const buttonId = inbound.buttonId || null;
   const hasImage = Boolean(inbound.imageUrl);
   const name = safeName(inbound.contactName);
 
   if (name && !session.name) session.name = name;
+
+  console.log("[MERGED IN]", {
+    phone,
+    stage: session.stage,
+    buttonId,
+    hasImageUrl: !!inbound.imageUrl,
+    preview: (message || "").slice(0, 120),
+  });
 
   // comandos
   if (/^reset$|^reiniciar$|^comecar novamente$|^começar novamente$/.test(lower)) {
@@ -593,27 +630,24 @@ async function handleInbound(phone, inbound) {
     }
   }
 
-  // 1) start -> greet + first contact buttons
-  if (session.stage === "start") {
-    const greet = msgGreeting(session.name || "");
-    if (!session.greeted) {
-      if (!antiRepeat(session, greet)) await zapiSendText(phone, greet);
-      session.greeted = true;
-    }
-    await askFirstContactButtons(phone, session);
+  const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
+
+  if (isFreshStart) {
+    await sendFirstContactButtons(phone, session, session.name || "");
     return;
   }
 
   // 2) awaiting first contact
-  if (session.stage === "await_first_contact") {
+  if (session.stage === "await_first_contact_buttons") {
     let choice = null;
 
-    if (buttonId === "FIRST_NEW") choice = 1;
-    if (buttonId === "FIRST_CONTINUE") choice = 2;
+    if (buttonId === "first_new_budget") choice = 1;
+    if (buttonId === "first_continue_budget") choice = 2;
 
     if (!choice) choice = parseChoice12(message);
 
     if (choice === 1) {
+      session.flowMode = "NEW_BUDGET";
       session.awaitingFirstContact = false;
       session.stage = "collect_reference";
       const reply = msgAskNewBudgetBasics();
@@ -622,14 +656,24 @@ async function handleInbound(phone, inbound) {
     }
 
     if (choice === 2) {
+      session.flowMode = "IN_PROGRESS";
       session.awaitingFirstContact = false;
       session.stage = "manual_continue";
-      const reply = msgAskContinueBudget();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      await notifyOwner(`📌 Cliente com orçamento em andamento: ${phone}`);
+      await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
       return;
     }
 
+    if (!buttonId) {
+      const cooldownMs = 15000;
+      const canResend =
+        !session.firstContactButtonsResent &&
+        (!session.lastFirstContactButtonsAt || Date.now() - session.lastFirstContactButtonsAt > cooldownMs);
+      if (canResend) {
+        session.firstContactButtonsResent = true;
+        await sendFirstContactButtons(phone, session, session.name || "");
+        return;
+      }
+    }
     const retry = "Só pra eu te direcionar certinho: é orçamento novo (1) ou em andamento (2)?";
     if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
     return;
