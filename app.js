@@ -58,6 +58,7 @@ function getSession(phone) {
       firstContactRetry: false,
       firstContactResolved: false,
       flowMode: null,
+      contactName: null,
 
       // referência / info
       imageDataUrl: null,
@@ -77,6 +78,7 @@ function getSession(phone) {
       // ordem / flags
       greeted: false,
       sentGreeting: false,
+      greetedOnce: false,
       greetVariant: null,
       closingVariant: null,
 
@@ -792,8 +794,8 @@ function isNeutralOrQuestion(text) {
 
 const BTN = {
   // Gate 1: primeiro contato
-  FIRST_NEW: "first_new",
-  FIRST_ONGOING: "first_ongoing",
+  FIRST_NEW: "FC_NEW_YES",
+  FIRST_ONGOING: "FC_CONT_NO",
 
   // Gate 2: alterar referência?
   CHG_YES: "change_yes",
@@ -822,10 +824,32 @@ function getInteractiveReplyId(incomingPayload) {
   );
 }
 
-function getIncomingText(incomingPayload) {
-  const buttonId = getInteractiveReplyId(incomingPayload);
-  if (buttonId) return buttonId;
+function getButtonId(payload) {
+  return (
+    payload?.buttonId ||
+    payload?.selectedButtonId ||
+    payload?.callback?.buttonId ||
+    payload?.message?.buttonResponse?.id ||
+    payload?.message?.buttonReply?.id ||
+    payload?.selectedId ||
+    payload?.optionId ||
+    payload?.buttonReply?.id ||
+    payload?.interactive?.button_reply?.id ||
+    payload?.interactive?.list_reply?.id ||
+    payload?.listReply?.id ||
+    payload?.payload?.buttonId ||
+    payload?.data?.selectedId ||
+    payload?.data?.selectedButtonId ||
+    payload?.data?.buttonId ||
+    payload?.data?.optionId ||
+    payload?.message?.buttonId ||
+    payload?.message?.interactive?.list_reply?.id ||
+    payload?.message?.interactive?.button_reply?.id ||
+    null
+  );
+}
 
+function getIncomingText(incomingPayload) {
   return (
     incomingPayload?.text ||
     incomingPayload?.body ||
@@ -853,7 +877,7 @@ function resolveFirstContactChoice({ buttonId, message }) {
   const wantsNew =
     isNumericChoice(t, 1) ||
     isYes(t) ||
-    /novo|orcamento novo|do zero/i.test(t);
+    /novo|or[cç]amento novo|do zero/i.test(t);
   const wantsContinue =
     isNumericChoice(t, 2) ||
     isNo(t) ||
@@ -946,7 +970,7 @@ async function zapiSendText(phone, message) {
   });
 }
 
-async function sendButtonsZapi(phone, text, buttons) {
+async function zapiSendButtons(phone, text, buttons) {
   try {
     await zapiPost("/send-button", {
       phone: String(phone).replace(/\D/g, ""),
@@ -960,11 +984,6 @@ async function sendButtonsZapi(phone, text, buttons) {
     });
     return true;
   } catch (error) {
-    const list = (buttons || [])
-      .map((btn, idx) => `${idx + 1}) ${btn.label ?? btn.title ?? ""}`)
-      .join("\n");
-    const fallback = list ? `${text}\n\n${list}` : text;
-    await zapiSendText(phone, fallback);
     return false;
   }
 }
@@ -985,20 +1004,52 @@ async function zapiPost(path, body) {
   return respBody;
 }
 
+function buildGreeting(session, contactName) {
+  const name = contactName || session.contactName || "";
+  const cleaned = safeName(name);
+  if (cleaned) {
+    return `Oi, ${cleaned}! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.`;
+  }
+  return "Oi! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.";
+}
+
 async function sendFirstContactButtons(phone, session, options = {}) {
   const interactiveKey = "first_contact_buttons";
   if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
+  if (
+    !options.force &&
+    session.stage === "await_first_contact_buttons" &&
+    Date.now() - (session.lastClientMsgAt || 0) < 8_000
+  ) {
+    return false;
+  }
 
   session.stage = "await_first_contact_buttons";
   session.lastInteractiveKey = interactiveKey;
   session.lastInteractiveAt = Date.now();
   session.askedFirstContact = true;
-  session.firstContactRetry = false;
+  if (!options.force) session.firstContactRetry = false;
 
-  return sendButtonsZapi(phone, "Pra eu te direcionar certinho:", [
-    { id: BTN.FIRST_NEW, label: "Orçamento novo" },
-    { id: BTN.FIRST_ONGOING, label: "Já tenho orçamento" },
+  const text =
+    "Só pra eu te direcionar certinho:\n" +
+    "Você quer começar um *orçamento novo do zero* (Sim) ou *continuar um orçamento em andamento* (Não)?";
+  if (antiRepeat(session, text)) return false;
+  const ok = await zapiSendButtons(phone, text, [
+    { id: BTN.FIRST_NEW, title: "Sim — orçamento novo" },
+    { id: BTN.FIRST_ONGOING, title: "Não — continuar orçamento" },
   ]);
+
+  if (!ok) {
+    await zapiSendText(
+      phone,
+      text +
+        "\n\nResponde:\n" +
+        "1) Sim — orçamento novo\n" +
+        "2) Não — continuar orçamento"
+    );
+  }
+
+  return ok;
 }
 
 async function sendChangeReferenceButtons(phone, session, options = {}) {
@@ -1010,10 +1061,14 @@ async function sendChangeReferenceButtons(phone, session, options = {}) {
   session.lastInteractiveAt = Date.now();
   session.confirmationAskedOnce = false;
 
-  return sendButtonsZapi(phone, "Você quer alterar algo na referência?", [
-    { id: BTN.CHG_YES, label: "Sim" },
-    { id: BTN.CHG_NO, label: "Não" },
+  const ok = await zapiSendButtons(phone, "Você quer alterar algo na referência?", [
+    { id: BTN.CHG_YES, title: "Sim" },
+    { id: BTN.CHG_NO, title: "Não" },
   ]);
+  if (!ok) {
+    await zapiSendText(phone, "Você quer alterar algo na referência?\n\nResponde:\n1) Sim\n2) Não");
+  }
+  return ok;
 }
 
 // -------------------- OWNER notify --------------------
@@ -2539,7 +2594,7 @@ async function processMergedInbound(phone, merged) {
   const session = getSession(phone);
 
   const payload = merged.payload || null;
-  const btnId = getInteractiveReplyId(payload);
+  const btnId = getButtonId(payload);
   const rawText = getIncomingText(payload);
   const message = String(btnId || rawText || merged.message || "").trim();
   const effectiveMessage = message || "";
@@ -2547,6 +2602,10 @@ async function processMergedInbound(phone, merged) {
   const imageUrl = merged.imageUrl || null;
   const imageMime = merged.imageMime || "image/jpeg";
   const contactName = merged.contactName || null;
+
+  if (contactName && !session.contactName) {
+    session.contactName = contactName;
+  }
 
   // marca última msg do cliente
   session.lastClientMsgAt = Date.now();
@@ -2556,7 +2615,7 @@ async function processMergedInbound(phone, merged) {
     stage: session.stage,
     hasImageUrl: !!imageUrl,
     buttonId: btnId || null,
-    messagePreview: (message || "").slice(0, 160),
+    messagePreview: (message || "").slice(0, 120),
   });
 
   // ✅ se já entrou em handoff manual
@@ -2599,10 +2658,10 @@ async function processMergedInbound(phone, merged) {
   ) {
     resetSession(phone);
     const s2 = getSession(phone);
-    const greet = chooseGreetingOnce(s2, contactName);
-    if (!s2.sentGreeting) {
-      await zapiSendText(phone, greet);
-      s2.sentGreeting = true;
+    const greet = buildGreeting(s2, contactName);
+    if (!s2.greetedOnce) {
+      if (!antiRepeat(s2, greet)) await zapiSendText(phone, greet);
+      s2.greetedOnce = true;
     }
     await sendFirstContactButtons(phone, s2);
     return;
@@ -2745,10 +2804,10 @@ async function processMergedInbound(phone, merged) {
   // -------------------- PRIMEIRO CONTATO (saudação + intents) --------------------
   const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
   if (isFreshStart) {
-    const greet = chooseGreetingOnce(session, contactName);
-    if (!session.sentGreeting) {
-      await zapiSendText(phone, greet);
-      session.sentGreeting = true;
+    const greet = buildGreeting(session, contactName);
+    if (!session.greetedOnce) {
+      if (!antiRepeat(session, greet)) await zapiSendText(phone, greet);
+      session.greetedOnce = true;
     }
     session.greeted = true;
     await sendFirstContactButtons(phone, session);
@@ -2783,13 +2842,8 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    session.flowMode = "NEW_BUDGET";
-    session.lastInteractiveKey = null;
-    session.firstContactResolved = true;
-    session.stage = "aguardando_referencia";
-    const reply = msgOrcamentoNovo();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    scheduleFollowup30min(phone, session, "fallback gate primeiro contato");
+    await zapiSendText(phone, "Não consegui entender. Responde só com *1* ou *2* 🙏");
+    await sendFirstContactButtons(phone, session, { force: true });
     return;
   }
 
