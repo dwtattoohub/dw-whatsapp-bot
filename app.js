@@ -81,35 +81,49 @@ async function zapiSendText(phone, message) {
   return zapiFetch("/send-text", { phone, message });
 }
 
-async function sendButtons(phone, text, buttons, label = "menu") {
+async function sendButtonListZapi(phone, text, buttons) {
+  return zapiFetch("/send-button-list", {
+    phone,
+    message: text,
+    buttonList: {
+      buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
+    },
+  });
+}
+
+async function sendButtonsZapi(phone, text, buttons) {
   await humanDelay();
 
   try {
-    const resp = await zapiFetch("/send-button-list", {
+    const resp = await sendButtonListZapi(phone, text, buttons);
+    console.log("[ZAPI BUTTONS] success on /send-button-list", {
       phone,
-      message: text,
-      buttonList: {
-        title: label,
-        buttons: buttons.map((button) => ({ id: button.id, label: button.title })),
-      },
+      respPreview: JSON.stringify(resp).slice(0, 240),
     });
-    console.log("[SEND BUTTON LIST OK]", resp);
     return true;
-  } catch (err) {
-    console.log("[SEND BUTTON LIST FAIL]", err?.message || err);
+  } catch (e1) {
+    console.error("[ZAPI BUTTONS] fail on /send-button-list", e1?.message || e1);
+    try {
+      const resp2 = await zapiFetch("/send-buttons", {
+        phone,
+        message: text,
+        buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
+      });
+      console.log("[ZAPI BUTTONS] success on /send-buttons", {
+        phone,
+        respPreview: JSON.stringify(resp2).slice(0, 240),
+      });
+      return true;
+    } catch (e2) {
+      console.error("[ZAPI BUTTONS] fail on /send-buttons", e2?.message || e2);
+      return false;
+    }
   }
+}
 
-  try {
-    const resp = await zapiFetch("/send-buttons", {
-      phone,
-      message: text,
-      buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
-    });
-    console.log("[SEND BUTTONS OK]", resp);
-    return true;
-  } catch (err) {
-    console.log("[SEND BUTTONS FAIL]", err?.message || err);
-  }
+async function sendButtons(phone, text, buttons) {
+  const ok = await sendButtonsZapi(phone, text, buttons);
+  if (ok) return true;
 
   if (buttons.length >= 2) {
     await zapiSendText(
@@ -201,6 +215,9 @@ function parseZapiInbound(body) {
     body?.buttonId ||
     body?.callback?.buttonId ||
     body?.data?.buttonId ||
+    body?.data?.idDoBotao ||
+    body?.data?.botao?.id ||
+    body?.data?.mensagem?.botao?.id ||
     body?.message?.button?.id ||
     body?.message?.interactive?.button_reply?.id ||
     body?.message?.interactive?.list_reply?.id ||
@@ -215,12 +232,15 @@ function parseZapiInbound(body) {
     body?.buttonTitle ||
     body?.callback?.buttonTitle ||
     body?.data?.buttonTitle ||
+    body?.data?.botao?.title ||
+    body?.data?.mensagem?.botao?.title ||
     body?.message?.button?.title ||
     body?.message?.interactive?.button_reply?.title ||
     body?.message?.interactive?.list_reply?.title ||
     body?.message?.button_reply?.title ||
     body?.message?.buttonsResponseMessage?.selectedDisplayText ||
     body?.message?.listResponseMessage?.title ||
+    body?.message?.listResponseMessage?.description ||
     body?.listReply?.title ||
     body?.data?.listReply?.title ||
     null;
@@ -243,6 +263,10 @@ function parseZapiInbound(body) {
     inbound.buttonTitle = bTitle ? String(bTitle) : "";
     inbound.messageType = "button";
     inbound.message = inbound.buttonTitle || inbound.buttonId;
+  }
+
+  if (!bId && bTitle && !inbound.message) {
+    inbound.message = String(bTitle);
   }
 
   if (!inbound.messageType) {
@@ -582,6 +606,15 @@ function parseChoice12(text) {
   return null;
 }
 
+function detectFirstContactChoiceFromText(message) {
+  const t = norm(message);
+  if (t.includes("orcamento novo")) return 1;
+  if (t.includes("ja tenho orcamento") || t.includes("em andamento") || t.includes("continuar")) {
+    return 2;
+  }
+  return null;
+}
+
 // -------------------- Core flow --------------------
 async function handleInbound(phone, inbound) {
   const session = getSession(phone);
@@ -665,16 +698,23 @@ async function handleInbound(phone, inbound) {
 
   // 2) awaiting first contact
   if (session.stage === "await_first_contact_buttons") {
+    const raw = inbound.raw || {};
+    console.log("[FIRST CONTACT CALLBACK]", {
+      keys: Object.keys(raw || {}),
+      dataKeys: Object.keys(raw?.data || {}),
+      messageKeys: Object.keys(raw?.message || {}),
+      buttonId: inbound.buttonId,
+      buttonTitle: inbound.buttonTitle,
+      message: inbound.message,
+    });
+
     let choice = null;
 
     if (buttonId === "first_new_budget") choice = 1;
     if (buttonId === "first_continue_budget") choice = 2;
 
     if (!choice) choice = parseChoice12(message);
-    if (!choice) {
-      if (/(orcamento|orçamento|fazer um orçamento|novo)/.test(lower)) choice = 1;
-      if (/(andamento|continuar|ja tenho|já tenho)/.test(lower)) choice = 2;
-    }
+    if (!choice) choice = detectFirstContactChoiceFromText(message);
 
     if (choice === 1) {
       session.flowMode = "NEW_BUDGET";
