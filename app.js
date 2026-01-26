@@ -82,42 +82,104 @@ async function zapiSendText(phone, message) {
 }
 
 async function sendButtonListZapi(phone, text, buttons) {
-  return zapiFetch("/send-button-list", {
-    phone,
-    message: text,
-    buttonList: {
+  const tries = [];
+  const preferredMode = (process.env.ZAPI_BUTTONLIST_MODE || "").toUpperCase();
+
+  // A
+  tries.push({
+    label: "A",
+    path: "/send-button-list",
+    payload: {
+      phone,
+      message: text,
+      buttonList: {
+        title: "Escolha uma opção",
+        buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
+      },
+    },
+  });
+
+  // B (LIST style)
+  tries.push({
+    label: "B",
+    path: "/send-button-list",
+    payload: {
+      phone,
+      message: text,
+      list: {
+        title: "Escolha uma opção",
+        buttonText: "Abrir opções",
+        sections: [
+          {
+            title: "Atendimento",
+            rows: buttons.map((button) => ({
+              rowId: button.id,
+              title: button.title,
+              description: "",
+            })),
+          },
+        ],
+      },
+    },
+  });
+
+  // C
+  tries.push({
+    label: "C",
+    path: "/send-button-list",
+    payload: {
+      phone,
+      message: text,
+      title: "Escolha uma opção",
       buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
     },
   });
+
+  const orderedTries = preferredMode
+    ? [
+        ...tries.filter((t) => t.label === preferredMode),
+        ...tries.filter((t) => t.label !== preferredMode),
+      ]
+    : tries;
+
+  let lastErr = null;
+  for (const t of orderedTries) {
+    try {
+      const resp = await zapiFetch(t.path, t.payload);
+      console.log(`[ZAPI BUTTON-LIST] success mode ${t.label}`, {
+        phone,
+        respPreview: JSON.stringify(resp).slice(0, 240),
+      });
+      process.env.ZAPI_BUTTONLIST_MODE = t.label;
+      return { ok: true, mode: t.label, resp };
+    } catch (e) {
+      lastErr = e;
+      console.error(`[ZAPI BUTTON-LIST] fail mode ${t.label}`, e?.message || e);
+    }
+  }
+  return { ok: false, err: lastErr };
 }
 
 async function sendButtonsZapi(phone, text, buttons) {
   await humanDelay();
 
+  const result = await sendButtonListZapi(phone, text, buttons);
+  if (result.ok) return true;
+
   try {
-    const resp = await sendButtonListZapi(phone, text, buttons);
-    console.log("[ZAPI BUTTONS] success on /send-button-list", {
+    const resp2 = await zapiFetch("/send-buttons", {
       phone,
-      respPreview: JSON.stringify(resp).slice(0, 240),
+      message: text,
+      buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
+    });
+    console.log("[ZAPI BUTTONS] success on /send-buttons", {
+      phone,
+      respPreview: JSON.stringify(resp2).slice(0, 240),
     });
     return true;
-  } catch (e1) {
-    console.error("[ZAPI BUTTONS] fail on /send-button-list", e1?.message || e1);
-    try {
-      const resp2 = await zapiFetch("/send-buttons", {
-        phone,
-        message: text,
-        buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
-      });
-      console.log("[ZAPI BUTTONS] success on /send-buttons", {
-        phone,
-        respPreview: JSON.stringify(resp2).slice(0, 240),
-      });
-      return true;
-    } catch (e2) {
-      console.error("[ZAPI BUTTONS] fail on /send-buttons", e2?.message || e2);
-      return false;
-    }
+  } catch (e2) {
+    console.error("[ZAPI BUTTONS] fail on /send-buttons", e2?.message || e2);
+    return false;
   }
 }
 
