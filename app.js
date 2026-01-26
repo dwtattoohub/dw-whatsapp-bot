@@ -833,6 +833,16 @@ function isNeutralOrQuestion(text) {
   return !isConfirmOk(text) && !wantsChange(text);
 }
 
+const BTN = {
+  // Gate 1: primeiro contato
+  FIRST_NEW: "first:new_budget",
+  FIRST_ONGOING: "first:in_progress",
+
+  // Gate 2: alterar referência?
+  CHG_YES: "change:yes",
+  CHG_NO: "change:no",
+};
+
 function getInteractiveReplyId(incomingPayload) {
   return (
     incomingPayload?.buttonId ||
@@ -847,6 +857,11 @@ function getInteractiveReplyId(incomingPayload) {
     incomingPayload?.message?.interactive?.button_reply?.id ||
     null
   );
+}
+
+function getInboundButtonId(payload) {
+  const id = getInteractiveReplyId(payload);
+  return id ? String(id).trim() : "";
 }
 
 function getIncomingText(incomingPayload) {
@@ -867,6 +882,38 @@ function detectRegionOrSizeHint(text) {
 
 function stageIsDoubts(stage) {
   return stage === "aguardando_duvidas";
+}
+
+function resolveFirstContactChoice({ buttonId, message }) {
+  if (buttonId === BTN.FIRST_NEW) return "NEW";
+  if (buttonId === BTN.FIRST_ONGOING) return "ONGOING";
+
+  const t = String(message || "");
+  const wantsNew =
+    isNumericChoice(t, 1) ||
+    isNewQuote(t) ||
+    (!isOngoingQuote(t) && isYes(t));
+  const wantsContinue =
+    isNumericChoice(t, 2) ||
+    isOngoingQuote(t) ||
+    (!isNewQuote(t) && isNo(t));
+
+  if (wantsNew) return "NEW";
+  if (wantsContinue) return "ONGOING";
+  return "";
+}
+
+function resolveChangeChoice({ buttonId, message }) {
+  if (buttonId === BTN.CHG_YES) return "YES";
+  if (buttonId === BTN.CHG_NO) return "NO";
+
+  const t = String(message || "");
+  const choseYes = isNumericChoice(t, 1) || wantsChange(t) || isYes(t);
+  const choseNo = isNumericChoice(t, 2) || isNo(t);
+
+  if (choseYes) return "YES";
+  if (choseNo) return "NO";
+  return "";
 }
 
 function computeDelayMs(session, mergedText, hasImage) {
@@ -998,6 +1045,44 @@ async function sendPollZapi(phone, title, options, multipleAnswers = false) {
     return false;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function sendFirstContactButtons(phone, session) {
+  session.stage = "await_first_contact_buttons";
+  session.pollContext = "first_contact";
+  session.firstContactAskedOnce = false;
+
+  const question = "É seu primeiro contato comigo?";
+  const ok = await sendButtons(phone, question, [
+    { id: BTN.FIRST_NEW, title: "Sim — orçamento novo" },
+    { id: BTN.FIRST_ONGOING, title: "Não — já tenho um orçamento em andamento" },
+  ])
+    .then(() => true)
+    .catch(() => false);
+
+  if (!ok) {
+    await zapiSendText(
+      phone,
+      "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
+    );
+  }
+}
+
+async function sendChangeReferenceButtons(phone, session) {
+  session.stage = "await_change_buttons";
+  session.pollContext = "change_reference";
+  session.refChangeAskedOnce = false;
+
+  const ok = await sendButtons(phone, "Quer fazer alguma alteração na referência?", [
+    { id: BTN.CHG_YES, title: "Sim" },
+    { id: BTN.CHG_NO, title: "Não" },
+  ])
+    .then(() => true)
+    .catch(() => false);
+
+  if (!ok) {
+    await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
   }
 }
 
@@ -2488,8 +2573,11 @@ async function processMergedInbound(phone, merged) {
 
   const payload = merged.payload || null;
   const incomingText = getIncomingText(payload);
-  const message = String(incomingText ?? merged.message ?? "").trim();
-  const lower = message.toLowerCase();
+  const rawMessage = String(incomingText ?? merged.message ?? "").trim();
+  const buttonId = getInboundButtonId(payload);
+  const message = rawMessage || "";
+  const effectiveMessage = message || (buttonId ? `button:${buttonId}` : "");
+  const lower = effectiveMessage.toLowerCase();
   const imageUrl = merged.imageUrl || null;
   const imageMime = merged.imageMime || "image/jpeg";
   const contactName = merged.contactName || null;
@@ -2501,6 +2589,7 @@ async function processMergedInbound(phone, merged) {
     phone,
     stage: session.stage,
     hasImageUrl: !!imageUrl,
+    buttonId: buttonId || null,
     messagePreview: (message || "").slice(0, 160),
   });
 
@@ -2673,62 +2762,21 @@ async function processMergedInbound(phone, merged) {
   // -------------------- PRIMEIRO CONTATO (saudação + intents) --------------------
   const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
   if (isFreshStart) {
-    const budgetIntent = intentBudget(message);
-    const greetingIntent = intentGreeting(message);
-
-    if (budgetIntent || imageUrl) {
-      session.stage = "await_first_contact_poll";
-      session.pollContext = "first_contact";
-      session.firstContactAskedOnce = false;
-      const pollSent = await sendPollZapi(phone, "É seu primeiro contato comigo?", [
-        "Sim — orçamento novo",
-        "Não — já tenho um orçamento em andamento",
-      ]);
-      if (!pollSent) {
-        await zapiSendText(
-          phone,
-          "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
-        );
-      }
-      return;
+    if (!session.greeted) {
+      const greet = chooseGreetingOnce(session, contactName);
+      if (!antiRepeat(session, greet)) await zapiSendText(phone, greet);
+      session.greeted = true;
     }
 
-    const normalized = norm(message);
-    const isAmbiguous = !normalized || (!budgetIntent && normalized.split(" ").length <= 2);
-    if (isGenericGreeting(message) || isAmbiguous || greetingIntent) {
-      session.stage = "await_first_contact_poll";
-      session.pollContext = "first_contact";
-      session.firstContactAskedOnce = false;
-      const pollSent = await sendPollZapi(phone, "É seu primeiro contato comigo?", [
-        "Sim — orçamento novo",
-        "Não — já tenho um orçamento em andamento",
-      ]);
-      if (!pollSent) {
-        await zapiSendText(
-          phone,
-          "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
-        );
-      }
-      return;
-    }
+    await sendFirstContactButtons(phone, session);
+    return;
   }
 
   // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (
-    session.stage === "await_first_contact_poll" ||
-    session.stage === "first_contact_poll" ||
-    session.stage === "aguardando_primeiro_contato"
-  ) {
-    const wantsNew =
-      isNumericChoice(message, 1) ||
-      isNewQuote(message) ||
-      (!isOngoingQuote(message) && isYes(message));
-    const wantsContinue =
-      isNumericChoice(message, 2) ||
-      isOngoingQuote(message) ||
-      (!isNewQuote(message) && isNo(message));
+  if (session.stage === "await_first_contact_buttons") {
+    const choice = resolveFirstContactChoice({ buttonId, message });
 
-    if (wantsNew) {
+    if (choice === "NEW") {
       session.flowMode = "NEW_BUDGET";
       session.firstContactResolved = true;
       session.pollContext = null;
@@ -2739,7 +2787,7 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    if (wantsContinue) {
+    if (choice === "ONGOING") {
       session.flowMode = "IN_PROGRESS";
       session.pollContext = null;
       await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
@@ -2748,18 +2796,8 @@ async function processMergedInbound(phone, merged) {
 
     if (!session.firstContactAskedOnce) {
       session.firstContactAskedOnce = true;
-      const retry = "Só pra eu te direcionar certinho: é orçamento novo (Sim) ou você já tem um em andamento (Não)?";
-      if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
-      const pollSent = await sendPollZapi(phone, "É seu primeiro contato comigo?", [
-        "Sim — orçamento novo",
-        "Não — já tenho um orçamento em andamento",
-      ]);
-      if (!pollSent) {
-        await zapiSendText(
-          phone,
-          "É seu primeiro contato comigo?\n1) Sim — orçamento novo\n2) Não — já tenho um orçamento em andamento\nResponde 1 ou 2."
-        );
-      }
+      await zapiSendText(phone, "Só pra eu te direcionar certinho: orçamento novo ou já tem um em andamento?");
+      await sendFirstContactButtons(phone, session);
       return;
     }
 
@@ -2878,10 +2916,8 @@ async function processMergedInbound(phone, merged) {
       session.sentQuote = false;
 
       if (
-        session.stage === "await_change_poll" ||
-        session.stage === "change_poll" ||
+        session.stage === "await_change_buttons" ||
         session.stage === "collect_changes" ||
-        session.stage === "aguardando_confirmacao_descricao" ||
         session.stage === "aguardando_ajustes_descricao"
       ) {
         session.stage = "collect_changes";
@@ -2931,15 +2967,9 @@ async function processMergedInbound(phone, merged) {
       session.pendingDescChanges = "";
       session.adjustNotes = "";
       session.confirmationAskedOnce = false;
-      session.stage = "await_change_poll";
-      session.pollContext = "change_reference";
-      session.refChangeAskedOnce = false;
 
       await zapiSendText(phone, desc);
-      const pollSent = await sendPollZapi(phone, msgConfirmacaoDescricao(), ["Sim", "Não"]);
-      if (!pollSent) {
-        await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
-      }
+      await sendChangeReferenceButtons(phone, session);
 
       return;
     }
@@ -2977,13 +3007,10 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
-  if (session.stage === "await_change_poll" || session.stage === "change_poll" || session.stage === "aguardando_confirmacao_descricao") {
-    const t = message;
+  if (session.stage === "await_change_buttons") {
+    const choice = resolveChangeChoice({ buttonId, message });
 
-    const choseYes = isNumericChoice(t, 1) || wantsChange(t) || isYes(t);
-    const choseNo = isNumericChoice(t, 2) || isNo(t);
-
-    if (choseYes) {
+    if (choice === "YES") {
       session.wantsChange = true;
       session.stage = "collect_changes";
       session.pollContext = null;
@@ -2991,7 +3018,7 @@ async function processMergedInbound(phone, merged) {
       return;
     }
 
-    if (choseNo) {
+    if (choice === "NO") {
       session.wantsChange = false;
       session.adjustNotes = "";
       session.stage = "aguardando_resposta_orcamento";
@@ -3003,14 +3030,12 @@ async function processMergedInbound(phone, merged) {
 
     if (!session.refChangeAskedOnce) {
       session.refChangeAskedOnce = true;
-      await zapiSendText(phone, "Só confirma pra mim: quer alterar algo? (Sim/Não)");
-      const pollSent = await sendPollZapi(phone, msgConfirmacaoDescricao(), ["Sim", "Não"]);
-      if (!pollSent) {
-        await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
-      }
+      await zapiSendText(phone, "Só confirma pra mim: quer alterar algo na referência?");
+      await sendChangeReferenceButtons(phone, session);
       return;
     }
 
+    session.wantsChange = false;
     session.adjustNotes = "";
     session.stage = "aguardando_resposta_orcamento";
     session.pollContext = null;
@@ -3041,14 +3066,8 @@ async function processMergedInbound(phone, merged) {
         }
 
         if (session.descriptionText) {
-          session.stage = "await_change_poll";
-          session.pollContext = "change_reference";
-          session.refChangeAskedOnce = false;
           await zapiSendText(phone, session.descriptionText);
-          const pollSent = await sendPollZapi(phone, msgConfirmacaoDescricao(), ["Sim", "Não"]);
-          if (!pollSent) {
-            await zapiSendText(phone, "Você quer alterar algo na referência?\n1) Sim\n2) Não\nResponde 1 ou 2.");
-          }
+          await sendChangeReferenceButtons(phone, session);
           return;
         }
 
@@ -3301,10 +3320,8 @@ async function processMergedInbound(phone, merged) {
   if (
     !session.imageDataUrl &&
     session.stage !== "inicio" &&
-    session.stage !== "await_first_contact_poll" &&
-    session.stage !== "first_contact_poll" &&
-    session.stage !== "await_change_poll" &&
-    session.stage !== "change_poll" &&
+    session.stage !== "await_first_contact_buttons" &&
+    session.stage !== "await_change_buttons" &&
     session.stage !== "collect_changes"
   ) {
     const reply =
