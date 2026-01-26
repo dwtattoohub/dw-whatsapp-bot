@@ -792,12 +792,12 @@ function isNeutralOrQuestion(text) {
 
 const BTN = {
   // Gate 1: primeiro contato
-  FIRST_NEW: "fc_new",
-  FIRST_ONGOING: "fc_ongoing",
+  FIRST_NEW: "first_new",
+  FIRST_ONGOING: "first_ongoing",
 
   // Gate 2: alterar referência?
-  CHG_YES: "chg_yes",
-  CHG_NO: "chg_no",
+  CHG_YES: "change_yes",
+  CHG_NO: "change_no",
 };
 
 function getInteractiveReplyId(incomingPayload) {
@@ -989,27 +989,23 @@ async function sendFirstContactButtons(phone, session, options = {}) {
   const interactiveKey = "first_contact_buttons";
   if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
 
-  session.stage = "await_first_contact_button";
+  session.stage = "await_first_contact_buttons";
   session.lastInteractiveKey = interactiveKey;
   session.lastInteractiveAt = Date.now();
   session.askedFirstContact = true;
   session.firstContactRetry = false;
 
-  return sendButtonsZapi(
-    phone,
-    "Pra eu te direcionar certinho: é seu primeiro contato comigo?",
-    [
-      { id: BTN.FIRST_NEW, label: "Sim — orçamento novo" },
-      { id: BTN.FIRST_ONGOING, label: "Não — já tenho um em andamento" },
-    ]
-  );
+  return sendButtonsZapi(phone, "Pra eu te direcionar certinho:", [
+    { id: BTN.FIRST_NEW, label: "Orçamento novo" },
+    { id: BTN.FIRST_ONGOING, label: "Já tenho orçamento" },
+  ]);
 }
 
 async function sendChangeReferenceButtons(phone, session, options = {}) {
   const interactiveKey = "change_buttons";
   if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
 
-  session.stage = "await_change_button";
+  session.stage = "await_change_buttons";
   session.lastInteractiveKey = interactiveKey;
   session.lastInteractiveAt = Date.now();
   session.confirmationAskedOnce = false;
@@ -1043,7 +1039,7 @@ function parseZapiInbound(body) {
     body?.data?.from ||
     null;
 
-  const message =
+  let message =
     body?.message ||
     body?.text?.message ||
     body?.text ||
@@ -1088,26 +1084,37 @@ function parseZapiInbound(body) {
     body?.data?.contact?.name ||
     null;
 
-  const buttonId =
+  const interactiveId =
     body?.buttonId ||
     body?.selectedId ||
     body?.selectedButtonId ||
     body?.optionId ||
+    body?.buttonReply?.id ||
     body?.data?.buttonId ||
     body?.data?.selectedId ||
     body?.data?.selectedButtonId ||
     body?.data?.optionId ||
     body?.interactive?.button_reply?.id ||
     body?.interactive?.list_reply?.id ||
+    body?.message?.buttonReply?.id ||
     body?.message?.interactive?.button_reply?.id ||
     body?.message?.interactive?.list_reply?.id ||
+    body?.data?.buttonId ||
+    body?.data?.selectedButtonId ||
+    body?.data?.buttonReply?.id ||
+    body?.data?.selectedId ||
+    body?.data?.optionId ||
     null;
+
+  if (!message && interactiveId) {
+    message = interactiveId;
+  }
 
   const interactiveType =
     body?.interactive?.type ||
     body?.message?.interactive?.type ||
     body?.data?.interactive?.type ||
-    (buttonId ? "button" : null);
+    (interactiveId ? "button" : null);
 
   return {
     phone: phone ? String(phone) : null,
@@ -1117,7 +1124,8 @@ function parseZapiInbound(body) {
     fromMe,
     messageType: String(messageType || ""),
     contactName: contactName ? String(contactName).trim() : null,
-    buttonId: buttonId ? String(buttonId) : null,
+    buttonId: interactiveId ? String(interactiveId) : null,
+    interactiveId: interactiveId ? String(interactiveId) : null,
     interactiveType: interactiveType ? String(interactiveType) : null,
     raw: body,
   };
@@ -2531,11 +2539,10 @@ async function processMergedInbound(phone, merged) {
   const session = getSession(phone);
 
   const payload = merged.payload || null;
-  const incomingText = getIncomingText(payload);
-  const rawMessage = String(incomingText ?? merged.message ?? "").trim();
   const btnId = getInteractiveReplyId(payload);
-  const message = rawMessage || "";
-  const effectiveMessage = message || (btnId ? `button:${btnId}` : "");
+  const rawText = getIncomingText(payload);
+  const message = String(btnId || rawText || merged.message || "").trim();
+  const effectiveMessage = message || "";
   const lower = effectiveMessage.toLowerCase();
   const imageUrl = merged.imageUrl || null;
   const imageMime = merged.imageMime || "image/jpeg";
@@ -2749,7 +2756,7 @@ async function processMergedInbound(phone, merged) {
   }
 
   // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (session.stage === "await_first_contact_button") {
+  if (session.stage === "await_first_contact_buttons") {
     const choice = resolveFirstContactChoice({ buttonId: btnId, message });
 
     if (choice === "NEW") {
@@ -2891,7 +2898,7 @@ async function processMergedInbound(phone, merged) {
       session.sentQuote = false;
 
       if (
-        session.stage === "await_change_button" ||
+        session.stage === "await_change_buttons" ||
         session.stage === "collect_changes" ||
         session.stage === "aguardando_ajustes_descricao"
       ) {
@@ -2982,7 +2989,7 @@ async function processMergedInbound(phone, merged) {
     }
   }
 
-  if (session.stage === "await_change_button") {
+  if (session.stage === "await_change_buttons") {
     const choice = resolveChangeChoice({ buttonId: btnId, message });
 
     if (choice === "YES") {
@@ -3294,8 +3301,8 @@ async function processMergedInbound(phone, merged) {
   if (
     !session.imageDataUrl &&
     session.stage !== "inicio" &&
-    session.stage !== "await_first_contact_button" &&
-    session.stage !== "await_change_button" &&
+    session.stage !== "await_first_contact_buttons" &&
+    session.stage !== "await_change_buttons" &&
     session.stage !== "collect_changes"
   ) {
     const reply =
@@ -3330,21 +3337,36 @@ app.get("/health", (req, res) => {
 
 // Webhook Z-API
 app.post("/", async (req, res) => {
+  console.log("[WEBHOOK HIT]", { hasBody: !!req.body, keys: Object.keys(req.body || {}) });
   try {
-    const inbound = parseZapiInbound(req.body || {});
-
     // responde 200 rápido
     res.status(200).json({ ok: true });
+
+    const inbound = parseZapiInbound(req.body || {});
+    console.log("[INBOUND PARSED]", {
+      phone: inbound.phone,
+      fromMe: inbound.fromMe,
+      type: inbound.messageType,
+      msg: inbound.message?.slice(0, 80),
+      hasImage: !!inbound.imageUrl,
+    });
 
     if (!inbound.phone) return;
 
     // ignora mensagens enviadas por você
     if (inbound.fromMe) return;
 
-    const session = getSession(inbound.phone);
-
-    // bufferiza para juntar (ex: imagem + texto + região)
-    enqueueInbound(session, inbound);
+    processMergedInbound(inbound.phone, {
+      phone: inbound.phone,
+      message: inbound.message,
+      imageUrl: inbound.imageUrl,
+      imageMime: inbound.imageMime,
+      contactName: inbound.contactName,
+      messageType: inbound.messageType,
+      payload: inbound.raw,
+    }).catch((e) => {
+      console.error("[PROCESS MERGED ERROR]", e?.message || e);
+    });
   } catch (e) {
     console.error("[WEBHOOK ERROR]", e?.message || e);
     // sempre 200 para não gerar re-tentativas em loop
