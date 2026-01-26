@@ -1,1087 +1,124 @@
-// app.js (ESM)
-// ENV no Render:
-// OPENAI_API_KEY
-// ZAPI_INSTANCE_ID
-// ZAPI_INSTANCE_TOKEN
-// ZAPI_CLIENT_TOKEN
-// (opcional) SYSTEM_PROMPT
-// (opcional) PIX_KEY
-// (opcional) OWNER_PHONE   // ex: 5544999999999
+// ============================================================
+// DW WhatsApp Bot — Jeezy Edition (RESET LIMPO + FUNÇÕES CHAVE)
+// - Sem POLL/ENQUETE
+// - Com BOTÕES (send buttons/list) via Z-API + fallback texto
+// - Fluxo: Saudação -> Primeiro contato (buttons) -> Coleta ref -> local/tamanho
+//        -> Análise imagem + descrição -> Pergunta alteração (buttons)
+//        -> Orçamento -> Agenda -> Sinal -> Comprovante -> Confirma -> Cuidados
+// ============================================================
 
 import express from "express";
+import crypto from "crypto";
 import OpenAI from "openai";
-
-const GCAL_ENABLED = process.env.GCAL_ENABLED === "true";
-const GCAL_CALENDAR_ID = process.env.GCAL_CALENDAR_ID || "";
-const GCAL_SERVICE_ACCOUNT_JSON_BASE64 = process.env.GCAL_SERVICE_ACCOUNT_JSON_BASE64 || "";
-const GCAL_SLOT_MINUTES = parseInt(process.env.GCAL_SLOT_MINUTES || "60");
-const GCAL_TZ = process.env.GCAL_TZ || "America/Sao_Paulo";
-const GCAL_WORK_HOURS_WEEKDAY = process.env.GCAL_WORK_HOURS_WEEKDAY || "0-23";
-const GCAL_WORK_HOURS_WEEKEND = process.env.GCAL_WORK_HOURS_WEEKEND || "0-23";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-/* DW_RULES_AGENDAMENTO
- * - Nunca pedir Pix/sinal antes de: (a) orçamento entregue e (b) horário pré-reservado.
- * - Sugestões de agenda devem usar Google Calendar free/busy para não colidir com eventos existentes.
- */
-
 // -------------------- ENV --------------------
 const ENV = {
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
-  ZAPI_INSTANCE_ID: process.env.ZAPI_INSTANCE_ID || "",
-  ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN || "",
-  ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || "",
-  SYSTEM_PROMPT: process.env.SYSTEM_PROMPT || "",
+  PORT: Number(process.env.PORT || 10000),
+
+  // Z-API
+  ZAPI_INSTANCE_ID: process.env.ZAPI_INSTANCE_ID || process.env.ID_INSTÂNCIA_ZAPI,
+  ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN || process.env.ZAPI_INSTANCE_TOKEN,
+  ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || process.env.ZAPI_CLIENT_TOKEN,
+
+  OWNER_PHONE: process.env.OWNER_PHONE || process.env.TELEFONE_DO_PROPRIETÁRIO || "",
   PIX_KEY: process.env.PIX_KEY || "",
-  OWNER_PHONE: process.env.OWNER_PHONE || "",
-  PORT: process.env.PORT || "10000",
+
+  // OpenAI
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
+
+  // Google Calendar (opcional)
+  GCAL_ENABLED:
+    String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "true" ||
+    String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "verdadeiro",
+  GCAL_TZ: process.env.GCAL_TZ || "America/Sao_Paulo",
 };
 
 function missingEnvs() {
-  const req = ["OPENAI_API_KEY", "ZAPI_INSTANCE_ID", "ZAPI_INSTANCE_TOKEN", "ZAPI_CLIENT_TOKEN"];
-  return req.filter((k) => !ENV[k] || String(ENV[k]).trim() === "");
+  const miss = [];
+  if (!ENV.ZAPI_INSTANCE_ID) miss.push("ZAPI_INSTANCE_ID/ID_INSTÂNCIA_ZAPI");
+  if (!ENV.ZAPI_INSTANCE_TOKEN) miss.push("ZAPI_INSTANCE_TOKEN");
+  if (!ENV.ZAPI_CLIENT_TOKEN) miss.push("ZAPI_CLIENT_TOKEN");
+  // OpenAI é opcional: sem ela o bot não analisa imagem com IA, mas continua respondendo.
+  return miss;
 }
 
-const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
-
-// -------------------- Session (RAM) --------------------
-const sessions = {}; // key: phone
-function getSession(phone) {
-  if (!sessions[phone]) {
-    sessions[phone] = {
-      stage: "inicio",
-
-      // first-contact gate
-      askedFirstContact: false,
-      firstContactRetry: false,
-      firstContactResolved: false,
-      flowMode: null,
-      contactName: null,
-
-      // referência / info
-      imageDataUrl: null,
-      descriptionText: null,
-      descriptionConfirmed: false,
-      pendingDescChanges: "",
-      adjustNotes: "",
-      imageSummary: null,
-      sizeLocation: null,
-      sizeCm: null,
-      bodyRegion: null,
-      bodyPart: null,
-      isCoverup: false,
-      referenceImageUrl: null,
-      hasReferenceImage: false,
-
-      // ordem / flags
-      greeted: false,
-      sentGreeting: false,
-      greetedOnce: false,
-      greetVariant: null,
-      closingVariant: null,
-
-      sentSummary: false,
-      askedDoubts: false,
-      doubtsResolved: false,
-      sentQuote: false,
-      confirmationAskedOnce: false,
-
-      // sinal / agenda
-      depositConfirmed: false,
-      askedSchedule: false,
-      scheduleCaptured: false,
-      scheduleConfirmed: false,
-      suggestedSlots: null,
-      pendingSlot: null,
-      durationMin: null,
-      sentDepositRequest: false,
-      waitingSchedule: false,
-      manualHandoff: false,
-
-      // controle
-      awaitingBWAnswer: false,
-      finished: false,
-      lastOwnerNotifyAt: 0,
-
-      // prazo comprovante (4h)
-      depositDeadlineAt: 0, // timestamp (ms)
-      sentDepositDeadlineInfo: false, // falou das 4h pelo menos 1x (no agendamento)
-      waitingReceipt: false, // cliente disse "já já mando"
-
-      // follow-up 30min (pra “vou ver e te aviso” ou sumiço pós-orçamento)
-      followupTimer: null,
-      followupSent: false,
-      lastClientMsgAt: 0,
-
-      // lembrete cuidados após confirmação do agendamento (cliente confirma depois do horário que você manda)
-      sentAfterConfirmReminder: false,
-
-      // anti spam/loop
-      lastReply: null,
-      lastReplyAt: 0,
-      lastQuoteSizeCm: null,
-      lastQuotePrice: null,
-      lastInteractiveKey: null,
-      lastInteractiveAt: 0,
-
-      // buffer p/ juntar mensagens (imagem + local, etc)
-      pending: {
-        timer: null,
-        textParts: [],
-        lastContactName: null,
-        imageUrl: null,
-        imageMime: "image/jpeg",
-        messageType: "",
-        payload: null,
-      },
-    };
-  }
-  return sessions[phone];
-}
-
-function resetSession(phone) {
-  const s = sessions[phone];
-  if (s?.followupTimer) {
-    try {
-      clearTimeout(s.followupTimer);
-    } catch {}
-  }
-  delete sessions[phone];
-}
-
-function antiRepeat(session, reply) {
-  const now = Date.now();
-  if (session.lastReply === reply && now - session.lastReplyAt < 90_000) return true;
-  session.lastReply = reply;
-  session.lastReplyAt = now;
-  return false;
-}
-
-// -------------------- smart delay --------------------
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function isSimpleAck(text) {
-  const t = String(text || "").toLowerCase().trim();
-  return /^(ok|blz|beleza|fechou|show|top|tmj|valeu|isso|sim|não|nao)$/i.test(t);
-}
-
-function normalizeText(input) {
-  return String(input || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function norm(s = "") {
-  return String(s)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizePollAnswer(input) {
-  let t = normalizeText(input);
-  if (!t) return "";
-  t = t.replace(/^option\s*:\s*/i, "");
-  t = t.replace(/^opcao\s*:\s*/i, "");
-  return t.trim();
-}
-
-function matchesOption(text, options) {
-  return options.some((option) => text === option || text.includes(option));
-}
-
-function isYes(message) {
-  const t = normalizePollAnswer(message);
-  return t ? matchesOption(t, YES_OPTIONS) : false;
-}
-
-function isNo(message) {
-  const t = normalizePollAnswer(message);
-  return t ? matchesOption(t, NO_OPTIONS) : false;
-}
-
-function isNumericChoice(message, value) {
-  const raw = String(message || "").trim();
-  if (!raw) return false;
-  return new RegExp(`^${value}\\b`).test(raw);
-}
-
-function hasAny(t, arr) {
-  return arr.some((k) => t.includes(k));
-}
-
-function escapeRegExp(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-const GREETING_PHRASES = [
-  "oi",
-  "ola",
-  "olá",
-  "oie",
-  "oiee",
-  "eai",
-  "e aí",
-  "iai",
-  "iae",
-  "salve",
-  "opa",
-  "opaa",
-  "bom dia",
-  "boa tarde",
-  "boa noite",
-  "tudo bem",
-  "td bem",
-  "tudo certo",
-  "tudo bom",
-  "beleza",
-  "blz",
-  "tranquilo",
-  "tranq",
-  "suave",
-  "de boa",
-  "deboas",
-  "fala",
-  "fala ai",
-  "fala aí",
-  "fala mano",
-  "fala meu mano",
-  "fala irmão",
-  "fala irmao",
-  "fala bro",
-  "fala chefe",
-  "bom",
-  "boa",
-  "noite",
-  "dia",
-  "tarde",
-];
-
-const BUDGET_INTENT_PHRASES = [
-  "quero orcamento",
-  "quero fazer um orcamento",
-  "quero fazer orcamento",
-  "quero um orcamento",
-  "orcamento",
-  "orçamento",
-  "valor",
-  "preco",
-  "preço",
-  "quanto fica",
-  "quanto custa",
-  "quanto sai",
-  "qual valor",
-  "qual o valor",
-  "me passa o valor",
-  "me passa o preco",
-  "me passa o preço",
-  "investimento",
-];
-
-const SCHEDULE_INTENT_PHRASES = [
-  "agendar",
-  "agendamento",
-  "horario",
-  "horário",
-  "marcar",
-  "marcacao",
-  "marcação",
-  "agenda",
-  "data",
-  "hora",
-  "disponibilidade",
-];
-
-const CONFIRM_OK_PHRASES = [
-  "sim",
-  "s",
-  "ss",
-  "uhum",
-  "aham",
-  "ok",
-  "okay",
-  "okey",
-  "certo",
-  "certinho",
-  "tudo certo",
-  "tudo certinho",
-  "ta certo",
-  "tá certo",
-  "ta certinho",
-  "tá certinho",
-  "ta ok",
-  "tá ok",
-  "ta bom",
-  "tá bom",
-  "tá ótimo",
-  "ta otimo",
-  "perfeito",
-  "perfeita",
-  "top",
-  "show",
-  "fechado",
-  "fechou",
-  "blz",
-  "beleza",
-  "tranquilo",
-  "suave",
-  "de boa",
-  "deboas",
-  "pode",
-  "pode ser",
-  "pode seguir",
-  "pode continuar",
-  "segue",
-  "segue ai",
-  "segue aí",
-  "pode ir",
-  "vai",
-  "manda",
-  "manda ver",
-  "pode mandar",
-  "segue o baile",
-  "segue o jogo",
-  "toca",
-  "toca ficha",
-  "bora",
-  "bora seguir",
-  "do jeito que ta",
-  "do jeito que tá",
-  "do jeito que esta",
-  "do jeito que está",
-  "assim mesmo",
-  "desse jeito mesmo",
-  "pode deixar assim",
-  "deixa assim",
-  "mantem assim",
-  "mantém assim",
-  "nao muda nada",
-  "não muda nada",
-  "nao quero mudar nada",
-  "não quero mudar nada",
-  "nao precisa mudar",
-  "não precisa mudar",
-  "sem alteracoes",
-  "sem alterações",
-  "sem mudancas",
-  "sem mudanças",
-  "sem ajuste",
-  "sem ajustes",
-  "nao quero adicionar nada",
-  "não quero adicionar nada",
-  "nao quero remover nada",
-  "não quero remover nada",
-  "ta perfeito",
-  "tá perfeito",
-  "ta perfeita",
-  "tá perfeita",
-  "ta lindo",
-  "tá lindo",
-  "ta linda",
-  "tá linda",
-  "pode seguir pro orcamento",
-  "pode seguir pro orçamento",
-  "pode seguir com o orcamento",
-  "pode seguir com o orçamento",
-  "pode seguir",
-  "pode continuar",
-  "pode dar sequência",
-  "pode dar sequencia",
-  "segue pro valor",
-  "segue pro valor ai",
-];
-
-const WANTS_CHANGE_PHRASES = [
-  "quero mudar",
-  "quero alterar",
-  "quero ajustar",
-  "quero trocar",
-  "quero adicionar",
-  "quero colocar",
-  "quero incluir",
-  "quero remover",
-  "quero tirar",
-  "quero mudar um detalhe",
-  "quero mudar alguns detalhes",
-  "pode mudar",
-  "pode alterar",
-  "pode ajustar",
-  "pode trocar",
-  "pode tirar",
-  "pode remover",
-  "pode adicionar",
-  "pode colocar",
-  "vamos mudar",
-  "vamos alterar",
-  "vamos ajustar",
-  "vamos trocar",
-  "vamos adicionar",
-  "vamos remover",
-  "vamos tirar",
-  "da pra mudar",
-  "dá pra mudar",
-  "da pra ajustar",
-  "dá pra ajustar",
-  "tem como mudar",
-  "tem como ajustar",
-  "nao ta certo",
-  "não tá certo",
-  "nao esta certo",
-  "não está certo",
-  "nao gostei",
-  "não gostei",
-  "ficou ruim",
-  "quero diferente",
-  "quero outro",
-  "quero mais",
-  "quero menos",
-  "muda",
-  "altera",
-  "ajusta",
-  "troca",
-  "remove",
-  "tira",
-  "coloca",
-  "inclui",
-  "adiciona",
-];
-
-const GREETINGS = [
-  "oi",
-  "ola",
-  "oie",
-  "opa",
-  "salve",
-  "e ai",
-  "eai",
-  "bom dia",
-  "boa tarde",
-  "boa noite",
-  "tudo bem",
-  "td bem",
-  "beleza",
-  "blz",
-  "tranquilo",
-  "suave",
-].map((value) => norm(value));
-
-const NEW_BUDGET_INTENT = [
-  "orcamento",
-  "orçamento",
-  "quero orcamento",
-  "quero fazer um orcamento",
-  "queria um orcamento",
-  "preciso de um orcamento",
-  "quanto fica",
-  "quanto custa",
-  "qual o valor",
-  "valor",
-  "preco",
-  "preço",
-  "investimento",
-  "me passa o valor",
-  "me passa valores",
-  "me passa o preco",
-  "me passa o preço",
-  "quero tatuar",
-  "quero fazer tattoo",
-  "quero fazer uma tattoo",
-  "quero fazer tatuagem",
-  "tatuagem",
-  "tattoo",
-].map((value) => norm(value));
-
-const CONTINUE_INTENT = [
-  "orcamento em andamento",
-  "orçamento em andamento",
-  "ja tenho orcamento",
-  "já tenho orçamento",
-  "continuar",
-  "dar continuidade",
-  "retomar",
-  "voltar",
-  "onde paramos",
-  "a gente ja conversou",
-  "a gente já conversou",
-  "sobre aquele orcamento",
-  "sobre aquele orçamento",
-  "da ultima vez",
-  "da última vez",
-].map((value) => norm(value));
-
-const YES_OPTIONS = [
-  "sim",
-  "s",
-  "claro",
-  "isso",
-  "pode",
-  "pode sim",
-  "com certeza",
-  "quero",
-  "quero sim",
-  "bora",
-  "fechado",
-  "fechou",
-  "confirmo",
-  "ok",
-  "okay",
-  "certo",
-  "certinho",
-  "tudo certo",
-  "segue",
-  "pode seguir",
-  "pode mandar",
-  "manda",
-  "vamos",
-].map((value) => normalizeText(value));
-
-const NO_OPTIONS = [
-  "nao",
-  "não",
-  "n",
-  "negativo",
-  "nem",
-  "nada",
-  "nada nao",
-  "nada não",
-  "deixa assim",
-  "assim mesmo",
-  "do jeito que ta",
-  "do jeito que tá",
-  "sem mudar",
-  "nao quero",
-  "não quero",
-  "sem alteracao",
-  "sem alteração",
-  "pode ir",
-  "pode seguir",
-  "segue assim",
-].map((value) => normalizeText(value));
-
-function textHasAnyPhrase(text, phrases, options = {}) {
-  const t = normalizeText(text);
-  if (!t) return false;
-
-  for (const rawPhrase of phrases) {
-    const phrase = normalizeText(rawPhrase);
-    if (!phrase) continue;
-
-    if (options.exactOnly?.includes(phrase)) {
-      if (t === phrase) return true;
-      continue;
-    }
-
-    const escaped = escapeRegExp(phrase);
-    const regex = new RegExp(`\\b${escaped}\\b`, "i");
-    if (regex.test(t)) return true;
-  }
-
-  return false;
-}
-
-function hasGreeting(text) {
-  return textHasAnyPhrase(text, GREETING_PHRASES);
-}
-
-function hasBudgetIntent(text) {
-  return textHasAnyPhrase(text, BUDGET_INTENT_PHRASES);
-}
-
-function hasScheduleIntent(text) {
-  return textHasAnyPhrase(text, SCHEDULE_INTENT_PHRASES);
-}
-
-function isConfirmOk(text) {
-  return textHasAnyPhrase(text, CONFIRM_OK_PHRASES, { exactOnly: ["s", "ss"] });
-}
-
-function wantsChange(text) {
-  const t = normalizeText(text);
-  if (!t) return false;
-  if (isNo(t) && /mudar|alterar|adicionar|remover|ajustar|trocar|tirar|colocar/.test(t)) {
-    return false;
-  }
-  const negatedPhrases = [
-    "nao quero mudar nada",
-    "não quero mudar nada",
-    "nao quero adicionar nada",
-    "não quero adicionar nada",
-    "sem alteracao",
-    "sem alteração",
-    "deixa assim",
-    "assim mesmo",
-    "do jeito que ta",
-    "do jeito que tá",
-  ].map((phrase) => normalizeText(phrase));
-  if (negatedPhrases.some((phrase) => t.includes(phrase))) {
-    return false;
-  }
-  const phrases = [
-    "quero mudar",
-    "quero alterar",
-    "alterar",
-    "mudar",
-    "ajustar",
-    "trocar",
-    "adicionar",
-    "remover",
-    "tirar",
-    "colocar",
-    "faz",
-    "faz assim",
-    "pode mudar",
-    "pode alterar",
-    "da pra mudar",
-    "dá pra mudar",
-    "quero diferente",
-    "quero outro",
-    "inclui",
-    "inclua",
-    "retira",
-    "retire",
-  ];
-  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
-}
-
-function isAffirmative(text) {
-  const t = normalizeText(text);
-  if (!t) return false;
-  const phrases = [
-    "sim",
-    "s",
-    "ss",
-    "ok",
-    "okk",
-    "certo",
-    "ta certo",
-    "tá certo",
-    "certinho",
-    "tudo certo",
-    "tudo ok",
-    "ok pode",
-    "pode",
-    "pode sim",
-    "pode ser",
-    "fechado",
-    "fechou",
-    "beleza",
-    "blz",
-    "tranquilo",
-    "suave",
-    "show",
-    "top",
-    "perfeito",
-    "maravilha",
-    "exatamente",
-    "isso",
-    "isso mesmo",
-    "do jeito que ta",
-    "do jeito que tá",
-    "assim mesmo",
-    "pode seguir",
-    "segue",
-    "pode continuar",
-    "continua",
-    "manda bala",
-    "vai",
-    "bora",
-    "boraa",
-    "pode ir",
-    "sem mudar",
-    "sem mudanca",
-    "sem mudança",
-    "sem alterações",
-    "sem alteracoes",
-    "nao precisa mudar",
-    "não precisa mudar",
-    "não quero mudar nada",
-    "nao quero mudar nada",
-    "não quero mudar",
-    "nao quero mudar",
-    "não quero adicionar nada",
-    "nao quero adicionar nada",
-    "pode manter",
-    "mantem",
-    "mantém",
-    "deixa assim",
-    "deixa do jeito que esta",
-    "deixa do jeito que tá",
-  ];
-  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
-}
-
-function isNegative(text) {
-  const t = normalizeText(text);
-  if (!t) return false;
-  const phrases = [
-    "nao",
-    "não",
-    "n",
-    "negativo",
-    "prefiro nao",
-    "prefiro não",
-    "deixa",
-    "deixa assim",
-    "sem",
-    "nao quero",
-    "não quero",
-    "nao precisa",
-    "não precisa",
-    "melhor nao",
-    "melhor não",
-  ];
-  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
-}
-
-function intentBudget(text) {
-  const t = normalizeText(text);
-  if (!t) return false;
-  const phrases = [
-    "orcamento",
-    "orçamento",
-    "valor",
-    "preco",
-    "preço",
-    "quanto fica",
-    "quanto custa",
-    "quero tatuar",
-    "quero fazer",
-    "tatuagem",
-    "agendar",
-    "agenda",
-  ];
-  return phrases.some((phrase) => t.includes(normalizeText(phrase)));
-}
-
-function intentGreeting(text) {
-  const t = normalizeText(text);
-  if (!t) return false;
-  const phrases = ["boa noite", "bom dia", "boa tarde", "oi", "olá", "ola", "eai", "e aí", "salve"];
-  return phrases.some((phrase) => t.startsWith(normalizeText(phrase)) || t.includes(normalizeText(phrase)));
-}
-
-function wantsNewBudget(rawText) {
-  const t = norm(rawText);
-  if (hasAny(t, CONTINUE_INTENT)) return false;
-  return hasAny(t, NEW_BUDGET_INTENT);
-}
-
-function wantsContinueBudget(rawText) {
-  const t = norm(rawText);
-  return hasAny(t, CONTINUE_INTENT);
-}
-
-function isGenericGreeting(rawText) {
-  const t = norm(rawText);
-  const wordCount = t ? t.split(" ").length : 0;
-  const hasGreet = hasAny(t, GREETINGS);
-  return hasGreet && !wantsNewBudget(rawText) && !wantsContinueBudget(rawText) && wordCount <= 6;
-}
-
-function isNeutralOrQuestion(text) {
-  return !isConfirmOk(text) && !wantsChange(text);
-}
-
-const BTN = {
-  // Gate 1: primeiro contato
-  FIRST_NEW: "FC_NEW_YES",
-  FIRST_ONGOING: "FC_CONT_NO",
-
-  // Gate 2: alterar referência?
-  CHG_YES: "change_yes",
-  CHG_NO: "change_no",
-};
-
-function getInteractiveReplyId(incomingPayload) {
-  return (
-    incomingPayload?.buttonId ||
-    incomingPayload?.selectedId ||
-    incomingPayload?.selectedButtonId ||
-    incomingPayload?.optionId ||
-    incomingPayload?.buttonReply?.id ||
-    incomingPayload?.interactive?.button_reply?.id ||
-    incomingPayload?.interactive?.list_reply?.id ||
-    incomingPayload?.listReply?.id ||
-    incomingPayload?.payload?.buttonId ||
-    incomingPayload?.data?.selectedId ||
-    incomingPayload?.data?.selectedButtonId ||
-    incomingPayload?.data?.buttonId ||
-    incomingPayload?.data?.optionId ||
-    incomingPayload?.message?.buttonId ||
-    incomingPayload?.message?.interactive?.list_reply?.id ||
-    incomingPayload?.message?.interactive?.button_reply?.id ||
-    null
-  );
-}
-
-function getButtonId(payload) {
-  return (
-    payload?.buttonId ||
-    payload?.selectedButtonId ||
-    payload?.callback?.buttonId ||
-    payload?.message?.buttonResponse?.id ||
-    payload?.message?.buttonReply?.id ||
-    payload?.selectedId ||
-    payload?.optionId ||
-    payload?.buttonReply?.id ||
-    payload?.interactive?.button_reply?.id ||
-    payload?.interactive?.list_reply?.id ||
-    payload?.listReply?.id ||
-    payload?.payload?.buttonId ||
-    payload?.data?.selectedId ||
-    payload?.data?.selectedButtonId ||
-    payload?.data?.buttonId ||
-    payload?.data?.optionId ||
-    payload?.message?.buttonId ||
-    payload?.message?.interactive?.list_reply?.id ||
-    payload?.message?.interactive?.button_reply?.id ||
-    null
-  );
-}
-
-function getIncomingText(incomingPayload) {
-  return (
-    incomingPayload?.text ||
-    incomingPayload?.body ||
-    incomingPayload?.message?.text ||
-    incomingPayload?.message?.conversation ||
-    null
-  );
-}
-
-function detectRegionOrSizeHint(text) {
-  const t = text || "";
-  return Boolean(parseBodyPart(t) || parseSizeCm(t)) ||
-    /(\d+\s*x\s*\d+)/i.test(t);
-}
-
-function stageIsDoubts(stage) {
-  return stage === "aguardando_duvidas";
-}
-
-function resolveFirstContactChoice({ buttonId, message }) {
-  if (buttonId === BTN.FIRST_NEW) return "NEW";
-  if (buttonId === BTN.FIRST_ONGOING) return "ONGOING";
-
-  const t = String(message || "");
-  const wantsNew =
-    isNumericChoice(t, 1) ||
-    isYes(t) ||
-    /novo|or[cç]amento novo|do zero/i.test(t);
-  const wantsContinue =
-    isNumericChoice(t, 2) ||
-    isNo(t) ||
-    /andamento|ja tenho|já tenho|continuar/i.test(t);
-
-  if (wantsNew) return "NEW";
-  if (wantsContinue) return "ONGOING";
-  return "";
-}
-
-function resolveChangeChoice({ buttonId, message }) {
-  if (buttonId === BTN.CHG_YES) return "YES";
-  if (buttonId === BTN.CHG_NO) return "NO";
-
-  const t = String(message || "");
-  const choseYes = isNumericChoice(t, 1) || isYes(t);
-  const choseNo = isNumericChoice(t, 2) || isNo(t);
-
-  if (choseYes) return "YES";
-  if (choseNo) return "NO";
-  return "";
-}
-
-function computeDelayMs(session, mergedText, hasImage) {
-  const t = String(mergedText || "");
-  if (hasImage) return 10_000; // referência: sempre 10s
-  if (detectRegionOrSizeHint(t)) return 10_000; // info importante: 10s
-  if (stageIsDoubts(session.stage)) return 5_000; // dúvidas: 5s
-  if (isSimpleAck(t)) return 2_500; // curto e natural
-  return 3_500; // padrão humano
-}
-
-// -------------------- follow-up 30min --------------------
-function clearFollowup(session) {
-  if (session.followupTimer) {
-    try {
-      clearTimeout(session.followupTimer);
-    } catch {}
-  }
-  session.followupTimer = null;
-}
-
-function scheduleFollowup30min(phone, session, reason = "geral") {
-  if (session.followupSent) return;
-  clearFollowup(session);
-
-  session.followupTimer = setTimeout(() => {
-    session.followupTimer = null;
-    if (session.followupSent) return;
-
-    // só dispara se ainda estiver em etapas “quentes”
-    const stageOk =
-      session.stage === "pos_orcamento" ||
-      session.stage === "aguardando_duvidas" ||
-      session.stage === "aguardando_info" ||
-      session.stage === "aguardando_referencia";
-
-    if (!stageOk) return;
-
-    const msg =
-      "Compreendo perfeitamente, uma tatuagem é uma decisão importante e é ótimo que você queira pensar com calma.\n\n" +
-      "Pra eu te ajudar nesse processo, existe algo específico que está te deixando em dúvida?\n" +
-      "Talvez sobre o *design*, o *orçamento* ou a *data*.\n\n" +
-      "Se tiver alguma preocupação que eu possa esclarecer agora, eu te ajudo por aqui. Meu objetivo é que você se sinta seguro e bem atendido.";
-
-    zapiSendText(phone, msg).catch(() => {});
-    session.followupSent = true;
-
-    // avisa dono só pra ciência (sem travar fluxo)
-    notifyOwner(
-      [
-        "⏳ FOLLOW-UP 30MIN (bot)",
-        `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-        `• Motivo: ${reason}`,
-        `• Etapa: ${session.stage}`,
-      ].join("\n")
-    ).catch(() => {});
-  }, 30 * 60 * 1000);
-}
-
-// -------------------- Z-API Send --------------------
-function zapiBaseUrl() {
-  return `https://api.z-api.io/instances/${ENV.ZAPI_INSTANCE_ID}/token/${ENV.ZAPI_INSTANCE_TOKEN}`;
-}
-
-async function zapiSendText(phone, message) {
-  return zapiPost("/send-text", {
-    phone: String(phone).replace(/\D/g, ""),
-    message: String(message || ""),
-  });
-}
-
-async function zapiSendButtons(phone, text, buttons) {
-  try {
-    await zapiPost("/send-button", {
-      phone: String(phone).replace(/\D/g, ""),
-      message: String(text || ""),
-      buttonList: {
-        buttons: (buttons || []).map((btn) => ({
-          id: String(btn.id),
-          label: String(btn.label ?? btn.title ?? ""),
-        })),
-      },
-    });
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function zapiPost(path, body) {
-  const url = `${zapiBaseUrl()}${path}`;
+// -------------------- OpenAI --------------------
+const openai = ENV.OPENAI_API_KEY ? new OpenAI({ apiKey: ENV.OPENAI_API_KEY }) : null;
+
+const BASE_SYSTEM =
+  "Você é o DW Tattooer, tatuador profissional atendendo no WhatsApp (tom humano, direto e profissional). " +
+  "Regras: Nunca diga que é IA. Não assine. Não fale de preço/hora. " +
+  "Você trabalha com realismo preto e cinza (black & grey) + whip shading. " +
+  "Antes de falar preço: explique rapidamente a complexidade (sombras, transições, volume, encaixe). " +
+  "Se o cliente quiser colorido, diga que você trabalha apenas black & grey.";
+
+// -------------------- Z-API helpers --------------------
+async function zapiFetch(path, payload) {
+  const url = `https://api.z-api.io/instances/${ENV.ZAPI_INSTANCE_ID}/token/${ENV.ZAPI_INSTANCE_TOKEN}${path}`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "client-token": ENV.ZAPI_CLIENT_TOKEN,
     },
-    body: JSON.stringify(body || {}),
+    body: JSON.stringify(payload || {}),
   });
-
-  const respBody = await resp.text().catch(() => "");
-  if (!resp.ok) throw new Error(`[ZAPI POST FAILED] ${resp.status} ${respBody}`);
-  return respBody;
+  const text = await resp.text().catch(() => "");
+  if (!resp.ok) throw new Error(`ZAPI ${resp.status}: ${text}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: true, raw: text };
+  }
 }
 
-function buildGreeting(session, contactName) {
-  const name = contactName || session.contactName || "";
-  const cleaned = safeName(name);
-  if (cleaned) {
-    return `Oi, ${cleaned}! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.`;
-  }
-  return "Oi! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.";
+async function zapiSendText(phone, message) {
+  return zapiFetch("/send-text", { phone, message });
 }
 
-async function sendFirstContactButtons(phone, session, options = {}) {
-  const interactiveKey = "first_contact_buttons";
-  if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
-  if (
-    !options.force &&
-    session.stage === "await_first_contact_buttons" &&
-    Date.now() - (session.lastClientMsgAt || 0) < 8_000
-  ) {
-    return false;
-  }
-
-  session.stage = "await_first_contact_buttons";
-  session.lastInteractiveKey = interactiveKey;
-  session.lastInteractiveAt = Date.now();
-  session.askedFirstContact = true;
-  if (!options.force) session.firstContactRetry = false;
-
-  const text =
-    "Só pra eu te direcionar certinho:\n" +
-    "Você quer começar um *orçamento novo do zero* (Sim) ou *continuar um orçamento em andamento* (Não)?";
-  if (antiRepeat(session, text)) return false;
-  const ok = await zapiSendButtons(phone, text, [
-    { id: BTN.FIRST_NEW, title: "Sim — orçamento novo" },
-    { id: BTN.FIRST_ONGOING, title: "Não — continuar orçamento" },
-  ]);
-
-  if (!ok) {
-    await zapiSendText(
+// "Send Button" (botões). Implementação depende do endpoint suportado na sua Z-API.
+// Tentamos 2 formatos comuns. Se falhar, retornamos false e caímos no fallback texto.
+async function zapiSendButtons(phone, text, buttons) {
+  // buttons: [{id:"ID", title:"Texto"}]
+  const try1 = async () => {
+    // formato A (muito comum)
+    return zapiFetch("/send-buttons", {
       phone,
-      text +
-        "\n\nResponde:\n" +
-        "1) Sim — orçamento novo\n" +
-        "2) Não — continuar orçamento"
-    );
-  }
+      message: text,
+      buttons: buttons.map((b) => ({ id: b.id, text: b.title })),
+    });
+  };
+  const try2 = async () => {
+    // formato B (alternativo)
+    return zapiFetch("/send-button-list", {
+      phone,
+      text,
+      buttons: buttons.map((b) => ({ id: b.id, label: b.title })),
+    });
+  };
 
-  return ok;
+  try {
+    await try1();
+    return true;
+  } catch {}
+  try {
+    await try2();
+    return true;
+  } catch {}
+  return false;
 }
 
-async function sendChangeReferenceButtons(phone, session, options = {}) {
-  const interactiveKey = "change_buttons";
-  if (!options.force && session.lastInteractiveKey === interactiveKey) return false;
-
-  session.stage = "await_change_buttons";
-  session.lastInteractiveKey = interactiveKey;
-  session.lastInteractiveAt = Date.now();
-  session.confirmationAskedOnce = false;
-
-  const ok = await zapiSendButtons(phone, "Você quer alterar algo na referência?", [
-    { id: BTN.CHG_YES, title: "Sim" },
-    { id: BTN.CHG_NO, title: "Não" },
-  ]);
-  if (!ok) {
-    await zapiSendText(phone, "Você quer alterar algo na referência?\n\nResponde:\n1) Sim\n2) Não");
-  }
-  return ok;
-}
-
-// -------------------- OWNER notify --------------------
 async function notifyOwner(text) {
   if (!ENV.OWNER_PHONE) return;
   try {
     await zapiSendText(ENV.OWNER_PHONE, text);
-  } catch (e) {
-    console.log("[OWNER NOTIFY FAIL]", e?.message || e);
-  }
+  } catch {}
 }
 
-// -------------------- INBOUND normalize --------------------
+// -------------------- Normalização inbound --------------------
 function parseZapiInbound(body) {
   const phone =
     body?.phone ||
@@ -1094,7 +131,7 @@ function parseZapiInbound(body) {
     body?.data?.from ||
     null;
 
-  let message =
+  const message =
     body?.message ||
     body?.text?.message ||
     body?.text ||
@@ -1123,13 +160,6 @@ function parseZapiInbound(body) {
 
   const fromMe = Boolean(body?.fromMe || body?.data?.fromMe);
 
-  const messageType =
-    body?.messageType ||
-    body?.type ||
-    body?.data?.messageType ||
-    body?.data?.type ||
-    "";
-
   const contactName =
     body?.senderName ||
     body?.pushName ||
@@ -1137,39 +167,7 @@ function parseZapiInbound(body) {
     body?.data?.senderName ||
     body?.data?.pushName ||
     body?.data?.contact?.name ||
-    null;
-
-  const interactiveId =
-    body?.buttonId ||
-    body?.selectedId ||
-    body?.selectedButtonId ||
-    body?.optionId ||
-    body?.buttonReply?.id ||
-    body?.data?.buttonId ||
-    body?.data?.selectedId ||
-    body?.data?.selectedButtonId ||
-    body?.data?.optionId ||
-    body?.interactive?.button_reply?.id ||
-    body?.interactive?.list_reply?.id ||
-    body?.message?.buttonReply?.id ||
-    body?.message?.interactive?.button_reply?.id ||
-    body?.message?.interactive?.list_reply?.id ||
-    body?.data?.buttonId ||
-    body?.data?.selectedButtonId ||
-    body?.data?.buttonReply?.id ||
-    body?.data?.selectedId ||
-    body?.data?.optionId ||
-    null;
-
-  if (!message && interactiveId) {
-    message = interactiveId;
-  }
-
-  const interactiveType =
-    body?.interactive?.type ||
-    body?.message?.interactive?.type ||
-    body?.data?.interactive?.type ||
-    (interactiveId ? "button" : null);
+    "";
 
   return {
     phone: phone ? String(phone) : null,
@@ -1177,114 +175,55 @@ function parseZapiInbound(body) {
     imageUrl: imageUrl ? String(imageUrl) : null,
     imageMime: String(imageMime || "image/jpeg"),
     fromMe,
-    messageType: String(messageType || ""),
-    contactName: contactName ? String(contactName).trim() : null,
-    buttonId: interactiveId ? String(interactiveId) : null,
-    interactiveId: interactiveId ? String(interactiveId) : null,
-    interactiveType: interactiveType ? String(interactiveType) : null,
+    contactName: String(contactName || "").trim(),
     raw: body,
   };
 }
 
-// -------------------- fetchImage --------------------
-async function fetchImageAsDataUrl(url, mimeHint = "image/jpeg") {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 15000);
-
-  try {
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        "client-token": ENV.ZAPI_CLIENT_TOKEN,
-        Accept: "image/*,*/*;q=0.8",
-        "User-Agent": "Mozilla/5.0",
-      },
-      signal: controller.signal,
-    });
-
-    if (!resp.ok) {
-      const tx = await resp.text().catch(() => "");
-      throw new Error(`Image download failed: ${resp.status} ${tx}`);
-    }
-
-    const ct = (resp.headers.get("content-type") || "").split(";")[0].trim();
-    const mime = ct || mimeHint || "image/jpeg";
-
-    const arr = await resp.arrayBuffer();
-    if (arr.byteLength > 8 * 1024 * 1024) throw new Error("Image too large");
-
-    const b64 = Buffer.from(arr).toString("base64");
-    return `data:${mime};base64,${b64}`;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// -------------------- utils --------------------
-function pickOne(arr) {
-  if (!Array.isArray(arr) || !arr.length) return null;
-  return arr[Math.floor(Math.random() * arr.length)];
+// -------------------- Util --------------------
+function norm(s) {
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
 }
 
 function safeName(name) {
-  const n = String(name || "")
-    .replace(/[^\p{L}\p{N}\s]/gu, "")
-    .trim();
+  const n = String(name || "").trim();
   if (!n) return "";
-  if (/undefined|null|unknown/i.test(n)) return "";
   if (n.length > 24) return n.slice(0, 24);
+  if (/undefined|null|unknown/i.test(n)) return "";
   return n;
 }
 
-// -------------------- GREETINGS / CLOSINGS --------------------
-const GREETING_MESSAGES = [
-  (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.`,
-  (name) =>
-    `Olá${name ? `, ${name}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading. Como posso te ajudar?`,
-];
-
-const CLOSINGS = [
-  () =>
-    `Fechado.\n\n` +
-    `• Obrigado pela confiança.\n` +
-    `• Qualquer dúvida, é só me chamar.\n` +
-    `• Se precisar remarcar, só peço 48h de antecedência.\n\n` +
-    `A gente se vê na sessão.`,
-  () =>
-    `Show!\n\n` +
-    `• Valeu por fechar comigo.\n` +
-    `• Qualquer dúvida até o dia, me chama.\n` +
-    `• Remarcação: 48h de antecedência.\n\n` +
-    `Até a sessão.`,
-];
-
-function chooseGreetingOnce(session, contactName) {
-  if (!session.greetVariant) session.greetVariant = pickOne(GREETING_MESSAGES) || GREETING_MESSAGES[0];
-  const nm = safeName(contactName);
-  return session.greetVariant(nm);
+function detectColorIntent(text) {
+  const t = norm(text);
+  return /colorid|color|cores|vermelh|azul|amarel|verde|roxo|rosa|laranj|aquarel|new school/.test(t);
 }
 
-function chooseClosingOnce(session) {
-  if (!session.closingVariant) session.closingVariant = pickOne(CLOSINGS) || CLOSINGS[0];
-  return session.closingVariant();
+function askedPain(text) {
+  const t = norm(text);
+  return /doi|dor|vai doer|anestes|sensivel|aguenta/.test(t);
 }
 
-// -------------------- Business rules --------------------
-function detectCoverup(text) {
-  const t = (text || "").toLowerCase();
-  return /cobertura|cover\s?up|tapar|tampar|por cima|cover/i.test(t);
+function askedAddress(text) {
+  const t = norm(text);
+  return /onde fica|endereco|localizacao|como chego|qual o endereco/.test(t);
+}
+
+function askedPix(text) {
+  const t = norm(text);
+  return /pix|chave pix|qual o pix|me passa o pix/.test(t);
 }
 
 function parseSizeCm(text) {
-  const t = normalizeText(text);
-
+  const t = norm(text);
   let m = t.match(/(\d{1,2})\s*(cm|centimetros|centimetro)\b/);
   if (m) {
     const n = parseInt(m[1], 10);
     if (n >= 1 && n <= 60) return n;
   }
-
   const hasContext = /\b(tamanho|aprox|aproximado|mais ou menos|uns|cerca|medida)\b/.test(t);
   if (hasContext) {
     m = t.match(/\b(\d{1,2})\b/);
@@ -1293,12 +232,11 @@ function parseSizeCm(text) {
       if (n >= 1 && n <= 60) return n;
     }
   }
-
   return null;
 }
 
 function parseBodyPart(text) {
-  const t = normalizeText(text);
+  const t = norm(text);
   const parts = [
     { match: /antebraco/, label: "antebraço" },
     { match: /\bbraco\b/, label: "braço" },
@@ -1310,7 +248,6 @@ function parseBodyPart(text) {
     { match: /\bcanela\b/, label: "canela" },
     { match: /\bcoxa\b/, label: "coxa" },
     { match: /\bjoelho\b/, label: "joelho" },
-    { match: /\bvirilha\b/, label: "virilha" },
     { match: /\bcostela\b/, label: "costela" },
     { match: /\bpescoco\b/, label: "pescoço" },
     { match: /\bmao\b/, label: "mão" },
@@ -1320,792 +257,58 @@ function parseBodyPart(text) {
     { match: /\btornozelo\b/, label: "tornozelo" },
     { match: /\bnuca\b/, label: "nuca" },
     { match: /\bescapula\b/, label: "escápula" },
-    { match: /\bcoluna\b/, label: "coluna" },
-    { match: /\brosto\b/, label: "rosto" },
-    { match: /\bcabeca\b/, label: "cabeça" },
   ];
-
-  for (const part of parts) {
-    if (part.match.test(t)) return part.label;
-  }
+  for (const p of parts) if (p.match.test(t)) return p.label;
   return null;
 }
 
-function extractSizeLocation(text) {
-  const size = parseSizeCm(text);
-  if (size !== null) return `${size} cm`;
-  const t = (text || "").trim();
-  if (!t || !/\d/.test(t)) return null;
-  return t;
-}
-
-function extractBodyRegion(text) {
-  return parseBodyPart(text);
-}
-
-function askedPix(text) {
-  const t = (text || "").toLowerCase();
-  return /qual\s*o\s*pix|chave\s*pix|me\s*passa\s*o\s*pix|pix\?/i.test(t);
-}
-
-function askedAddress(text) {
-  const t = (text || "").toLowerCase();
-  return /onde\s*fica|endereço|endereco|localização|localizacao|como\s*chego|qual\s*o\s*endereço|qual\s*o\s*endereco/i.test(t);
-}
-
-function detectThanks(text) {
-  const t = (text || "").toLowerCase();
-  return /obrigad|valeu|tmj|agradeço|fechou|show|top|blz|beleza/i.test(t);
-}
-
-// confirma agendamento (cliente confirmou depois do horário que você mandou manualmente)
-function detectAppointmentConfirm(text) {
-  const t = (text || "").toLowerCase();
-  return /confirm|confirmado|combinado|perfeito|fechado|ok|beleza|show|top|tá\s*confirmado|ta\s*confirmado/i.test(t);
-}
-
-// Black & Grey only
-function detectColorIntentByText(text) {
-  const t = (text || "").toLowerCase();
-  return /colorid|color|cores|vermelh|azul|amarel|verde|roxo|rosa|laranj|aquarel|new\s*school/i.test(t);
-}
-
-function detectColorIntentBySummary(summary) {
-  const s = (summary || "").toLowerCase();
-  return /colorid|cores|color|tinta\s*colorida/i.test(s);
-}
-
-function detectBWAccept(text) {
-  const t = (text || "").toLowerCase();
-  if (/\b(sim|aceito|pode|fechado|bora|ok|topo|manda|vamo)\b/i.test(t)) return "yes";
-  if (
-    /\b(n[aã]o|nao|prefiro\s*color|quero\s*color|n[aã]o\s*quero\s*preto|nao\s*quero\s*preto)\b/i.test(t)
-  )
-    return "no";
-  return "";
-}
-
-// agenda
-function detectCommercialPref(text) {
-  const t = (text || "").toLowerCase();
-  if (/(p[oó]s|pos)[ -]?comercial|noite|ap[oó]s\s*o\s*trabalho|depois\s*do\s*trabalho/i.test(t)) return "pos";
-  if (/comercial|manh[aã]|tarde|hor[aá]rio\s*comercial/i.test(t)) return "comercial";
-  return "";
-}
-
-function detectNoSpecificDate(text) {
-  const t = (text || "").toLowerCase();
-  return /pr[oó]xim[ao]\s*(hor[aá]rio|data)\s*(livre|dispon[ií]vel)|qualquer\s*data|pr[oó]xima\s*data|pode\s*marcar\s*no\s*pr[oó]ximo|o\s*que\s*voc[eê]\s*tiver/i.test(
-    t
-  );
-}
-
-function detectHasSpecificDate(text) {
-  const t = (text || "").toLowerCase();
-  return /(\d{1,2}\/\d{1,2})|(\d{1,2}\-\d{1,2})|dia\s*\d{1,2}|(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)/i.test(
-    t
-  );
-}
-
-// comprovante confirmado só com FOTO (imageUrl) após agendamento
-function detectDepositTextOnly(text) {
-  const t = (text || "").toLowerCase();
-  return /comprovante|pix\s*feito|pix\s*realizado|paguei|pago|transferi|transferência|transferencia|sinal|enviei\s*o\s*pix|mandei\s*o\s*pix|caiu\s*o\s*pix|confirmad/i.test(
-    t
-  );
-}
-
-function detectWillSendReceipt(text) {
-  const t = (text || "").toLowerCase();
-  return (
-    /(ja\s*ja|já\s*já|logo|daqui\s*a\s*pouco|vou\s*mandar|já\s*vou\s*mandar|vou\s*enviar|ja\s*envio|já\s*envio|assim\s*que\s*eu\s*fizer|assim\s*que\s*eu\s*conseguir|to\s*fazendo|tô\s*fazendo)/i.test(
-      t
-    ) &&
-    /(comprovante|pix|sinal|transfer|pagamento)/i.test(t)
-  );
-}
-
-function detectReceiptContext(session, message) {
-  // evita o bot tentar analisar comprovante como "referência"
-  const t = (message || "").toLowerCase();
-  if (session.scheduleConfirmed || session.stage === "aguardando_comprovante") return true;
-  if (session.waitingReceipt) return true;
-  if (session.depositDeadlineAt && session.depositDeadlineAt > 0) return true;
-  if (/comprovante|pix|sinal|pagamento|transfer/i.test(t)) return true;
-  return false;
-}
-
-function addDays(date, days) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
-}
-
-function startOfDay(date) {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function fmtDateBR(date) {
-  const formatter = new Intl.DateTimeFormat("pt-BR", {
-    timeZone: GCAL_TZ,
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  });
-  return formatter.format(new Date(date));
-}
-
-function dayOfWeek(date) {
-  return new Date(date).getDay(); // 0 dom ... 6 sab
-}
-
-// Espera existir integração Google Calendar (free/busy). Se já existir, adapte para usar a sua.
-async function calendarFreeBusy({ timeMinISO, timeMaxISO }) {
-  if (typeof getCalendarBusyRanges === "function") {
-    return await getCalendarBusyRanges({ timeMinISO, timeMaxISO });
-  }
-  console.warn("[calendarFreeBusy] Integração não configurada; retornando agenda livre.");
-  return [];
-}
-
-function overlapsBusy(slotStartISO, slotEndISO, busyRanges) {
-  const s = new Date(slotStartISO).getTime();
-  const e = new Date(slotEndISO).getTime();
-  for (const b of busyRanges || []) {
-    const bs = new Date(b.startISO || b.start).getTime();
-    const be = new Date(b.endISO || b.end).getTime();
-    if (Math.max(s, bs) < Math.min(e, be)) return true;
-  }
-  return false;
-}
-
-function dayOfWeekName(date) {
-  const formatter = new Intl.DateTimeFormat("pt-BR", {
-    timeZone: GCAL_TZ,
-    weekday: "long",
-  });
-  const name = formatter.format(new Date(date));
-  return name.charAt(0).toUpperCase() + name.slice(1);
-}
-
-function buildSuggestionFromDate(slotStart, timeHM) {
-  return {
-    dateBR: fmtDateBR(slotStart),
-    dateISO: slotStart.toISOString().slice(0, 10),
-    timeHM,
-    label: `${dayOfWeekName(slotStart)}, ${fmtDateBR(slotStart)} – ${timeHM}`,
-    startISO: slotStart.toISOString(),
-  };
-}
-
-async function buildNextAvailableSuggestionsDW({ durationMin = 180 }) {
-  const now = new Date();
-  const horizonDays = 60;
-
-  const timeMinISO = startOfDay(now).toISOString();
-  const timeMaxISO = addDays(startOfDay(now), horizonDays).toISOString();
-  const busyRanges = GCAL_ENABLED ? await calendarFreeBusy({ timeMinISO, timeMaxISO }) : [];
-
-  const usedDates = new Set();
-  const suggestions = [];
-
-  const findWeekdaySlot = (timeHM) => {
-    for (let i = 1; i <= horizonDays; i += 1) {
-      const d = addDays(now, i);
-      const dow = dayOfWeek(d);
-      if (dow === 0 || dow === 6) continue;
-
-      const slotStart = new Date(d);
-      const [hh, mm] = timeHM.split(":").map(Number);
-      slotStart.setHours(hh, mm, 0, 0);
-
-      if (slotStart.getTime() < now.getTime()) continue;
-
-      const dateISO = slotStart.toISOString().slice(0, 10);
-      if (usedDates.has(dateISO)) continue;
-
-      const slotEnd = new Date(slotStart);
-      slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
-
-      if (!overlapsBusy(slotStart.toISOString(), slotEnd.toISOString(), busyRanges)) {
-        usedDates.add(dateISO);
-        return buildSuggestionFromDate(slotStart, timeHM);
-      }
-    }
-    return null;
-  };
-
-  const findWeekendSlot = () => {
-    for (let i = 1; i <= horizonDays; i += 1) {
-      const d = addDays(now, i);
-      const dow = dayOfWeek(d);
-      let timeHM = "";
-      if (dow === 6) timeHM = "10:00";
-      if (dow === 0) timeHM = "14:00";
-      if (!timeHM) continue;
-
-      const slotStart = new Date(d);
-      const [hh, mm] = timeHM.split(":").map(Number);
-      slotStart.setHours(hh, mm, 0, 0);
-
-      if (slotStart.getTime() < now.getTime()) continue;
-
-      const dateISO = slotStart.toISOString().slice(0, 10);
-      if (usedDates.has(dateISO)) continue;
-
-      const slotEnd = new Date(slotStart);
-      slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
-
-      if (!overlapsBusy(slotStart.toISOString(), slotEnd.toISOString(), busyRanges)) {
-        usedDates.add(dateISO);
-        return buildSuggestionFromDate(slotStart, timeHM);
-      }
-    }
-    return null;
-  };
-
-  const option1 = findWeekdaySlot("14:00");
-  if (option1) suggestions.push(option1);
-
-  const option2 = findWeekdaySlot("19:00");
-  if (option2) suggestions.push(option2);
-
-  const option3 = findWeekendSlot();
-  if (option3) suggestions.push(option3);
-
-  return suggestions;
-}
-
-function buildCalendarTitle(session, phone) {
-  const name = session?.pending?.lastContactName || "Cliente";
-  return `Tattoo - ${name} (${String(phone).replace(/\D/g, "")})`;
-}
-
-async function upsertCalendarHoldOrEvent({ session, phone, dateISO, timeHM, durationMin, title }) {
-  if (typeof createCalendarHold === "function") {
-    return await createCalendarHold({ session, phone, dateISO, timeHM, durationMin, title });
-  }
-  if (typeof createCalendarEvent === "function") {
-    return await createCalendarEvent({ session, phone, dateISO, timeHM, durationMin, title });
-  }
-
-  console.warn("[calendar] Integração não configurada; armazenando hold local.");
-  session.calendarHold = { dateISO, timeHM, durationMin, title };
-  return { ok: true, fallback: true };
-}
-
-function parseChoice1to3(text) {
-  const t = (text || "").trim();
-  if (/^[1-3]$/.test(t)) return Number(t);
-  const m = t.match(/\b([1-3])\b/);
-  return m ? Number(m[1]) : null;
-}
-
-// desconto / “tem como melhorar?” pós-orçamento
-function detectDiscountAsk(text) {
-  const t = (text || "").toLowerCase();
-  return /desconto|melhorar\s*o\s*valor|abaixar|faz\s*por\s*menos|negociar|fecha\s*por|tem\s*como\s*fazer\s*por|d[aá]\s*uma\s*for[cç]a|d[aá]\s*pra\s*ajustar/i.test(
-    t
-  );
-}
-
-// fechamento grande (não perguntar tamanho aproximado)
-function detectLargeProject(text) {
-  const t = (text || "").toLowerCase();
-  return /fechamento|fechar\s*o\s*bra[cç]o|bra[cç]o\s*fechado|fechar\s*as\s*costas|costas\s*fechada|costas\s*inteira|costas\s*fechamento|manga\s*fechada|sleeve/i.test(
-    t
-  );
-}
-
-// -------------------- PRIMEIRO CONTATO (gate) --------------------
-function detectFirstContactAnswer(text) {
-  const t = (text || "").toLowerCase().trim();
-
-  // EM ANDAMENTO (continuar orçamento)
-  if (/^n[aã]o$|^nao$/.test(t)) return "ongoing";
-  if (/andamento|or[cç]amento\s*em\s*andamento|continuar|dar\s*continuidade|já\s*tenho|ja\s*tenho|já\s*fiz|ja\s*fiz/i.test(t))
-    return "ongoing";
-
-  // ORÇAMENTO NOVO (do zero)
-  if (/^sim$/.test(t)) return "first";
-  if (/primeir[ao]|1a\s*vez|primeira\s*vez|novo\s*or[cç]amento|do\s*zero|come[cç]ando|comecando|novo/i.test(t))
-    return "first";
-
-  return "";
-}
-
-// -------------------- DÚVIDAS / INTENTS --------------------
-function askedPain(text) {
-  const t = String(text || "").toLowerCase();
-  return /do[ií]|d[oó]i\s*muito|vai\s*doer|dor|aguenta|sens[ií]vel|anest[eé]s|anestesia/i.test(t);
-}
-
-function askedTime(text) {
-  const t = String(text || "").toLowerCase();
-  return /tempo|demora|quantas\s*sess|qnt\s*sess|dura[cç][aã]o|dura|termina\s*em\s*1|uma\s*sess[aã]o|duas\s*sess/i.test(t);
-}
-
-function askedPrice(text) {
-  const t = String(text || "").toLowerCase();
-  return /quanto\s*custa|valor|pre[cç]o|or[cç]amento|investimento|fica\s*quanto/i.test(t);
-}
-
-function askedHesitation(text) {
-  const t = String(text || "").toLowerCase();
-  return /vou\s*ver|te\s*aviso|preciso\s*pensar|depois\s*eu\s*falo|talvez|to\s*na\s*d[uú]vida|vou\s*avaliar|vou\s*falar\s*com\s*algu[eé]m|vejo\s*e\s*te\s*falo/i.test(
-    t
-  );
-}
-
-function answeredNoDoubts(text) {
-  const t = String(text || "").toLowerCase();
-  return /\b(ok|tudo\s*certo|tranquilo|fechado|sem\s*d[uú]vidas|blz|beleza|deboa|de boa|pode\s*mandar)\b/i.test(t);
-}
-
-// ✅ NOVO modelo (dor) — do jeito que você pediu
-function msgDorResposta() {
-  return (
-    "Entendo perfeitamente sua preocupação com a dor, é uma dúvida muito comum.\n" +
-    "A sensação varia bastante de pessoa pra pessoa e também da área do corpo.\n\n" +
-    "A maioria dos meus clientes descreve como um desconforto suportável — mais uma ardência ou arranhão intenso do que uma dor excruciante.\n" +
-    "Eu trabalho num ritmo que minimiza isso ao máximo e fazemos pausas sempre que precisar.\n\n" +
-    "Se você for mais sensível, eu te passo dicas simples de preparo (alimentação, hidratação e descanso) que ajudam bastante.\n\n" +
-    "Se quiser, me diz a região que você pretende fazer que eu te falo como costuma ser nela."
-  );
-}
-
-// ✅ NOVO modelo (tempo) — sem perguntar “tamanho” quando for fechamento
-function msgTempoResposta(message) {
-  const isBig = detectLargeProject(message || "");
-  if (isBig) {
-    return (
-      "O tempo de execução varia bastante, mas em *fechamento* (braço/costas) a gente sempre organiza por etapas.\n\n" +
-      "Normalmente dividimos em algumas sessões com intervalo pra cicatrização, porque isso garante um resultado perfeito e menos estresse pra você.\n" +
-      "Meu foco é sempre manter qualidade, conforto e uma cicatrização redonda.\n\n" +
-      "Se for *braço fechado* ou *costas inteira*, me diz qual dos dois e se já tem referência que eu te passo uma noção bem realista de sessões."
-    );
-  }
-
-  return (
-    "O tempo de execução varia bastante, dependendo diretamente do tamanho e do detalhamento da sua tatuagem.\n\n" +
-    "Projetos menores podem fechar em uma sessão; já peças com mais detalhes, sombreamento e transições podem pedir duas ou mais sessões.\n" +
-    "Meu foco é sempre garantir qualidade e o seu conforto.\n\n" +
-    "Me diz onde no corpo você quer fazer e, se souber, um tamanho aproximado — assim eu te dou uma estimativa mais precisa."
-  );
-}
-
-function msgPrecoAntesDoValor(message) {
-  const isBig = detectLargeProject(message || "");
-  if (isBig) {
-    return (
-      "Consigo te passar um valor bem fiel assim que eu tiver:\n\n" +
-      "• referência em imagem (se tiver)\n" +
-      "• se é *braço fechado* ou *costas inteira*\n\n" +
-      "Me manda isso que eu já te retorno bem certinho."
-    );
-  }
-
-  return (
-    "Consigo te passar um valor bem fiel assim que eu tiver:\n\n" +
-    "• referência em imagem (se tiver)\n" +
-    "• onde no corpo + tamanho aproximado\n\n" +
-    "Me manda isso que eu já te retorno."
-  );
-}
-
-function msgHesitacaoResposta() {
-  return (
-    "Tranquilo.\n\n" +
-    "Pra eu te ajudar de verdade: o que tá pesando mais agora — *design*, *orçamento* ou *data*?\n" +
-    "Se tiver uma preferência de data, me fala também que eu tento facilitar o melhor caminho."
-  );
-}
-
-// -------------------- Regras de preço --------------------
-function calcPriceFromHours(hours) {
-  const h = Math.max(1, Math.round(Number(hours) || 1));
-  return 150 + Math.max(0, h - 1) * 120;
-}
-
-function sessionsFromHours(hours) {
-  const h = Math.max(1, Number(hours) || 1);
-  return Math.ceil(h / 7);
-}
-
-function roundToNearest10(n) {
-  return Math.round(n / 10) * 10;
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function computeQuote({ sizeCm, bodyPart, analysis }) {
-  if (!sizeCm) {
-    return { ok: false, reason: "missing_size" };
-  }
-
+function calcPriceFromSize(sizeCm, bodyPart, complexity = "medio") {
+  // Base do seu JS (simplificado e estável)
   const base = 220;
   const perCm = 28;
+
   let price = base + sizeCm * perCm;
 
   const regionMultMap = {
-    "antebraço": 1.0,
-    "braço": 1.0,
-    "ombro": 1.05,
-    "perna": 1.05,
-    "coxa": 1.08,
-    "panturrilha": 1.08,
-    "peito": 1.15,
-    "costela": 1.18,
-    "costas": 1.22,
-    "pescoço": 1.12,
-    "mão": 1.12,
+    antebraço: 1.0,
+    braço: 1.0,
+    ombro: 1.05,
+    perna: 1.05,
+    coxa: 1.08,
+    panturrilha: 1.08,
+    peito: 1.15,
+    costela: 1.18,
+    costas: 1.22,
+    pescoço: 1.12,
+    mão: 1.12,
   };
-  const regionMult = regionMultMap[bodyPart] || 1.06;
-  price *= regionMult;
+  price *= regionMultMap[bodyPart] || 1.06;
 
-  let complexityMult = 1.0;
-  if (analysis) {
-    const d = analysis.detailLevel || "medio";
-    const bg = analysis.hasBackground === true;
+  const compMap = { baixo: 0.98, medio: 1.06, alto: 1.14 };
+  price *= compMap[complexity] || 1.06;
 
-    if (d === "baixo") complexityMult *= 0.98;
-    if (d === "medio") complexityMult *= 1.06;
-    if (d === "alto") complexityMult *= 1.14;
-    if (d === "incerto") complexityMult *= 1.02;
-
-    if (bg) complexityMult *= 1.08;
-
-    const shade = analysis.shadingComplexity || "medio";
-    if (shade === "alto") complexityMult *= 1.08;
-    if (shade === "incerto") complexityMult *= 1.01;
-  } else {
-    complexityMult *= 1.03;
-  }
-  price *= complexityMult;
-
-  price = roundToNearest10(price);
-  price = clamp(price, 350, 2500);
-
-  let sessions = 1;
-  if (sizeCm <= 12) sessions = 1;
-  else if (sizeCm <= 18) sessions = 1;
-  else sessions = 2;
-
-  if (
-    sessions === 1 &&
-    sizeCm >= 14 &&
-    analysis &&
-    analysis.detailLevel === "alto" &&
-    analysis.shadingComplexity === "alto"
-  ) {
-    sessions = 2;
-  }
-
-  return {
-    ok: true,
-    price,
-    sessions,
-    breakdown: { base, perCm, regionMult, complexityMult },
-  };
+  // arredonda e limita
+  price = Math.round(price / 10) * 10;
+  price = Math.max(350, Math.min(2500, price));
+  return price;
 }
 
-// -------------------- OpenAI prompts --------------------
-const BASE_SYSTEM = (ENV.SYSTEM_PROMPT || `
-Você é o DW Tattooer, tatuador profissional atendendo no WhatsApp (tom humano, direto e profissional).
-Regras:
-- Nunca diga que é IA.
-- Não assine mensagem.
-- Não use termos estranhos tipo "acabamento bem limpo". Fale como tatuador de verdade.
-- Não fale de horas nem preço/hora pro cliente (isso é interno).
-- Antes de falar preço: explique o valor do trabalho de forma simples (complexidade, sombras, transições, encaixe, cicatrização).
-- Você trabalha com realismo em preto e cinza + whip shading.
-- Você não faz sessões acima de 7 horas; se passar disso, divide em 2+ sessões (sem falar horas).
-- Pagamento: Pix, débito, crédito até 12x.
-- Inclui 1 retoque se necessário em 40–50 dias.
-- Parcelamento mensal existe: se o cliente não conseguir pagar de uma vez, pode dividir em sessões mensais.
-- Cobertura: peça foto da tattoo atual, e diga que vai analisar antes de confirmar.
-- Criação: você faz criações exclusivas baseadas na referência e adapta ao corpo do cliente.
-- Depois de fechar (depósito e agenda), continue respondendo dúvidas básicas do procedimento (dor, cuidados, tempo, local, preparo), sem tomar decisões de agenda.
-- Se a pergunta for fora do procedimento (agenda complexa, assuntos pessoais, mudanças grandes de projeto/valor), responda que vai analisar e retornar em breve.
-`).trim();
-
-async function describeImageForClient(imageDataUrl) {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o",
-    temperature: 0.35,
-    messages: [
-      { role: "system", content: BASE_SYSTEM },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text:
-              "Analise a referência e gere uma explicação curta, direta e profissional do que o projeto exige (sombras, transições, volume, contraste, encaixe). NÃO fale de preço, NÃO fale de horas. 5 a 8 linhas no máximo.",
-          },
-          { type: "image_url", image_url: { url: imageDataUrl } },
-        ],
-      },
-    ],
-  });
-
-  return resp.choices?.[0]?.message?.content?.trim() || "";
+// -------------------- Mensagens --------------------
+function msgGreeting(name) {
+  const nm = safeName(name);
+  return `Olá${nm ? `, ${nm}` : ""}! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.`;
 }
 
-async function buildWorkDescription(imageDataUrl, bodyRegion, sizeLocation) {
-  try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.35,
-      messages: [
-        { role: "system", content: BASE_SYSTEM },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "Crie uma descrição objetiva do projeto de tatuagem com base na referência. " +
-                "Inclua região do corpo e tamanho informado, em tom profissional e direto. " +
-                "Não fale de preço nem horas. 4 a 6 linhas no máximo.",
-            },
-            {
-              type: "text",
-              text: `Região: ${bodyRegion || "não informado"} | Tamanho: ${sizeLocation || "não informado"}`,
-            },
-            { type: "image_url", image_url: { url: imageDataUrl } },
-          ],
-        },
-      ],
-    });
-
-    const content = resp.choices?.[0]?.message?.content?.trim();
-    if (content) return content;
-    return [
-      "Descrição do projeto:",
-      bodyRegion ? `• Região: ${bodyRegion}` : null,
-      sizeLocation ? `• Tamanho: ${sizeLocation}` : null,
-      "• Estilo: realismo black & grey, com sombras e transições suaves.",
-    ]
-      .filter(Boolean)
-      .join("\n");
-  } catch (e) {
-    console.error("[DESC BUILD ERROR]", e?.message || e);
-    return [
-      "Descrição do projeto:",
-      bodyRegion ? `• Região: ${bodyRegion}` : null,
-      sizeLocation ? `• Tamanho: ${sizeLocation}` : null,
-      "• Estilo: realismo black & grey, com sombras e transições suaves.",
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
+function msgAddress() {
+  return "Claro.\n\n• Endereço: *Av. Mauá, 1308* — próximo à rodoviária.";
 }
 
-function buildHeuristicAnalysis({ sizeCm, bodyPart, notes }) {
-  const t = normalizeText(notes);
-  const detailHigh = /\b(realismo|retrato|muito detalhado|detalhado|micro|hiperreal|textura|mandala)\b/.test(t);
-  const detailLow = /\b(minimal|simples|linha|tra(c|ç)o leve)\b/.test(t);
-  const hasBackground = /\b(fundo|background|paisagem|cenario|preenchido)\b/.test(t);
-  const shadeHigh = /\b(muita sombra|sombra pesada|preto solido|contraste alto)\b/.test(t);
-  const shadeMedium = /\b(sombra|esfumado|degrade|transicao|whip)\b/.test(t);
-  const lineDense = /\b(linework|linhas finas|tra(c|ç)o fino|ornamento)\b/.test(t);
-
-  let detailLevel = "medio";
-  if (detailHigh) detailLevel = "alto";
-  if (detailLow) detailLevel = "baixo";
-
-  let shadingComplexity = "medio";
-  if (shadeHigh) shadingComplexity = "alto";
-  if (!shadeHigh && !shadeMedium) shadingComplexity = "baixo";
-
-  let lineworkDensity = "medio";
-  if (lineDense) lineworkDensity = "alto";
-  if (detailLow && !lineDense) lineworkDensity = "baixo";
-
-  const elementsCount = /\b(duas|dois|tres|tr[eê]s|quatro|varios|v[áa]rios|muitos|multiplos)\b/.test(t) ? 2 : 1;
-  const sizeLine = sizeCm ? `${sizeCm} cm` : "tamanho a confirmar";
-  const placeLine = bodyPart || "local a confirmar";
-
-  const notesHuman =
-    `Pelo texto, parece um projeto com ${detailLevel} nível de detalhe` +
-    (hasBackground ? " e algum fundo/ornamento" : "") +
-    `. Tamanho ${sizeLine} no ${placeLine}.`;
-
-  return {
-    detailLevel,
-    hasBackground,
-    lineworkDensity,
-    shadingComplexity,
-    elementsCount,
-    notesHuman,
-  };
-}
-
-function normalizeAnalysisPayload(payload, fallback) {
-  const safe = { ...fallback, ...payload };
-  const allowed = ["baixo", "medio", "alto", "incerto"];
-  if (!allowed.includes(safe.detailLevel)) safe.detailLevel = fallback.detailLevel;
-  if (!allowed.includes(safe.lineworkDensity)) safe.lineworkDensity = fallback.lineworkDensity;
-  if (!allowed.includes(safe.shadingComplexity)) safe.shadingComplexity = fallback.shadingComplexity;
-  safe.hasBackground = Boolean(safe.hasBackground);
-  const count = parseInt(safe.elementsCount, 10);
-  safe.elementsCount = Number.isFinite(count) ? count : fallback.elementsCount;
-  safe.notesHuman = String(safe.notesHuman || fallback.notesHuman || "").trim();
-  return safe;
-}
-
-async function buildArtAnalysis({ sizeCm, bodyPart, notes, imageUrl }) {
-  const fallback = buildHeuristicAnalysis({ sizeCm, bodyPart, notes });
-  if (!ENV.OPENAI_API_KEY || !imageUrl) {
-    return fallback;
-  }
-
-  try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "Você é um tatuador experiente analisando referências. " +
-            "Descreva somente o que está claramente visível. " +
-            "Não invente elementos. Se algo não estiver claro, use 'incerto'. " +
-            "Responda apenas com JSON válido.",
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "Analise a referência e devolva apenas este JSON curto:\n" +
-                "{\n" +
-                '  "detailLevel": "baixo|medio|alto|incerto",\n' +
-                '  "hasBackground": true|false,\n' +
-                '  "lineworkDensity": "baixo|medio|alto|incerto",\n' +
-                '  "shadingComplexity": "baixo|medio|alto|incerto",\n' +
-                '  "elementsCount": number,\n' +
-                '  "notesHuman": "1-2 frases humanas resumindo sem inventar"\n' +
-                "}\n" +
-                "Se não tiver certeza, use 'incerto' nos níveis e descreva a dúvida nas notesHuman.",
-            },
-            { type: "image_url", image_url: { url: imageUrl } },
-          ],
-        },
-      ],
-    });
-
-    const raw = resp.choices?.[0]?.message?.content?.trim();
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw);
-    return normalizeAnalysisPayload(parsed, fallback);
-  } catch (e) {
-    console.error("[ART ANALYSIS ERROR]", e?.message || e);
-    return fallback;
-  }
-}
-
-async function estimateHoursInternal(imageDataUrl, sizeLocationOrRegion, isCoverup) {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o",
-    temperature: 0.15,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Você é um tatuador experiente. Estime SOMENTE um número de horas (inteiro) para execução, considerando complexidade e as informações (tamanho/local OU apenas região). Responda APENAS com um número. Sem texto.",
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `Info do cliente: ${sizeLocationOrRegion || "não informado"}.
-Cobertura: ${isCoverup ? "sim" : "não"}.
-Estime horas inteiras.`,
-          },
-          { type: "image_url", image_url: { url: imageDataUrl } },
-        ],
-      },
-    ],
-  });
-
-  const raw = (resp.choices?.[0]?.message?.content || "").trim();
-  const n = parseInt(raw.replace(/[^\d]/g, ""), 10);
-  if (!Number.isFinite(n) || n <= 0) return 4;
-  return Math.min(30, n);
-}
-
-// “máxima inteligência nas dúvidas”: responde a dúvida com GPT (curto e tatuador real) e volta pro fluxo
-async function answerClientDoubtSmart(question, session) {
-  const context = [
-    session.bodyRegion ? `Região: ${session.bodyRegion}` : null,
-    session.sizeLocation ? `Tamanho/descrição: ${session.sizeLocation}` : null,
-    session.isCoverup ? "É cobertura: sim" : "É cobertura: não",
-  ]
-    .filter(Boolean)
-    .join(" | ");
-
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o",
-    temperature: 0.45,
-    messages: [
-      { role: "system", content: BASE_SYSTEM },
-      {
-        role: "user",
-        content:
-          `Cliente perguntou: "${String(question || "").slice(0, 700)}"\n` +
-          `Contexto do atendimento: ${context || "não informado"}\n\n` +
-          "Responda como o DW Tattooer, de forma humana, objetiva e profissional. " +
-          "No máximo 6 linhas. Termine perguntando se ficou claro e se podemos seguir (ele responde OK).",
-      },
-    ],
-  });
-
-  return resp.choices?.[0]?.message?.content?.trim() || "";
-}
-
-// -------------------- Replies --------------------
-function msgCriacao() {
+function msgDorResposta() {
   return (
-    "Sim — eu faço *criações exclusivas*.\n" +
-    "A referência serve como base, e eu adapto a composição pro teu corpo (encaixe, proporção e leitura), mantendo meu estilo."
-  );
-}
-
-function msgCoberturaPedirFoto() {
-  return (
-    "Sobre *cobertura*: me manda uma foto bem nítida da tattoo atual (de perto e um pouco mais longe).\n\n" +
-    "Aí eu analiso e te falo com sinceridade se dá pra fazer ou se vale outro caminho."
-  );
-}
-
-function msgPedirLocalOuTamanhoMaisHumano(message) {
-  const isBig = detectLargeProject(message || "");
-
-  if (isBig) {
-    return (
-      "Fechado — agora vamos deixar isso bem redondo.\n\n" +
-      "Me manda só mais duas coisas pra eu te passar um orçamento certinho:\n" +
-      "• *a referência em imagem* (se tiver)\n" +
-      "• se é *braço fechado* ou *costas inteira*\n\n" +
-      "Se tiver alguma alteração além da referência, pode falar também."
-    );
-  }
-
-  return (
-    "Fechado — agora vamos deixar isso bem redondo.\n\n" +
-    "Me manda só mais duas coisas pra eu te passar um orçamento certinho:\n" +
-    "• *onde no corpo* você quer fazer\n" +
-    "• *tamanho aproximado* (se não souber em cm, descreve na mão mesmo)\n\n" +
-    "Se tiver alguma alteração além da referência, pode falar também."
+    "Entendo perfeitamente sua preocupação com a dor — é uma dúvida bem comum.\n" +
+    "A sensação varia de pessoa pra pessoa e também depende da área.\n\n" +
+    "A maioria descreve como um desconforto suportável (ardência/arranhão intenso), e eu trabalho num ritmo que minimiza isso, com pausas quando precisar.\n\n" +
+    "Se você me disser a região, eu te falo como costuma ser nela."
   );
 }
 
@@ -2118,1267 +321,511 @@ function msgSoBlackGrey() {
   );
 }
 
-function msgFinalizaPorNaoAceitarBW() {
+function msgFirstContactQuestion() {
+  return "É seu primeiro contato comigo?";
+}
+
+function msgAskNewBudgetBasics() {
   return (
-    "Entendi.\n\n" +
-    "Como eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender no colorido do jeito que você quer.\n\n" +
-    "Obrigado por me chamar — se decidir fazer em preto e cinza no futuro, só me chamar."
+    "Show. Pra eu te passar um orçamento bem fiel, me manda:\n\n" +
+    "• *referência em imagem* (print/foto)\n" +
+    "• *onde no corpo* + *tamanho aproximado em cm*\n"
   );
 }
 
-function msgEndereco() {
+function msgAskContinueBudget() {
   return (
-    "Claro.\n\n" +
-    "• Endereço: *Av. Mauá, 1308* — próximo à rodoviária."
+    "Fechado. Como você já tem um orçamento em andamento, me manda uma mensagem com:\n\n" +
+    "• o que já foi combinado\n" +
+    "• e a última referência\n\n" +
+    "que eu continuo daqui."
   );
 }
 
-function depositDeadlineLine() {
-  return "• A partir dessa mensagem, você tem 4 horas pra realizar o pagamento e enviar o comprovante.";
-}
-
-function msgFicoNoAguardoComprovante() {
-  return "Perfeito, fico no aguardo do comprovante ✅";
-}
-
-function msgAguardandoComprovante() {
-  const pixLine = ENV.PIX_KEY ? `• Chave Pix: ${ENV.PIX_KEY}\n` : "";
+function msgAskBodyAndSize() {
   return (
-    "Certo.\n\n" +
-    "• Pra eu confirmar a reserva do horário, eu preciso da *foto do comprovante* aqui no Whats.\n" +
-    pixLine +
-    "Assim que chegar, fica tudo confirmado."
+    "Perfeito. Me confirma só:\n\n" +
+    "• onde no corpo\n" +
+    "• tamanho aproximado em cm (ex: 10cm, 15cm, 18cm)\n"
   );
 }
 
-function msgPixDireto() {
-  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
-  return (
-    "Perfeito! Pra garantir o seu horário, o sinal é:\n" +
-    "R$ 50,00\n\n" +
-    "Chave Pix:\n" +
-    `${pixLine}\n\n` +
-    "Assim que fizer o Pix, me manda o comprovante aqui pra eu confirmar o agendamento ✅\n\n" +
-    depositDeadlineLine()
-  );
-}
-
-function msgPerguntaAgenda() {
-  return (
-    "Comprovante recebido.\n\n" +
-    "Pra eu agendar do melhor jeito:\n" +
-    "• você prefere horário comercial ou pós-comercial?\n" +
-    "• tem alguma data específica livre?"
-  );
-}
-
-function msgOpcoesAgendamentoComDatasDW(suggestions) {
-  const lines = [];
-  lines.push("Tenho estes horários disponíveis:");
-  (suggestions || []).slice(0, 3).forEach((s, idx) => {
-    lines.push(`${idx + 1}) ${s.label}`);
-  });
-  lines.push("Se algum desses horários ficar bom pra você, me fala 1, 2 ou 3.");
-  lines.push("Se quiser um dia/horário específico, pode mandar também (ex: 15/01/2026 16:00).");
-  return lines.join("\n");
-}
-
-function msgAgendamentoConfirmado(resumo) {
-  return (
-    "Agendamento confirmado ✅\n\n" +
-    "Resumo:\n" +
-    `${resumo}\n\n` +
-    "Se precisar ajustar algo, me chama."
-  );
-}
-
-function msgAgendamentoPreReserva(resumo) {
-  return (
-    "Fechado ✅ Separei esse horário pra você.\n" +
-    "Pra garantir, agora é só fazer o sinal e me mandar o comprovante.\n\n" +
-    "Resumo:\n" +
-    `${resumo}`
-  );
-}
-
-function msgPedirSinalPixDepoisAgendar() {
-  return (
-    "Show! Para finalizar seu agendamento e garantir seu horário, o sinal é de R$ 50,00.\n" +
-    "Esse valor é totalmente abatido no total da tattoo no dia.\n\n" +
-    "Chave Pix:\n" +
-    "dwtattooshop@gmail.com\n\n" +
-    "Assim que fizer o Pix, só me enviar o comprovante aqui.\n" +
-    "O prazo para envio é de 4 horas — após isso, o agendamento é cancelado automaticamente pra manter tudo organizado na agenda.\n\n" +
-    "Qualquer coisa, estou aqui."
-  );
-}
-
-function msgVouVerificarAgendaSemData() {
-  return (
-    "Fechado.\n\n" +
-    "Vou conferir minha agenda e já te retorno com as próximas opções."
-  );
-}
-
-function msgVouVerificarAgendaComData() {
-  return (
-    "Perfeito.\n\n" +
-    "Vou verificar na agenda e já te retorno confirmando opções de data e horário."
-  );
-}
-
-async function isSlotAvailable({ date, timeHM, durationMin }) {
-  const slotStart = new Date(date);
-  const [hh, mm] = timeHM.split(":").map(Number);
-  slotStart.setHours(hh, mm, 0, 0);
-  const slotEnd = new Date(slotStart);
-  slotEnd.setMinutes(slotEnd.getMinutes() + durationMin);
-
-  const timeMinISO = startOfDay(slotStart).toISOString();
-  const timeMaxISO = addDays(startOfDay(slotStart), 1).toISOString();
-  const busyRanges = GCAL_ENABLED ? await calendarFreeBusy({ timeMinISO, timeMaxISO }) : [];
-  return !overlapsBusy(slotStart.toISOString(), slotEnd.toISOString(), busyRanges);
-}
-
-async function confirmScheduleSelection({ session, phone, slot }) {
-  session.pendingSlot = slot;
-  session.scheduleConfirmed = false;
-  session.waitingSchedule = false;
-
-  const resumo = `• ${slot.dateBR} às ${slot.timeHM}`;
-  const msgOk = msgAgendamentoPreReserva(resumo);
-  if (!antiRepeat(session, msgOk)) await zapiSendText(phone, msgOk);
-
-  const msgPix = msgPedirSinalPixDepoisAgendar();
-  if (!antiRepeat(session, msgPix) && !session.sentDepositRequest) {
-    await zapiSendText(phone, msgPix);
-    session.sentDepositRequest = true;
-  }
-
-  session.depositDeadlineAt = Date.now() + 4 * 60 * 60 * 1000;
-  session.sentDepositDeadlineInfo = true;
-  session.waitingReceipt = true;
-  session.stage = "aguardando_comprovante";
-  return true;
-}
-
-function msgCuidadosFinal() {
-  return (
-    "Vou te mandar algumas orientações pra você seguir antes da nossa sessão:\n\n" +
-    "• Beba bastante água no dia anterior.\n" +
-    "• Evite álcool nas 24h antes da sessão.\n" +
-    "• Passe creme hidratante na região (quanto antes começar, melhor).\n" +
-    "• Coma antes da sessão, não venha de estômago vazio.\n" +
-    "• Use roupa confortável.\n\n" +
-    "Reagendamento:\n" +
-    "• Se precisar remarcar, só avisar com até 24h de antecedência.\n" +
-    "• Depois disso não consigo ajustar porque o horário já fica separado pra você e eu não consigo reagendar.\n\n" +
-    "Qualquer coisa até o dia, é só chamar. Tamo junto!"
-  );
-}
-
-async function confirmCalendarEventAfterReceipt({ session, phone, slot }) {
-  if (!GCAL_ENABLED || !slot) return { ok: true, skipped: true };
-  const durationMin = session.durationMin || 180;
-  if (typeof createCalendarEvent === "function") {
-    return await createCalendarEvent({
-      session,
-      phone,
-      dateISO: slot.dateISO,
-      timeHM: slot.timeHM,
-      durationMin,
-      title: buildCalendarTitle(session, phone),
-    });
-  }
-  return await upsertCalendarHoldOrEvent({
-    session,
-    phone,
-    dateISO: slot.dateISO,
-    timeHM: slot.timeHM,
-    durationMin,
-    title: buildCalendarTitle(session, phone),
-  });
-}
-
-function msgCuidadosPreSessao() {
-  return (
-    "Antes da sessão:\n\n" +
-    "• Beba bastante água.\n" +
-    "• Evite álcool no dia anterior.\n" +
-    "• Se alimente bem antes de vir.\n" +
-    "• Se puder, usar *creme hidratante* na região nos dias anteriores ajuda bastante a pele (pigmento e durabilidade agradecem)."
-  );
-}
-
-function parseSpecificDateTime(text) {
-  const normalized = normalizeText(text);
-  const timeMatch = normalized.match(/(\d{1,2})\s*:\s*(\d{2})|\b(\d{1,2})\s*h\b/);
-  if (!timeMatch) return null;
-
-  const hour = timeMatch[1] ? Number(timeMatch[1]) : Number(timeMatch[3]);
-  const minute = timeMatch[2] ? Number(timeMatch[2]) : 0;
-  if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
-  if (hour > 23 || minute > 59) return null;
-
-  const dateMatch = normalized.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
-  const dowMap = {
-    domingo: 0,
-    segunda: 1,
-    "segunda-feira": 1,
-    terca: 2,
-    "terca-feira": 2,
-    quarta: 3,
-    "quarta-feira": 3,
-    quinta: 4,
-    "quinta-feira": 4,
-    sexta: 5,
-    "sexta-feira": 5,
-    sabado: 6,
-    "sabado-feira": 6,
-  };
-
-  const now = new Date();
-
-  if (dateMatch) {
-    const day = Number(dateMatch[1]);
-    const month = Number(dateMatch[2]) - 1;
-    const yearRaw = dateMatch[3];
-    let year = yearRaw ? Number(yearRaw) : now.getFullYear();
-    if (year < 100) year += 2000;
-
-    let candidate = new Date(year, month, day, hour, minute, 0, 0);
-    if (candidate.getTime() < now.getTime() && !yearRaw) {
-      candidate = new Date(year + 1, month, day, hour, minute, 0, 0);
-    }
-    return { date: candidate, timeHM: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
-  }
-
-  for (const [label, dow] of Object.entries(dowMap)) {
-    if (!normalized.includes(label)) continue;
-    const candidate = new Date(now);
-    const currentDow = candidate.getDay();
-    let diff = (dow - currentDow + 7) % 7;
-    if (diff === 0 && (candidate.getHours() > hour || (candidate.getHours() === hour && candidate.getMinutes() >= minute))) {
-      diff = 7;
-    }
-    candidate.setDate(candidate.getDate() + diff);
-    candidate.setHours(hour, minute, 0, 0);
-    return { date: candidate, timeHM: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
-  }
-
-  return null;
-}
-
-function msgChecagemDuvidas() {
-  return (
-    "Antes de eu te passar o investimento:\n\n" +
-    "Ficou alguma dúvida sobre o atendimento?\n" +
-    "Se estiver tudo certo, me responde *OK* que eu já te mando o valor e as formas de pagamento."
-  );
-}
-
-function msgConfirmacaoDescricao() {
+function msgAskChangeQuestion() {
   return "Você quer alterar algo na referência?";
 }
 
-function msgOrcamentoNovo() {
-  return (
-    "Show! Então vamos montar um orçamento novo bem certinho.\n\n" +
-    "Pra eu te passar um valor bem fiel, me manda:\n" +
-    "• *a referência em imagem* (se tiver)\n" +
-    "• *onde no corpo* você quer fazer + *tamanho aproximado*\n\n" +
-    "Se você tiver alguma ideia de ajuste além da referência, pode falar também."
-  );
+function msgAskChangeDetails() {
+  return "Fechou. Me descreve rapidinho o que você quer adicionar/remover/ajustar (pode mandar em tópicos).";
 }
 
-function msgOrcamentoCompleto(valor, sessions) {
-  const hasOneSession = Number(sessions) <= 1;
-  const sessionLine = hasOneSession
-    ? "Esse trabalho a gente faz em 1 única sessão, pra ficar bem executado e cicatrizar bem."
-    : "Se for um trabalho maior e passar de ~7h, a gente divide em 2 sessões pra manter o nível e cicatrização redonda.";
+function msgBeforeQuoteSummary(sizeCm, bodyPart, imageSummary) {
+  const lines = [];
+  lines.push("Fechado. Pra eu te passar um valor bem fiel, eu considerei:");
+  if (sizeCm) lines.push(`• Tamanho: ${sizeCm} cm`);
+  if (bodyPart) lines.push(`• Local: ${bodyPart}`);
+  if (imageSummary) lines.push(`• Detalhes: ${imageSummary}`);
+  lines.push("Isso influencia direto no nível de sombra/detalhe e na execução pra cicatrizar bem.");
+  return lines.join("\n");
+}
+
+function msgQuote(finalPrice) {
   return (
-    `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${valor}*.\n\n` +
+    `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${finalPrice}*.\n\n` +
     "Formas de pagamento:\n" +
     "• Pix\n" +
     "• Débito\n" +
     "• Crédito em até 12x (+ acréscimo da máquina)\n\n" +
-    sessionLine
+    "Se quiser, eu já te mando opções de datas e horários."
   );
 }
 
-async function sendQuoteFlow(phone, session, message) {
-  if (!session.sizeCm) {
-    const reply =
-      "Me diz só o tamanho aproximado em cm (ex: 10cm, 15cm, 18cm) pra eu fechar o orçamento certinho.";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    session.stage = "aguardando_info";
-    return false;
-  }
-
-  try {
-    const notes = [session.descriptionText, session.adjustNotes, message].filter(Boolean).join(" ");
-    const imageForAnalysis = session.referenceImageUrl || session.imageDataUrl;
-    const analysis = await buildArtAnalysis({
-      sizeCm: session.sizeCm,
-      bodyPart: session.bodyPart || session.bodyRegion,
-      notes,
-      imageUrl: session.hasReferenceImage ? imageForAnalysis : null,
-    });
-
-    const quoteResult = computeQuote({
-      sizeCm: session.sizeCm,
-      bodyPart: session.bodyPart || session.bodyRegion,
-      analysis,
-    });
-
-    if (!quoteResult.ok) {
-      const reply =
-        "Me diz só o tamanho aproximado em cm (ex: 10cm, 15cm, 18cm) pra eu fechar o orçamento certinho.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.stage = "aguardando_info";
-      return false;
-    }
-
-    let finalPrice = quoteResult.price;
-    if (
-      session.lastQuoteSizeCm &&
-      session.lastQuotePrice &&
-      session.sizeCm !== session.lastQuoteSizeCm &&
-      finalPrice === session.lastQuotePrice
-    ) {
-      finalPrice += 50;
-    }
-
-    if (process.env.NODE_ENV !== "production") {
-      console.log(
-        `[QUOTE] sizeCm=${session.sizeCm} bodyPart=${session.bodyPart || session.bodyRegion || "n/a"} price=${finalPrice} ` +
-          `breakdown=${JSON.stringify(quoteResult.breakdown)}`
-      );
-    }
-
-    const analysisLines = [
-      "Fechado. Pra eu te passar um valor bem fiel, eu considerei:",
-      `• Tamanho: ${session.sizeCm} cm`,
-      `• Local: ${session.bodyPart || session.bodyRegion || "a confirmar"}`,
-      analysis?.notesHuman ? `• Detalhes: ${analysis.notesHuman}` : null,
-      "Isso influencia direto no tempo de sessão e na quantidade de sombra/detalhe pra ficar bem executado e cicatrizar redondo.",
-    ]
-      .filter(Boolean)
-      .join("\n");
-    if (!antiRepeat(session, analysisLines)) await zapiSendText(phone, analysisLines);
-
-    const quote = msgOrcamentoCompleto(finalPrice, quoteResult.sessions);
-    if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
-
-    const durationMin = session.durationMin || 180;
-    const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
-
-    if (suggestions.length < 3) {
-      const reply = msgVouVerificarAgendaSemData();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      await notifyOwner(
-        [
-          "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
-          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-          "• Ação: verificar agenda manualmente",
-        ].join("\n")
-      );
-      session.manualHandoff = true;
-      session.stage = "manual_pendente";
-    } else {
-      session.suggestedSlots = suggestions;
-      session.waitingSchedule = true;
-      session.stage = "aguardando_escolha_agendamento";
-
-      const reply = msgOpcoesAgendamentoComDatasDW(suggestions);
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    }
-
-    session.sentQuote = true;
-    session.waitingReceipt = false;
-    session.lastQuoteSizeCm = session.sizeCm;
-    session.lastQuotePrice = finalPrice;
-
-    // follow-up 30min pós-orçamento (se sumir)
-    scheduleFollowup30min(phone, session, "pós orçamento");
-    return true;
-  } catch (e) {
-    console.error("[QUOTE ERROR]", e?.message || e);
-
-    // se der erro na estimativa, manda handoff manual (sem travar)
-    await handoffToManual(phone, session, "erro ao estimar orçamento", message);
-    return false;
-  }
+function msgAskSchedule() {
+  return "Você quer que eu te mande as próximas opções de datas e horários agora?";
 }
 
-// -------------------- HANDOFF manual --------------------
-async function handoffToManual(phone, session, motivo, mensagemCliente) {
-  const now = Date.now();
-  if (!session.lastOwnerNotifyAt) session.lastOwnerNotifyAt = 0;
-
-  if (now - session.lastOwnerNotifyAt > 30_000) {
-    session.lastOwnerNotifyAt = now;
-    await notifyOwner(
-      [
-        "🧠 HANDOFF MANUAL (bot)",
-        `• Motivo: ${motivo}`,
-        `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-        `• Etapa: ${session.stage || "?"}`,
-        `• Mensagem: ${(mensagemCliente || "").slice(0, 400)}`,
-      ].join("\n")
-    );
-  }
-
-  session.manualHandoff = true;
-  session.stage = "manual_pendente";
-
-  const reply =
-    "Entendi.\n\n" +
-    "• Vou analisar direitinho e já te retorno.";
-  if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+function msgPixSinal() {
+  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
+  return (
+    "Show! Para garantir seu horário, o sinal é de *R$ 50,00* (abatido do total no dia).\n\n" +
+    "Chave Pix:\n" +
+    `${pixLine}\n\n` +
+    "Assim que fizer, me manda a *foto do comprovante* aqui no Whats ✅"
+  );
 }
 
-// -------------------- Buffer / Merge inbound --------------------
-function enqueueInbound(session, inbound) {
-  const p = session.pending;
-  if (inbound.contactName) p.lastContactName = inbound.contactName;
-  if (inbound.raw) p.payload = inbound.raw;
-
-  // guarda partes de texto
-  const msg = String(inbound.message || "").trim();
-  if (msg) p.textParts.push(msg);
-
-  // guarda imagem (se veio)
-  if (inbound.imageUrl) {
-    p.imageUrl = inbound.imageUrl;
-    p.imageMime = inbound.imageMime || "image/jpeg";
-  }
-
-  p.messageType = inbound.messageType || p.messageType || "";
-
-  // reseta timer e agenda processamento com delay inteligente
-  if (p.timer) clearTimeout(p.timer);
-
-  const mergedTextPreview = p.textParts.join(" \n");
-  const delay = computeDelayMs(session, mergedTextPreview, Boolean(p.imageUrl));
-
-  p.timer = setTimeout(() => {
-    p.timer = null;
-    const mergedText = p.textParts.join("\n").trim();
-  const merged = {
-      phone: inbound.phone,
-      message: mergedText,
-      imageUrl: p.imageUrl,
-      imageMime: p.imageMime,
-      contactName: p.lastContactName,
-      messageType: p.messageType,
-      payload: p.payload,
-    };
-
-    // limpa buffer antes de processar (pra não duplicar)
-    p.textParts = [];
-    p.imageUrl = null;
-    p.imageMime = "image/jpeg";
-    p.messageType = "";
-    p.payload = null;
-
-    // processa (async)
-    processMergedInbound(merged.phone, merged).catch((e) => {
-      console.error("[PROCESS MERGED ERROR]", e?.message || e);
-    });
-  }, delay);
+// -------------------- Image analysis (OpenAI) --------------------
+async function describeImageShort(imageUrl) {
+  if (!openai) return "";
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o",
+    temperature: 0.25,
+    messages: [
+      { role: "system", content: BASE_SYSTEM },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              "Analise a referência e gere 1-2 frases objetivas sobre complexidade (sombras, transições, volume, contraste). " +
+              "Não fale de preço, não fale de horas.",
+          },
+          { type: "image_url", image_url: { url: imageUrl } },
+        ],
+      },
+    ],
+  });
+  return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// -------------------- Core processor --------------------
-async function processMergedInbound(phone, merged) {
+// -------------------- Sessions (in-memory) --------------------
+const sessions = new Map();
+
+function newSession() {
+  return {
+    stage: "start",
+    greeted: false,
+
+    // data
+    name: "",
+    bodyPart: "",
+    sizeCm: null,
+    referenceImageUrl: "",
+    imageSummary: "",
+    changeNotes: "",
+    wantsChange: null,
+
+    // quote
+    lastPrice: null,
+
+    // flags
+    awaitingBWAnswer: false,
+    awaitingFirstContact: false,
+    awaitingChangeConfirm: false,
+    awaitingScheduleConfirm: false,
+    awaitingDeposit: false,
+  };
+}
+
+function getSession(phone) {
+  if (!sessions.has(phone)) sessions.set(phone, newSession());
+  return sessions.get(phone);
+}
+
+function resetSession(phone) {
+  sessions.set(phone, newSession());
+}
+
+// -------------------- Anti-repeat (simple) --------------------
+function hash(s) {
+  return crypto.createHash("md5").update(String(s)).digest("hex");
+}
+function antiRepeat(session, text) {
+  const h = hash(text);
+  if (session.lastSentHash === h) return true;
+  session.lastSentHash = h;
+  return false;
+}
+
+// -------------------- Buttons helpers --------------------
+async function askFirstContactButtons(phone, session) {
+  const text = msgFirstContactQuestion();
+  const buttons = [
+    { id: "FIRST_NEW", title: "Sim — orçamento novo" },
+    { id: "FIRST_CONTINUE", title: "Não — já tenho em andamento" },
+  ];
+  const sent = await zapiSendButtons(phone, text, buttons);
+  if (!sent) {
+    await zapiSendText(phone, `${text}\n1) Sim — orçamento novo\n2) Não — já tenho em andamento\nResponde 1 ou 2.`);
+  }
+  session.awaitingFirstContact = true;
+  session.stage = "await_first_contact";
+}
+
+async function askChangeButtons(phone, session) {
+  const text = msgAskChangeQuestion();
+  const buttons = [
+    { id: "CHG_YES", title: "Sim" },
+    { id: "CHG_NO", title: "Não" },
+  ];
+  const sent = await zapiSendButtons(phone, text, buttons);
+  if (!sent) {
+    await zapiSendText(phone, `${text}\n1) Sim\n2) Não\nResponde 1 ou 2.`);
+  }
+  session.awaitingChangeConfirm = true;
+  session.stage = "await_change_confirm";
+}
+
+async function askScheduleButtons(phone, session) {
+  const text = msgAskSchedule();
+  const buttons = [
+    { id: "SCHED_YES", title: "Sim" },
+    { id: "SCHED_NO", title: "Não" },
+  ];
+  const sent = await zapiSendButtons(phone, text, buttons);
+  if (!sent) {
+    await zapiSendText(phone, `${text}\n1) Sim\n2) Não\nResponde 1 ou 2.`);
+  }
+  session.awaitingScheduleConfirm = true;
+  session.stage = "await_schedule_confirm";
+}
+
+// Detect button selection in inbound (varia conforme Z-API)
+function extractButtonId(raw) {
+  // tentativas comuns
+  return (
+    raw?.buttonId ||
+    raw?.data?.buttonId ||
+    raw?.selectedButtonId ||
+    raw?.data?.selectedButtonId ||
+    raw?.interactive?.button_reply?.id ||
+    raw?.data?.interactive?.button_reply?.id ||
+    raw?.listReply?.id ||
+    raw?.data?.listReply?.id ||
+    ""
+  );
+}
+
+function parseChoice12(text) {
+  const t = norm(text);
+  if (t === "1" || /\b1\b/.test(t)) return 1;
+  if (t === "2" || /\b2\b/.test(t)) return 2;
+  if (/\bsim\b/.test(t)) return 1;
+  if (/\bnao\b|\bnão\b/.test(t)) return 2;
+  return null;
+}
+
+// -------------------- Core flow --------------------
+async function handleInbound(phone, inbound) {
   const session = getSession(phone);
 
-  const payload = merged.payload || null;
-  const btnId = getButtonId(payload);
-  const rawText = getIncomingText(payload);
-  const message = String(btnId || rawText || merged.message || "").trim();
-  const effectiveMessage = message || "";
-  const lower = effectiveMessage.toLowerCase();
-  const imageUrl = merged.imageUrl || null;
-  const imageMime = merged.imageMime || "image/jpeg";
-  const contactName = merged.contactName || null;
+  const message = inbound.message || "";
+  const lower = norm(message);
+  const buttonId = extractButtonId(inbound.raw);
+  const hasImage = Boolean(inbound.imageUrl);
+  const name = safeName(inbound.contactName);
 
-  if (contactName && !session.contactName) {
-    session.contactName = contactName;
-  }
+  if (name && !session.name) session.name = name;
 
-  // marca última msg do cliente
-  session.lastClientMsgAt = Date.now();
-
-  console.log("[MERGED IN]", {
-    phone,
-    stage: session.stage,
-    hasImageUrl: !!imageUrl,
-    buttonId: btnId || null,
-    messagePreview: (message || "").slice(0, 120),
-  });
-
-  // ✅ se já entrou em handoff manual
-  if (session.manualHandoff) {
-    // se cliente confirmar, manda cuidados + fechamento (sem duplicar)
-    if ((session.stage === "pos_agenda_manual" || session.stage === "manual_pendente") && detectAppointmentConfirm(message)) {
-      if (!session.sentAfterConfirmReminder) {
-        const reply = [msgCuidadosPreSessao(), "", "Qualquer dúvida até o dia, é só me chamar."].join("\n\n");
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.sentAfterConfirmReminder = true;
-        return;
-      }
-    }
-
-    if ((session.stage === "pos_agenda_manual" || session.stage === "manual_pendente") && detectThanks(message)) {
-      const reply = chooseClosingOnce(session);
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.finished = true;
-      session.stage = "finalizado";
-    }
-    return;
-  }
-
-  // ✅ comando reset
-  if (/^reset$|^reiniciar$|^reinicia$|^começar\s*novamente$|^comecar\s*novamente$/i.test(lower)) {
+  // comandos
+  if (/^reset$|^reiniciar$|^comecar novamente$|^começar novamente$/.test(lower)) {
     resetSession(phone);
     const s2 = getSession(phone);
-    const reply =
-      "Atendimento reiniciado.\n\n" +
-      "Me manda a referência em imagem e me diz onde no corpo + tamanho aproximado.";
+    const reply = "Atendimento reiniciado.\n\nMe manda a referência em imagem e me diz onde no corpo + tamanho em cm.";
     if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
     return;
   }
 
-  // ✅ reset automático quando sessão ficou presa e o cliente só manda saudação
-  if (
-    isGenericGreeting(message) &&
-    session.stage !== "inicio" &&
-    !["aguardando_comprovante", "aguardando_escolha_agendamento"].includes(session.stage)
-  ) {
-    resetSession(phone);
-    const s2 = getSession(phone);
-    const greet = buildGreeting(s2, contactName);
-    if (!s2.greetedOnce) {
-      if (!antiRepeat(s2, greet)) await zapiSendText(phone, greet);
-      s2.greetedOnce = true;
-    }
-    await sendFirstContactButtons(phone, s2);
-    return;
-  }
-
-  // ✅ endereço
+  // address/pix quick intents
   if (askedAddress(message)) {
-    const reply = msgEndereco();
+    const reply = msgAddress();
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
-
-  // ✅ pix
-  if (askedPix(message)) {
-    if (session.scheduleConfirmed || session.stage === "aguardando_comprovante" || session.pendingSlot) {
-      const reply = msgPixDireto();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    const reply =
-      "Pra liberar a chave Pix eu preciso confirmar o horário primeiro.\n\n" +
-      "Se quiser, já te mando opções de datas disponíveis agora.";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    return;
-  }
-
-  // intents (dor/tempo/preço/hesitação)
-  const pain = askedPain(message);
-  const timeAsk = askedTime(message);
-  const priceAsk = askedPrice(message);
-  const hes = askedHesitation(message);
-
-  if (pain && !session.finished) {
+  if (askedPain(message)) {
     const reply = msgDorResposta();
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
 
-  if (timeAsk && !session.finished) {
-    const reply = msgTempoResposta(message);
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    return;
-  }
-
-  if (hes && !session.finished) {
-    const reply = msgHesitacaoResposta();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-    // agenda follow-up 30min em hesitação
-    scheduleFollowup30min(phone, session, "hesitação");
-    return;
-  }
-
-  if (priceAsk && !session.finished) {
-    if (!session.imageDataUrl || (!session.bodyRegion && !session.sizeLocation)) {
-      const reply = msgPrecoAntesDoValor(message);
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-      // agenda follow-up 30min se ficou travado pedindo info
-      scheduleFollowup30min(phone, session, "pediu preço sem info");
-      return;
-    }
-  }
-
-  // intents gerais
-  if (detectCoverup(message)) session.isCoverup = true;
-  const askedCreation = /cria|criação|desenho|autor|exclusiv/i.test(lower);
-
-  const maybeRegion = parseBodyPart(message);
-  if (maybeRegion) {
-    session.bodyPart = maybeRegion;
-    session.bodyRegion = maybeRegion;
-  }
-
-  const maybeSizeCm = parseSizeCm(message);
-  if (maybeSizeCm !== null) {
-    session.sizeCm = maybeSizeCm;
-    session.sizeLocation = `${maybeSizeCm} cm`;
-  }
-
-  const maybeSizeLoc = extractSizeLocation(message);
-  if (maybeSizeLoc) session.sizeLocation = maybeSizeLoc;
-
-  // se recebeu info nova, limpa follow-up (não precisa mais)
-  if (maybeRegion || maybeSizeLoc || imageUrl) {
-    clearFollowup(session);
-    session.followupSent = false;
-  }
-
-  if (!session.finished && detectColorIntentByText(message)) {
+  // color gating
+  if (!session.awaitingBWAnswer && detectColorIntent(message)) {
     session.awaitingBWAnswer = true;
     const reply = msgSoBlackGrey();
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
-
-  if (askedCreation) {
-    const reply = msgCriacao();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    // não returna, deixa seguir fluxo
-  }
-
-  // ✅ aceitar/recusar preto e cinza
   if (session.awaitingBWAnswer) {
-    const bw = detectBWAccept(message);
-    if (bw === "no") {
-      session.finished = true;
+    // se aceitou black&grey
+    if (/\b(sim|aceito|pode|fechado|ok|bora)\b/.test(lower)) {
+      session.awaitingBWAnswer = false;
+    } else if (/\b(nao|não|quero colorido|prefiro colorido)\b/.test(lower)) {
+      const reply =
+        "Entendi.\n\nComo eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender no colorido do jeito que você quer.\n\nSe decidir fazer em preto e cinza, é só me chamar.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       session.stage = "finalizado";
-      const reply = msgFinalizaPorNaoAceitarBW();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
-    }
-    if (bw === "yes") session.awaitingBWAnswer = false;
-  }
-
-  // -------------------- PRAZO 12H (cancelamento) --------------------
-  if (session.depositDeadlineAt && !session.depositConfirmed) {
-    const now = Date.now();
-    if (now > session.depositDeadlineAt) {
-      const reply =
-        "Certo.\n\n" +
-        "Como o comprovante não chegou dentro do prazo, eu cancelei a reserva e o horário voltou pra agenda.\n" +
-        "Se você ainda quiser fazer, me chama aqui que a gente retoma e vê novos horários.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-      await notifyOwner(
-        [
-          "⏰ PRAZO EXPIRADO (bot)",
-          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-          "• Ação: reserva cancelada (12h sem comprovante)",
-        ].join("\n")
-      );
-
-      resetSession(phone);
-      return;
-    }
-  }
-
-  // -------------------- PRIMEIRO CONTATO (saudação + intents) --------------------
-  const isFreshStart = !session.stage || session.stage === "start" || session.stage === "inicio";
-  if (isFreshStart) {
-    const greet = buildGreeting(session, contactName);
-    if (!session.greetedOnce) {
-      if (!antiRepeat(session, greet)) await zapiSendText(phone, greet);
-      session.greetedOnce = true;
-    }
-    session.greeted = true;
-    await sendFirstContactButtons(phone, session);
-    return;
-  }
-
-  // -------------------- FLUXO (gate primeiro contato) --------------------
-  if (session.stage === "await_first_contact_buttons") {
-    const choice = resolveFirstContactChoice({ buttonId: btnId, message });
-
-    if (choice === "NEW") {
-      session.lastInteractiveKey = null;
-      session.flowMode = "NEW_BUDGET";
-      session.firstContactResolved = true;
-      session.stage = "aguardando_referencia";
-      const reply = msgOrcamentoNovo();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      scheduleFollowup30min(phone, session, "gate resolvido, aguardando referência");
-      return;
-    }
-
-    if (choice === "ONGOING") {
-      session.lastInteractiveKey = null;
-      session.flowMode = "IN_PROGRESS";
-      await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
-      return;
-    }
-
-    if (!session.firstContactRetry) {
-      session.firstContactRetry = true;
-      await sendFirstContactButtons(phone, session, { force: true });
-      return;
-    }
-
-    await zapiSendText(phone, "Não consegui entender. Responde só com *1* ou *2* 🙏");
-    await sendFirstContactButtons(phone, session, { force: true });
-    return;
-  }
-
-  // ✅ coverup sem imagem
-  if (session.isCoverup && !session.imageDataUrl && !imageUrl) {
-    const reply = msgCoberturaPedirFoto();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    session.stage = "aguardando_referencia";
-
-    scheduleFollowup30min(phone, session, "coverup pediu foto");
-    return;
-  }
-
-  // ✅ aguardando referência e não tem imagem
-  if (session.stage === "aguardando_referencia" && !session.imageDataUrl && !imageUrl) {
-    const reply =
-      "Perfeito.\n\n" +
-      "Quando puder, me manda:\n" +
-      "• *referência em imagem* (print/foto)\n" +
-      "• *onde no corpo* + *tamanho aproximado*";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-    scheduleFollowup30min(phone, session, "aguardando referência sem imagem");
-    return;
-  }
-
-  // ✅ comprovante por texto sem foto (depois do orçamento)
-  const depositTextOnly = detectDepositTextOnly(message);
-  const isAfterSchedule = session.scheduleConfirmed || session.stage === "aguardando_comprovante";
-
-  if (!session.depositConfirmed && depositTextOnly && !imageUrl && isAfterSchedule) {
-    // “já já mando”
-    if (detectWillSendReceipt(message)) {
-      session.waitingReceipt = true;
-      const reply = msgFicoNoAguardoComprovante();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-
-    const reply = msgAguardandoComprovante();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-    return;
-  }
-
-  // ✅ FOTO do comprovante
-  const isReceiptImage = Boolean(imageUrl) && detectReceiptContext(session, message);
-  if (!session.depositConfirmed && isReceiptImage && isAfterSchedule) {
-    session.depositConfirmed = true;
-    const slot = session.pendingSlot || session.calendarHold;
-    const slotLabel = slot ? `${slot.dateBR || slot.dateISO} ${slot.timeHM}` : "não informado";
-
-    await notifyOwner(
-      [
-        "💸 COMPROVANTE RECEBIDO (bot)",
-        `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-        `• Slot escolhido: ${slotLabel}`,
-        "• Mensagem: Comprovante recebido. Confirmar no Google Agenda.",
-      ].join("\n")
-    );
-
-    await confirmCalendarEventAfterReceipt({ session, phone, slot });
-
-    session.scheduleConfirmed = true;
-    session.stage = "agendamento_confirmado";
-    session.pendingSlot = null;
-
-    if (slot) {
-      const resumo = `• ${slot.dateBR || slot.dateISO} às ${slot.timeHM}`;
-      const confirmMsg = msgAgendamentoConfirmado(resumo);
-      if (!antiRepeat(session, confirmMsg)) await zapiSendText(phone, confirmMsg);
     } else {
-      if (!antiRepeat(session, "Agendamento confirmado ✅")) await zapiSendText(phone, "Agendamento confirmado ✅");
+      // ainda aguardando resposta clara
+      const reply = "Só confirma pra mim: você topa fazer em *preto e cinza*? (Sim/Não)";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
     }
+  }
 
-    const cuidados = msgCuidadosFinal();
-    if (!antiRepeat(session, cuidados)) await zapiSendText(phone, cuidados);
+  // 1) start -> greet + first contact buttons
+  if (session.stage === "start") {
+    const greet = msgGreeting(session.name || "");
+    if (!session.greeted) {
+      if (!antiRepeat(session, greet)) await zapiSendText(phone, greet);
+      session.greeted = true;
+    }
+    await askFirstContactButtons(phone, session);
     return;
   }
 
-  // ✅ imagem referência chegou -> salva + analisa
-  if (imageUrl && !isReceiptImage) {
-    try {
-      session.referenceImageUrl = imageUrl;
-      session.hasReferenceImage = true;
-      const dataUrl = await fetchImageAsDataUrl(imageUrl, imageMime);
-      session.imageDataUrl = dataUrl;
-      session.descriptionText = null;
-      session.descriptionConfirmed = false;
-      session.pendingDescChanges = "";
-      session.adjustNotes = "";
-      session.confirmationAskedOnce = false;
+  // 2) awaiting first contact
+  if (session.stage === "await_first_contact") {
+    let choice = null;
 
-      session.imageSummary = await describeImageForClient(dataUrl);
+    if (buttonId === "FIRST_NEW") choice = 1;
+    if (buttonId === "FIRST_CONTINUE") choice = 2;
 
-      if (detectColorIntentBySummary(session.imageSummary)) {
-        session.awaitingBWAnswer = true;
-        const reply = msgSoBlackGrey();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        return;
-      }
+    if (!choice) choice = parseChoice12(message);
 
-      // reset flags
-      session.sentSummary = false;
-      session.askedDoubts = false;
-      session.doubtsResolved = false;
-      session.sentQuote = false;
-
-      if (
-        session.stage === "await_change_buttons" ||
-        session.stage === "collect_changes" ||
-        session.stage === "aguardando_ajustes_descricao"
-      ) {
-        session.stage = "collect_changes";
-        await zapiSendText(
-          phone,
-          "Recebi mais uma referência. Me diz o que você quer incorporar dela (ou o que quer remover) e já sigo pro orçamento."
-        );
-        return;
-      }
-
-      session.stage = "aguardando_info";
-
-      if (!session.bodyRegion && !session.sizeLocation) {
-        const reply = msgPedirLocalOuTamanhoMaisHumano(message);
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-        scheduleFollowup30min(phone, session, "recebeu ref, pedindo info");
-        return;
-      }
-    } catch (e) {
-      console.error("[IMG] failed:", e?.message || e);
-      session.stage = "aguardando_info";
-      if (!session.bodyRegion && !session.sizeLocation) {
-        const reply = msgPedirLocalOuTamanhoMaisHumano(message);
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-        scheduleFollowup30min(phone, session, "falhou download ref, pedindo info");
-        return;
-      }
-    }
-  }
-
-  // ✅ se tem imagem e está aguardando info -> manda resumo / dúvidas
-  if (session.imageDataUrl && session.stage === "aguardando_info") {
-    if (!session.bodyRegion && !session.sizeLocation) {
-      const reply = msgPedirLocalOuTamanhoMaisHumano(message);
+    if (choice === 1) {
+      session.awaitingFirstContact = false;
+      session.stage = "collect_reference";
+      const reply = msgAskNewBudgetBasics();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-
-      scheduleFollowup30min(phone, session, "aguardando info (sem região/tamanho)");
       return;
     }
 
-    if (session.bodyRegion && session.sizeLocation) {
-      const desc = await buildWorkDescription(session.imageDataUrl, session.bodyRegion, session.sizeLocation);
-      session.descriptionText = desc;
-      session.descriptionConfirmed = false;
-      session.pendingDescChanges = "";
-      session.adjustNotes = "";
-      session.confirmationAskedOnce = false;
-
-      await zapiSendText(phone, desc);
-      await sendChangeReferenceButtons(phone, session);
-
-      return;
-    }
-
-    if (!session.sentSummary) {
-      if (!session.imageSummary) {
-        const reply =
-          "Recebi a referência.\n\n" +
-          "Só me confirma:\n" +
-          "• onde no corpo\n" +
-          "• tamanho aproximado\n" +
-          "e se é igual à referência ou quer alguma alteração.";
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        session.sentSummary = true;
-      } else {
-        const intro =
-          "Recebi a referência.\n\n" +
-          "Pra esse projeto ficar bem executado, ele exige:\n\n" +
-          session.imageSummary;
-        if (!antiRepeat(session, intro)) await zapiSendText(phone, intro);
-        session.sentSummary = true;
-      }
-    }
-
-    // ✅ após enviar o resumo, faz a checagem de dúvidas (1x) e muda de etapa
-    if (!session.askedDoubts) {
-      const reply = msgChecagemDuvidas();
+    if (choice === 2) {
+      session.awaitingFirstContact = false;
+      session.stage = "manual_continue";
+      const reply = msgAskContinueBudget();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      session.askedDoubts = true;
-      session.stage = "aguardando_duvidas";
-
-      // se sumir nessa etapa, follow-up 30min
-      scheduleFollowup30min(phone, session, "checagem de dúvidas");
-      return;
-    }
-  }
-
-  if (session.stage === "await_change_buttons") {
-    const choice = resolveChangeChoice({ buttonId: btnId, message });
-
-    if (choice === "YES") {
-      session.lastInteractiveKey = null;
-      session.wantsChange = true;
-      session.stage = "collect_changes";
-      await zapiSendText(phone, "Fechou. Me descreve rapidinho o que você quer adicionar/remover/ajustar (pode mandar em tópicos).");
+      await notifyOwner(`📌 Cliente com orçamento em andamento: ${phone}`);
       return;
     }
 
-    if (choice === "NO") {
-      session.lastInteractiveKey = null;
-      session.wantsChange = false;
-      session.adjustNotes = "";
-      session.stage = "aguardando_resposta_orcamento";
-      await zapiSendText(phone, "Perfeito! Vou calcular o investimento pra você.");
-      await sendQuoteFlow(phone, session, message);
-      return;
-    }
-
-    if (!session.confirmationAskedOnce) {
-      session.confirmationAskedOnce = true;
-      await sendChangeReferenceButtons(phone, session, { force: true });
-      return;
-    }
-
-    session.wantsChange = false;
-    session.lastInteractiveKey = null;
-    session.adjustNotes = "";
-    session.stage = "aguardando_resposta_orcamento";
-    await zapiSendText(phone, "Perfeito! Vou calcular o investimento pra você.");
-    await sendQuoteFlow(phone, session, message);
+    const retry = "Só pra eu te direcionar certinho: é orçamento novo (1) ou em andamento (2)?";
+    if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
     return;
   }
 
-  if (session.stage === "collect_changes" || session.stage === "aguardando_ajustes_descricao") {
-    if (message) {
-      session.adjustNotes = session.adjustNotes ? `${session.adjustNotes}\n${message}` : message;
-      await zapiSendText(phone, "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.");
-      session.stage = "aguardando_resposta_orcamento";
-      await sendQuoteFlow(phone, session, message);
+  // 3) collect reference (need image)
+  if (session.stage === "collect_reference") {
+    if (!hasImage) {
+      const reply = "Quando puder, me manda a *referência em imagem* (print/foto).";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      return;
     }
+
+    session.referenceImageUrl = inbound.imageUrl;
+    session.stage = "collect_body_size";
+
+    // IA: resumo curto
+    const sum = await describeImageShort(inbound.imageUrl);
+    session.imageSummary = sum;
+
+    if (sum) {
+      const msg = "Recebi a referência.\n\nPra esse projeto ficar bem executado, ele exige:\n\n" + sum;
+      if (!antiRepeat(session, msg)) await zapiSendText(phone, msg);
+    } else {
+      const msg = "Recebi a referência ✅";
+      if (!antiRepeat(session, msg)) await zapiSendText(phone, msg);
+    }
+
+    const ask = msgAskBodyAndSize();
+    if (!antiRepeat(session, ask)) await zapiSendText(phone, ask);
     return;
   }
 
-  // -------------------- ETAPA: DÚVIDAS --------------------
-  if (session.stage === "aguardando_duvidas") {
-    // se o cliente disse que não tem dúvidas / OK -> gera orçamento
-    if (!session.descriptionConfirmed) {
-      const prematurely = ["ok", "aceito", "fechado", "bora", "quero"];
-      if (prematurely.some((w) => lower.includes(w))) {
-        if (!session.descriptionText && session.imageDataUrl && session.bodyRegion && session.sizeLocation) {
-          const desc = await buildWorkDescription(session.imageDataUrl, session.bodyRegion, session.sizeLocation);
-          session.descriptionText = desc;
-        }
+  // 4) collect body + size
+  if (session.stage === "collect_body_size") {
+    const maybeBody = parseBodyPart(message);
+    const maybeSize = parseSizeCm(message);
 
-        if (session.descriptionText) {
-          await zapiSendText(phone, session.descriptionText);
-          await sendChangeReferenceButtons(phone, session);
-          return;
-        }
+    if (maybeBody) session.bodyPart = maybeBody;
+    if (maybeSize) session.sizeCm = maybeSize;
 
-        await zapiSendText(phone, "Antes de prosseguir, preciso que você confirme a descrição do projeto.");
-        return;
-      }
+    // se mandou imagem de novo, atualiza referência
+    if (hasImage) {
+      session.referenceImageUrl = inbound.imageUrl;
+      const sum = await describeImageShort(inbound.imageUrl);
+      session.imageSummary = sum;
     }
 
-    if (answeredNoDoubts(message) || /^ok$/i.test(lower)) {
-      session.doubtsResolved = true;
-
-      await sendQuoteFlow(phone, session, message);
+    if (!session.bodyPart || !session.sizeCm) {
+      const reply = msgAskBodyAndSize();
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
-    // se ele mandou uma dúvida de verdade, responde com GPT e mantém na etapa
-    const reply = await answerClientDoubtSmart(message, session);
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    // pronto -> perguntar alteração (buttons)
+    session.stage = "await_change_confirm";
+    const before = msgBeforeQuoteSummary(session.sizeCm, session.bodyPart, session.imageSummary);
+    if (!antiRepeat(session, before)) await zapiSendText(phone, before);
+    await askChangeButtons(phone, session);
     return;
   }
 
-  // -------------------- ETAPA: PÓS-ORÇAMENTO --------------------
-  if (session.stage === "pos_orcamento") {
-    // pedido de desconto -> resposta padrão (sem negociar valor diretamente)
-    if (detectDiscountAsk(message)) {
-      const reply =
-        "Entendo.\n\n" +
-        "O valor é baseado na complexidade e no tempo de execução pra eu te entregar um resultado perfeito e uma cicatrização redonda.\n\n" +
-        "O que eu consigo fazer pra facilitar é:\n" +
-        "• parcelar no cartão em até 12x\n" +
-        "• ou dividir em *sessões mensais* (você vai pagando por etapa)\n\n" +
-        "Se você me disser qual dessas formas te ajuda mais, eu te guio no melhor caminho.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+  // 5) change confirm
+  if (session.stage === "await_change_confirm") {
+    let choice = null;
+    if (buttonId === "CHG_YES") choice = 1;
+    if (buttonId === "CHG_NO") choice = 2;
+    if (!choice) choice = parseChoice12(message);
 
-      // follow-up 30min se sumir
-      scheduleFollowup30min(phone, session, "pedido de desconto");
-      return;
-    }
-
-    /* STAGE: CONVIDAR_AGENDAMENTO_START */
-    if (detectHasSpecificDate(message) || detectNoSpecificDate(message) || /marcar|agenda|hor[aá]rio|data/i.test(lower)) {
-      const durationMin = session.durationMin || 180;
-      const specificRequest = parseSpecificDateTime(message);
-      if (specificRequest) {
-        const slot = {
-          dateBR: fmtDateBR(specificRequest.date),
-          dateISO: specificRequest.date.toISOString().slice(0, 10),
-          timeHM: specificRequest.timeHM,
-        };
-        const isFree = await isSlotAvailable({
-          date: specificRequest.date,
-          timeHM: specificRequest.timeHM,
-          durationMin,
-        });
-
-        if (isFree) {
-          const ok = await confirmScheduleSelection({ session, phone, slot });
-          if (!ok) {
-            const fallback = msgVouVerificarAgendaComData();
-            if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
-            await notifyOwner(
-              [
-                "📅 HORÁRIO ESPECÍFICO INDISPONÍVEL (bot)",
-                `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-                `• Pedido: ${message.slice(0, 200)}`,
-                "• Ação: verificar agenda manualmente",
-              ].join("\n")
-            );
-            session.manualHandoff = true;
-            session.stage = "manual_pendente";
-          }
-          return;
-        }
-      }
-
-      const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
-
-      if (suggestions.length < 3) {
-        const reply = msgVouVerificarAgendaSemData();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        await notifyOwner(
-          [
-            "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
-            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-            "• Ação: verificar agenda manualmente",
-          ].join("\n")
-        );
-        session.manualHandoff = true;
-        session.stage = "manual_pendente";
-        return;
-      }
-
-      session.suggestedSlots = suggestions;
-      session.waitingSchedule = true;
-      session.stage = "aguardando_escolha_agendamento";
-
-      const reply = msgOpcoesAgendamentoComDatasDW(suggestions);
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-    /* STAGE: CONVIDAR_AGENDAMENTO_END */
-
-    // se cliente agradecer depois do orçamento, responde curto (não finaliza)
-    if (detectThanks(message)) {
-      const reply =
-        "Tamo junto.\n\n" +
-        "Se quiser seguir, me fala que eu já te mando opções de datas e horários. Qualquer dúvida, me chama.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
-    }
-  }
-
-  /* STAGE: AGUARDANDO_ESCOLHA_AGENDAMENTO_START */
-  if (session.stage === "aguardando_escolha_agendamento") {
-    const txt = (message?.text || message?.body || message || "").trim();
-
-    // 3.1) Se cliente mandou dia/horário específico
-    const specificRequest = parseSpecificDateTime(txt);
-    if (specificRequest) {
-      const durationMin = session.durationMin || 180;
-      const slot = {
-        dateBR: fmtDateBR(specificRequest.date),
-        dateISO: specificRequest.date.toISOString().slice(0, 10),
-        timeHM: specificRequest.timeHM,
-      };
-      const isFree = await isSlotAvailable({
-        date: specificRequest.date,
-        timeHM: specificRequest.timeHM,
-        durationMin,
-      });
-
-      if (isFree) {
-        const ok = await confirmScheduleSelection({ session, phone, slot });
-        if (!ok) {
-          const retry = msgVouVerificarAgendaComData();
-          if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
-          await notifyOwner(
-            [
-              "📅 HORÁRIO ESPECÍFICO INDISPONÍVEL (bot)",
-              `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-              `• Pedido: ${txt.slice(0, 200)}`,
-              "• Ação: verificar agenda manualmente",
-            ].join("\n")
-          );
-          session.manualHandoff = true;
-          session.stage = "manual_pendente";
-        }
-        return;
-      }
-
-      const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
-      if (suggestions.length < 3) {
-        const reply = msgVouVerificarAgendaSemData();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        await notifyOwner(
-          [
-            "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
-            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-            "• Ação: verificar agenda manualmente",
-          ].join("\n")
-        );
-        session.manualHandoff = true;
-        session.stage = "manual_pendente";
-        return;
-      }
-
-      session.suggestedSlots = suggestions;
-      session.waitingSchedule = true;
-      session.stage = "aguardando_escolha_agendamento";
-
-      const reply = msgOpcoesAgendamentoComDatasDW(suggestions);
+    if (choice === 1) {
+      session.stage = "collect_change_notes";
+      const reply = msgAskChangeDetails();
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
       return;
     }
 
-    // 3.2) Escolha 1-3
-    const choice = parseChoice1to3(txt);
-    if (!choice || !session.suggestedSlots || !session.suggestedSlots[choice - 1]) {
-      const retry = "Me diz só *1, 2 ou 3* ✅ (ou manda um dia/horário específico).";
+    if (choice === 2) {
+      session.changeNotes = "";
+      session.stage = "send_quote";
+      // cai para orçamento
+    } else {
+      const retry = "Só confirma: quer alterar algo? (1=Sim / 2=Não)";
       if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
       return;
     }
+  }
 
-    const slot = session.suggestedSlots[choice - 1];
-    const ok = await confirmScheduleSelection({ session, phone, slot });
-    if (!ok) {
-      const durationMin = session.durationMin || 180;
-      const suggestions = await buildNextAvailableSuggestionsDW({ durationMin });
-      if (suggestions.length < 3) {
-        const reply = msgVouVerificarAgendaSemData();
-        if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-        await notifyOwner(
-          [
-            "📅 SEM OPÇÕES DISPONÍVEIS (bot)",
-            `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-            "• Ação: verificar agenda manualmente",
-          ].join("\n")
-        );
-        session.manualHandoff = true;
-        session.stage = "manual_pendente";
-        return;
-      }
-
-      session.suggestedSlots = suggestions;
-      const reply =
-        "Esse horário acabou de ficar indisponível. Te mando outras opções livres ✅\n\n" +
-        msgOpcoesAgendamentoComDatasDW(suggestions);
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
-      return;
+  // 6) collect change notes
+  if (session.stage === "collect_change_notes") {
+    if (hasImage) {
+      // referência adicional
+      session.referenceImageUrl = inbound.imageUrl;
     }
+    if (message) {
+      session.changeNotes = (session.changeNotes ? session.changeNotes + "\n" : "") + message;
+    }
+    const ack = "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.";
+    if (!antiRepeat(session, ack)) await zapiSendText(phone, ack);
+    session.stage = "send_quote";
+    // cai para orçamento
+  }
+
+  // 7) quote
+  if (session.stage === "send_quote") {
+    const complexity = session.imageSummary && session.imageSummary.length > 0 ? "medio" : "medio";
+    const price = calcPriceFromSize(session.sizeCm, session.bodyPart, complexity);
+    session.lastPrice = price;
+
+    const quote = msgQuote(price);
+    if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
+
+    await askScheduleButtons(phone, session);
     return;
   }
-  /* STAGE: AGUARDANDO_ESCOLHA_AGENDAMENTO_END */
 
-  // -------------------- ETAPA: AGENDA (após comprovante) --------------------
-  if (session.stage === "agenda") {
-    // captura preferências simples e passa pro dono (manual)
-    const pref = detectCommercialPref(message);
-    const hasDate = detectHasSpecificDate(message);
+  // 8) schedule confirm
+  if (session.stage === "await_schedule_confirm") {
+    let choice = null;
+    if (buttonId === "SCHED_YES") choice = 1;
+    if (buttonId === "SCHED_NO") choice = 2;
+    if (!choice) choice = parseChoice12(message);
 
-    // se ele respondeu algo relacionado à agenda, repassa pro dono
-    if (pref || hasDate || /manh[aã]|tarde|noite|pos|p[oó]s|comercial|segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo|\d{1,2}\/\d{1,2}/i.test(message)) {
-      await notifyOwner(
-        [
-          "📅 PEDIDO DE AGENDA (bot)",
-          `• Cliente: ${String(phone).replace(/\D/g, "")}`,
-          `• Preferência: ${pref || "não informado"}`,
-          `• Mensagem: ${(message || "").slice(0, 400)}`,
-        ].join("\n")
-      );
-
-      session.manualHandoff = true;
-      session.stage = "pos_agenda_manual";
-
-      const reply =
-        "Perfeito.\n\n" +
-        "Vou confirmar na agenda e já te retorno com as opções certinhas de data e horário.";
+    if (choice === 1) {
+      // Aqui você já tinha a lógica avançada no seu JS antigo. Mantemos simples e fazemos handoff
+      const reply = "Fechado ✅ Me manda sua preferência de dia/horário (ex: 15/01 16:00) que eu verifico e te confirmo.";
       if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.stage = "manual_schedule";
+      await notifyOwner(`📅 Cliente quer agendar: ${phone} | peça: ${session.bodyPart} ${session.sizeCm}cm | R$ ${session.lastPrice}`);
       return;
     }
 
-    // se não entendeu, pede de novo de forma simples
-    const reply = msgPerguntaAgenda();
+    if (choice === 2) {
+      const reply = "Tranquilo. Quando quiser seguir, é só me chamar aqui que eu te mando as opções de agenda.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.stage = "pos_orcamento";
+      return;
+    }
+
+    const retry = "Só confirma: quer que eu mande opções de datas? (1=Sim / 2=Não)";
+    if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+    return;
+  }
+
+  // 9) manual schedule -> pix
+  if (session.stage === "manual_schedule") {
+    // Quando você confirmar manualmente o slot, você manda "confirmado" e o bot manda pix.
+    if (/\b(confirmado|fechado|ok|beleza)\b/.test(lower)) {
+      const pix = msgPixSinal();
+      if (!antiRepeat(session, pix)) await zapiSendText(phone, pix);
+      session.stage = "await_receipt";
+      return;
+    }
+
+    // se o cliente pedir pix direto aqui
+    if (askedPix(message)) {
+      const pix = msgPixSinal();
+      if (!antiRepeat(session, pix)) await zapiSendText(phone, pix);
+      session.stage = "await_receipt";
+      return;
+    }
+
+    const reply = "Perfeito. Me manda o dia/horário que você quer e eu confirmo o melhor disponível.";
     if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
 
-  // -------------------- FALLBACK --------------------
-  // se chegou aqui, tenta guiar conforme o que falta
-  if (
-    !session.imageDataUrl &&
-    session.stage !== "inicio" &&
-    session.stage !== "await_first_contact_buttons" &&
-    session.stage !== "await_change_buttons" &&
-    session.stage !== "collect_changes"
-  ) {
-    const reply =
-      "Pra eu te atender certinho, me manda uma *referência em imagem* e me diz *onde no corpo + tamanho aproximado*.";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+  // 10) receipt
+  if (session.stage === "await_receipt") {
+    if (hasImage) {
+      const reply =
+        "Comprovante recebido ✅\n\n" +
+        "Agendamento confirmado. Qualquer dúvida até o dia, é só me chamar.\n\n" +
+        "Antes da sessão:\n" +
+        "• Beba bastante água.\n" +
+        "• Evite álcool no dia anterior.\n" +
+        "• Se alimente bem antes de vir.\n" +
+        "• Se puder, usar creme hidratante na região nos dias anteriores ajuda bastante.";
+      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      session.stage = "finalizado";
+      await notifyOwner(`💸 Comprovante recebido: ${phone}`);
+      return;
+    }
 
-    scheduleFollowup30min(phone, session, "fallback pedindo referência");
+    const reply = "Pra confirmar, preciso da *foto do comprovante* aqui no Whats ✅";
+    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
     return;
   }
 
-  // fallback geral
-  const reply =
-    "Entendi.\n\n" +
-    "Me manda só a referência em imagem (se ainda não mandou) + onde no corpo e tamanho aproximado, que eu já sigo daqui.";
-  if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+  // fallback
+  const fallback =
+    "Pra eu te atender certinho, me manda a *referência em imagem* e me diz *onde no corpo + tamanho em cm*.";
+  if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
 }
 
-// -------------------- Express routes --------------------
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
-
+// -------------------- Routes --------------------
+app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => {
   const miss = missingEnvs();
   res.status(miss.length ? 500 : 200).json({
@@ -3386,53 +833,28 @@ app.get("/health", (req, res) => {
     missing: miss,
     hasOwner: Boolean(ENV.OWNER_PHONE),
     hasPix: Boolean(ENV.PIX_KEY),
+    gcalEnabled: ENV.GCAL_ENABLED,
   });
 });
 
-// Webhook Z-API
+// ✅ Webhook principal (use "/" como no seu código antigo)
 app.post("/", async (req, res) => {
-  console.log("[WEBHOOK HIT]", { hasBody: !!req.body, keys: Object.keys(req.body || {}) });
+  // responde 200 IMEDIATO pra Z-API não re-tentar e não travar
+  res.status(200).json({ ok: true });
+
   try {
-    // responde 200 rápido
-    res.status(200).json({ ok: true });
-
     const inbound = parseZapiInbound(req.body || {});
-    console.log("[INBOUND PARSED]", {
-      phone: inbound.phone,
-      fromMe: inbound.fromMe,
-      type: inbound.messageType,
-      msg: inbound.message?.slice(0, 80),
-      hasImage: !!inbound.imageUrl,
-    });
-
     if (!inbound.phone) return;
-
-    // ignora mensagens enviadas por você
     if (inbound.fromMe) return;
 
-    processMergedInbound(inbound.phone, {
-      phone: inbound.phone,
-      message: inbound.message,
-      imageUrl: inbound.imageUrl,
-      imageMime: inbound.imageMime,
-      contactName: inbound.contactName,
-      messageType: inbound.messageType,
-      payload: inbound.raw,
-    }).catch((e) => {
-      console.error("[PROCESS MERGED ERROR]", e?.message || e);
-    });
+    await handleInbound(inbound.phone, inbound);
   } catch (e) {
     console.error("[WEBHOOK ERROR]", e?.message || e);
-    // sempre 200 para não gerar re-tentativas em loop
-    try {
-      res.status(200).json({ ok: true });
-    } catch {}
   }
 });
 
-// -------------------- Start --------------------
-app.listen(Number(ENV.PORT || 10000), () => {
+app.listen(ENV.PORT, () => {
   const miss = missingEnvs();
-  console.log("🚀 Server on port", ENV.PORT);
+  console.log("🚀 DW BOT ONLINE port", ENV.PORT);
   if (miss.length) console.log("⚠️ Missing ENV:", miss.join(", "));
-}); 
+});
