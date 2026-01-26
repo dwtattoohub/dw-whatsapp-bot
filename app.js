@@ -81,51 +81,44 @@ async function zapiSendText(phone, message) {
   return zapiFetch("/send-text", { phone, message });
 }
 
-async function sendButtonsZapi(phone, text, buttons) {
-  const buttonPayload = {
-    phone,
-    message: text,
-    buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
-  };
+async function sendButtons(phone, text, buttons, label = "menu") {
+  await humanDelay();
 
-  const listPayload = {
-    phone,
-    message: text,
-    title: "Selecione uma opção",
-    buttonText: "Escolher",
-    sections: [
-      {
-        title: "Opções",
-        rows: buttons.map((button) => ({
-          id: button.id,
-          title: button.title,
-          description: "",
-        })),
+  try {
+    const resp = await zapiFetch("/send-button-list", {
+      phone,
+      message: text,
+      buttonList: {
+        title: label,
+        buttons: buttons.map((button) => ({ id: button.id, label: button.title })),
       },
-    ],
-  };
-
-  const attempts = [
-    { path: ENV.ZAPI_BUTTONS_PATH, payload: buttonPayload, label: "buttons" },
-    { path: "/send-button-list", payload: listPayload, label: "button-list" },
-    { path: ENV.ZAPI_LIST_PATH, payload: listPayload, label: "list" },
-  ];
-
-  for (const attempt of attempts) {
-    try {
-      const resp = await zapiFetch(attempt.path, attempt.payload);
-      const respString = typeof resp === "string" ? resp : JSON.stringify(resp || {});
-      if (/NOT_FOUND|error/i.test(respString)) {
-        throw new Error(`ZAPI response indicates error: ${respString.slice(0, 240)}`);
-      }
-      const respPreview = respString.slice(0, 240);
-      console.log("[ZAPI BUTTONS] success on", attempt.path, { phone, label: attempt.label, respPreview });
-      return true;
-    } catch (err) {
-      console.error("[ZAPI BUTTONS] fail on", attempt.path, err?.message || err);
-    }
+    });
+    console.log("[SEND BUTTON LIST OK]", resp);
+    return true;
+  } catch (err) {
+    console.log("[SEND BUTTON LIST FAIL]", err?.message || err);
   }
 
+  try {
+    const resp = await zapiFetch("/send-buttons", {
+      phone,
+      message: text,
+      buttons: buttons.map((button) => ({ id: button.id, title: button.title })),
+    });
+    console.log("[SEND BUTTONS OK]", resp);
+    return true;
+  } catch (err) {
+    console.log("[SEND BUTTONS FAIL]", err?.message || err);
+  }
+
+  if (buttons.length >= 2) {
+    await zapiSendText(
+      phone,
+      `${text}\n1) ${buttons[0].title}\n2) ${buttons[1].title}\nResponda 1 ou 2.`
+    );
+  } else {
+    await zapiSendText(phone, text);
+  }
   return false;
 }
 
@@ -138,7 +131,7 @@ async function notifyOwner(text) {
 
 async function handoffToManual(phone, session, reason, lastMessage) {
   const reply = msgAskContinueBudget();
-  if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+  if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
   await notifyOwner(`📌 Handoff manual (${reason}): ${phone} | msg: ${lastMessage || "-"}`);
 }
 
@@ -210,9 +203,12 @@ function parseZapiInbound(body) {
     body?.data?.buttonId ||
     body?.message?.button?.id ||
     body?.message?.interactive?.button_reply?.id ||
+    body?.message?.interactive?.list_reply?.id ||
     body?.message?.button_reply?.id ||
     body?.message?.buttonsResponseMessage?.selectedButtonId ||
-    body?.messages?.[0]?.button?.payload ||
+    body?.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    body?.listReply?.id ||
+    body?.data?.listReply?.id ||
     null;
 
   const bTitle =
@@ -221,8 +217,12 @@ function parseZapiInbound(body) {
     body?.data?.buttonTitle ||
     body?.message?.button?.title ||
     body?.message?.interactive?.button_reply?.title ||
+    body?.message?.interactive?.list_reply?.title ||
     body?.message?.button_reply?.title ||
     body?.message?.buttonsResponseMessage?.selectedDisplayText ||
+    body?.message?.listResponseMessage?.title ||
+    body?.listReply?.title ||
+    body?.data?.listReply?.title ||
     null;
 
   const inbound = {
@@ -334,42 +334,26 @@ function parseBodyPart(text) {
   return null;
 }
 
-function calcPriceFromSize(sizeCm, bodyPart, complexity = "medio") {
-  // Base do seu JS (simplificado e estável)
-  const base = 220;
-  const perCm = 28;
+function calcHoursAndPrice(sizeCm, complexityLevel) {
+  const base = sizeCm <= 12 ? 1.2 : sizeCm <= 18 ? 2 : sizeCm <= 25 ? 3 : 4;
 
-  let price = base + sizeCm * perCm;
+  const multiplier =
+    complexityLevel === "alta" ? 1.5 : complexityLevel === "media" ? 1.2 : 1.0;
 
-  const regionMultMap = {
-    antebraço: 1.0,
-    braço: 1.0,
-    ombro: 1.05,
-    perna: 1.05,
-    coxa: 1.08,
-    panturrilha: 1.08,
-    peito: 1.15,
-    costela: 1.18,
-    costas: 1.22,
-    pescoço: 1.12,
-    mão: 1.12,
-  };
-  price *= regionMultMap[bodyPart] || 1.06;
+  const hours = Math.max(1, base * multiplier);
 
-  const compMap = { baixo: 0.98, medio: 1.06, alto: 1.14 };
-  price *= compMap[complexity] || 1.06;
+  const firstHour = 130;
+  const nextHours = Math.max(0, hours - 1) * 120;
+  const finalPrice = Math.round(firstHour + nextHours);
 
-  // arredonda e limita
-  price = Math.round(price / 10) * 10;
-  price = Math.max(350, Math.min(2500, price));
-  return price;
+  return { hours, finalPrice };
 }
 
 // -------------------- Mensagens --------------------
 function msgSaudacaoPrimeiroContato(name) {
   const nm = safeName(name);
   const greet = nm ? `Oi, ${nm}!` : "Oi!";
-  return `${greet} Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\nPra eu te direcionar certinho, escolhe uma opção abaixo:`;
+  return `${greet} Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\nPra te direcionar certinho, escolha uma opção abaixo:`;
 }
 
 function msgAddress() {
@@ -437,13 +421,10 @@ function msgBeforeQuoteSummary(sizeCm, bodyPart, imageSummary) {
   return lines.join("\n");
 }
 
-function msgQuote(finalPrice) {
+function msgQuote(finalPrice, hours) {
   return (
-    `Pelo tamanho e complexidade do que você me enviou, o investimento fica em *R$ ${finalPrice}*.\n\n` +
-    "Formas de pagamento:\n" +
-    "• Pix\n" +
-    "• Débito\n" +
-    "• Crédito em até 12x (+ acréscimo da máquina)\n\n" +
+    `Pelo tamanho e complexidade do trabalho, o investimento fica em *R$ ${finalPrice}*.\n` +
+    `Estimativa profissional: cerca de *${hours.toFixed(1)}h* de execução.\n\n` +
     "Se quiser, eu já te mando opções de datas e horários."
   );
 }
@@ -463,11 +444,11 @@ function msgPixSinal() {
 }
 
 // -------------------- Image analysis (OpenAI) --------------------
-async function describeImageShort(imageUrl) {
+async function analyzeImageDetails(url) {
   if (!openai) return "";
   const resp = await openai.chat.completions.create({
     model: "gpt-4o",
-    temperature: 0.25,
+    temperature: 0.2,
     messages: [
       { role: "system", content: BASE_SYSTEM },
       {
@@ -476,10 +457,16 @@ async function describeImageShort(imageUrl) {
           {
             type: "text",
             text:
-              "Analise a referência e gere 1-2 frases objetivas sobre complexidade (sombras, transições, volume, contraste). " +
-              "Não fale de preço, não fale de horas.",
+              "Analise a referência e descreva:\n" +
+              "• Complexidade de sombras\n" +
+              "• Contraste\n" +
+              "• Volume e formas\n" +
+              "• Detalhes finos\n" +
+              "• Dificuldade técnica\n" +
+              "• Áreas que exigem mais tempo\n" +
+              "Escreva como tatuador profissional. Não cite preços.",
           },
-          { type: "image_url", image_url: { url: imageUrl } },
+          { type: "image_url", image_url: { url } },
         ],
       },
     ],
@@ -540,20 +527,23 @@ function antiRepeat(session, text) {
   return false;
 }
 
+async function humanDelay() {
+  await new Promise((resolve) => setTimeout(resolve, 1200 + Math.random() * 800));
+}
+
+async function sendTextWithDelay(phone, message) {
+  await humanDelay();
+  return zapiSendText(phone, message);
+}
+
 // -------------------- Buttons helpers --------------------
 async function sendFirstContactButtons(phone, session, contactName) {
   const text = msgSaudacaoPrimeiroContato(contactName);
   const buttons = [
-    { id: "first_new_budget", title: "Orçamento novo (do zero)" },
-    { id: "first_continue_budget", title: "Continuar orçamento em andamento" },
+    { id: "first_new_budget", title: "Orçamento novo" },
+    { id: "first_continue_budget", title: "Já tenho orçamento" },
   ];
-  const sent = await sendButtonsZapi(phone, text, buttons);
-  if (!sent) {
-    await zapiSendText(
-      phone,
-      `${text}\n1) Orçamento novo (do zero)\n2) Continuar orçamento em andamento\nResponde 1 ou 2.`
-    );
-  }
+  await sendButtons(phone, text, buttons, "primeiro_contato");
   session.stage = "await_first_contact_buttons";
   session.awaitingFirstContact = true;
   session.greeted = true;
@@ -567,10 +557,7 @@ async function askChangeButtons(phone, session) {
     { id: "CHG_YES", title: "Sim" },
     { id: "CHG_NO", title: "Não" },
   ];
-  const sent = await sendButtonsZapi(phone, text, buttons);
-  if (!sent) {
-    await zapiSendText(phone, `${text}\n1) Sim\n2) Não\nResponde 1 ou 2.`);
-  }
+  await sendButtons(phone, text, buttons, "alteracao");
   session.awaitingChangeConfirm = true;
   session.stage = "await_change_confirm";
 }
@@ -581,10 +568,7 @@ async function askScheduleButtons(phone, session) {
     { id: "SCHED_YES", title: "Sim" },
     { id: "SCHED_NO", title: "Não" },
   ];
-  const sent = await sendButtonsZapi(phone, text, buttons);
-  if (!sent) {
-    await zapiSendText(phone, `${text}\n1) Sim\n2) Não\nResponde 1 ou 2.`);
-  }
+  await sendButtons(phone, text, buttons, "agenda");
   session.awaitingScheduleConfirm = true;
   session.stage = "await_schedule_confirm";
 }
@@ -623,19 +607,19 @@ async function handleInbound(phone, inbound) {
     resetSession(phone);
     const s2 = getSession(phone);
     const reply = "Atendimento reiniciado.\n\nMe manda a referência em imagem e me diz onde no corpo + tamanho em cm.";
-    if (!antiRepeat(s2, reply)) await zapiSendText(phone, reply);
+    if (!antiRepeat(s2, reply)) await sendTextWithDelay(phone, reply);
     return;
   }
 
   // address/pix quick intents
   if (askedAddress(message)) {
     const reply = msgAddress();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
     return;
   }
   if (askedPain(message)) {
     const reply = msgDorResposta();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
     return;
   }
 
@@ -643,7 +627,7 @@ async function handleInbound(phone, inbound) {
   if (!session.awaitingBWAnswer && detectColorIntent(message)) {
     session.awaitingBWAnswer = true;
     const reply = msgSoBlackGrey();
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
     return;
   }
   if (session.awaitingBWAnswer) {
@@ -653,13 +637,13 @@ async function handleInbound(phone, inbound) {
     } else if (/\b(nao|não|quero colorido|prefiro colorido)\b/.test(lower)) {
       const reply =
         "Entendi.\n\nComo eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender no colorido do jeito que você quer.\n\nSe decidir fazer em preto e cinza, é só me chamar.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       session.stage = "finalizado";
       return;
     } else {
       // ainda aguardando resposta clara
       const reply = "Só confirma pra mim: você topa fazer em *preto e cinza*? (Sim/Não)";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       return;
     }
   }
@@ -672,7 +656,7 @@ async function handleInbound(phone, inbound) {
   if (isFreshStart) {
     if (inGreetCooldown) {
       const reply = "Me responde 1 ou 2 pra eu te direcionar certinho.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       return;
     }
     await sendFirstContactButtons(phone, session, session.name || "");
@@ -697,7 +681,7 @@ async function handleInbound(phone, inbound) {
       session.awaitingFirstContact = false;
       session.stage = "collect_reference";
       const reply = msgAskNewBudgetBasics();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       return;
     }
 
@@ -722,7 +706,7 @@ async function handleInbound(phone, inbound) {
     }
     const retry =
       "Só pra eu te direcionar certinho: é orçamento novo (1) ou em andamento (2)?";
-    if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+    if (!antiRepeat(session, retry)) await sendTextWithDelay(phone, retry);
     return;
   }
 
@@ -730,7 +714,7 @@ async function handleInbound(phone, inbound) {
   if (session.stage === "collect_reference") {
     if (!hasImage) {
       const reply = "Quando puder, me manda a *referência em imagem* (print/foto).";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       return;
     }
 
@@ -738,19 +722,19 @@ async function handleInbound(phone, inbound) {
     session.stage = "collect_body_size";
 
     // IA: resumo curto
-    const sum = await describeImageShort(inbound.imageUrl);
+    const sum = await analyzeImageDetails(inbound.imageUrl);
     session.imageSummary = sum;
 
     if (sum) {
-      const msg = "Recebi a referência.\n\nPra esse projeto ficar bem executado, ele exige:\n\n" + sum;
-      if (!antiRepeat(session, msg)) await zapiSendText(phone, msg);
+      const msg = "Recebi a referência!\n\nAnálise técnica:\n" + sum;
+      if (!antiRepeat(session, msg)) await sendTextWithDelay(phone, msg);
     } else {
       const msg = "Recebi a referência ✅";
-      if (!antiRepeat(session, msg)) await zapiSendText(phone, msg);
+      if (!antiRepeat(session, msg)) await sendTextWithDelay(phone, msg);
     }
 
     const ask = msgAskBodyAndSize();
-    if (!antiRepeat(session, ask)) await zapiSendText(phone, ask);
+    if (!antiRepeat(session, ask)) await sendTextWithDelay(phone, ask);
     return;
   }
 
@@ -765,20 +749,20 @@ async function handleInbound(phone, inbound) {
     // se mandou imagem de novo, atualiza referência
     if (hasImage) {
       session.referenceImageUrl = inbound.imageUrl;
-      const sum = await describeImageShort(inbound.imageUrl);
+      const sum = await analyzeImageDetails(inbound.imageUrl);
       session.imageSummary = sum;
     }
 
     if (!session.bodyPart || !session.sizeCm) {
       const reply = msgAskBodyAndSize();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       return;
     }
 
     // pronto -> perguntar alteração (buttons)
     session.stage = "await_change_confirm";
     const before = msgBeforeQuoteSummary(session.sizeCm, session.bodyPart, session.imageSummary);
-    if (!antiRepeat(session, before)) await zapiSendText(phone, before);
+    if (!antiRepeat(session, before)) await sendTextWithDelay(phone, before);
     await askChangeButtons(phone, session);
     return;
   }
@@ -793,7 +777,7 @@ async function handleInbound(phone, inbound) {
     if (choice === 1) {
       session.stage = "collect_change_notes";
       const reply = msgAskChangeDetails();
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       return;
     }
 
@@ -803,7 +787,7 @@ async function handleInbound(phone, inbound) {
       // cai para orçamento
     } else {
       const retry = "Só confirma: quer alterar algo? (1=Sim / 2=Não)";
-      if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+      if (!antiRepeat(session, retry)) await sendTextWithDelay(phone, retry);
       return;
     }
   }
@@ -818,19 +802,19 @@ async function handleInbound(phone, inbound) {
       session.changeNotes = (session.changeNotes ? session.changeNotes + "\n" : "") + message;
     }
     const ack = "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.";
-    if (!antiRepeat(session, ack)) await zapiSendText(phone, ack);
+    if (!antiRepeat(session, ack)) await sendTextWithDelay(phone, ack);
     session.stage = "send_quote";
     // cai para orçamento
   }
 
   // 7) quote
   if (session.stage === "send_quote") {
-    const complexity = session.imageSummary && session.imageSummary.length > 0 ? "medio" : "medio";
-    const price = calcPriceFromSize(session.sizeCm, session.bodyPart, complexity);
-    session.lastPrice = price;
+    const complexity = norm(session.imageSummary).includes("detalh") ? "alta" : "media";
+    const { hours, finalPrice } = calcHoursAndPrice(session.sizeCm, complexity);
+    session.lastPrice = finalPrice;
 
-    const quote = msgQuote(price);
-    if (!antiRepeat(session, quote)) await zapiSendText(phone, quote);
+    const quote = msgQuote(finalPrice, hours);
+    if (!antiRepeat(session, quote)) await sendTextWithDelay(phone, quote);
 
     await askScheduleButtons(phone, session);
     return;
@@ -846,7 +830,7 @@ async function handleInbound(phone, inbound) {
     if (choice === 1) {
       // Aqui você já tinha a lógica avançada no seu JS antigo. Mantemos simples e fazemos handoff
       const reply = "Fechado ✅ Me manda sua preferência de dia/horário (ex: 15/01 16:00) que eu verifico e te confirmo.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       session.stage = "manual_schedule";
       await notifyOwner(`📅 Cliente quer agendar: ${phone} | peça: ${session.bodyPart} ${session.sizeCm}cm | R$ ${session.lastPrice}`);
       return;
@@ -854,13 +838,13 @@ async function handleInbound(phone, inbound) {
 
     if (choice === 2) {
       const reply = "Tranquilo. Quando quiser seguir, é só me chamar aqui que eu te mando as opções de agenda.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       session.stage = "pos_orcamento";
       return;
     }
 
     const retry = "Só confirma: quer que eu mande opções de datas? (1=Sim / 2=Não)";
-    if (!antiRepeat(session, retry)) await zapiSendText(phone, retry);
+    if (!antiRepeat(session, retry)) await sendTextWithDelay(phone, retry);
     return;
   }
 
@@ -869,7 +853,7 @@ async function handleInbound(phone, inbound) {
     // Quando você confirmar manualmente o slot, você manda "confirmado" e o bot manda pix.
     if (/\b(confirmado|fechado|ok|beleza)\b/.test(lower)) {
       const pix = msgPixSinal();
-      if (!antiRepeat(session, pix)) await zapiSendText(phone, pix);
+      if (!antiRepeat(session, pix)) await sendTextWithDelay(phone, pix);
       session.stage = "await_receipt";
       return;
     }
@@ -877,13 +861,13 @@ async function handleInbound(phone, inbound) {
     // se o cliente pedir pix direto aqui
     if (askedPix(message)) {
       const pix = msgPixSinal();
-      if (!antiRepeat(session, pix)) await zapiSendText(phone, pix);
+      if (!antiRepeat(session, pix)) await sendTextWithDelay(phone, pix);
       session.stage = "await_receipt";
       return;
     }
 
     const reply = "Perfeito. Me manda o dia/horário que você quer e eu confirmo o melhor disponível.";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
     return;
   }
 
@@ -898,21 +882,21 @@ async function handleInbound(phone, inbound) {
         "• Evite álcool no dia anterior.\n" +
         "• Se alimente bem antes de vir.\n" +
         "• Se puder, usar creme hidratante na região nos dias anteriores ajuda bastante.";
-      if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+      if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
       session.stage = "finalizado";
       await notifyOwner(`💸 Comprovante recebido: ${phone}`);
       return;
     }
 
     const reply = "Pra confirmar, preciso da *foto do comprovante* aqui no Whats ✅";
-    if (!antiRepeat(session, reply)) await zapiSendText(phone, reply);
+    if (!antiRepeat(session, reply)) await sendTextWithDelay(phone, reply);
     return;
   }
 
   // fallback
   const fallback =
     "Pra eu te atender certinho, me manda a *referência em imagem* e me diz *onde no corpo + tamanho em cm*.";
-  if (!antiRepeat(session, fallback)) await zapiSendText(phone, fallback);
+  if (!antiRepeat(session, fallback)) await sendTextWithDelay(phone, fallback);
 }
 
 // -------------------- Routes --------------------
