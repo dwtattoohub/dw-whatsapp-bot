@@ -173,6 +173,7 @@ function newSession() {
   return {
     stage: "start",
     lastSentHash: "",
+    lastMenuAt: 0,
     agentContext: [],
     data: {
       name: "",
@@ -519,6 +520,10 @@ function pickFirstBase64(...vals) {
   return null;
 }
 
+function isEmptyInbound(inbound) {
+  return !inbound.message && !inbound.buttonId && !inbound.imageUrl && !inbound.imageBase64;
+}
+
 function parseInbound(body) {
   const phone =
     body?.phone ||
@@ -548,6 +553,10 @@ function parseInbound(body) {
     body?.Body ||
     body?.data?.message ||
     body?.data?.text ||
+    body?.data?.message?.conversation ||
+    body?.data?.message?.extendedTextMessage?.text ||
+    body?.message?.conversation ||
+    body?.message?.extendedTextMessage?.text ||
     "";
 
   const imageUrl = pickFirstString(
@@ -607,20 +616,32 @@ function parseInbound(body) {
   const buttonId =
     body?.buttonId ||
     body?.data?.buttonId ||
+    body?.data?.message?.interactive?.button_reply?.id ||
+    body?.data?.message?.interactive?.list_reply?.id ||
     body?.message?.interactive?.button_reply?.id ||
+    body?.message?.interactive?.list_reply?.id ||
+    body?.data?.message?.buttonsResponseMessage?.selectedButtonId ||
+    body?.data?.message?.interactive?.button_reply?.title ||
+    body?.data?.message?.interactive?.list_reply?.title ||
+    body?.data?.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
     body?.message?.buttonsResponseMessage?.selectedButtonId ||
     body?.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    body?.data?.selectedButtonId ||
+    body?.data?.selectedRowId ||
+    body?.data?.selectedId ||
     null;
 
   const buttonTitle =
     body?.buttonTitle ||
     body?.data?.buttonTitle ||
     body?.message?.interactive?.button_reply?.title ||
+    body?.message?.interactive?.list_reply?.title ||
+    body?.data?.message?.buttonsResponseMessage?.selectedDisplayText ||
+    body?.data?.message?.listResponseMessage?.singleSelectReply?.title ||
     body?.message?.buttonsResponseMessage?.selectedDisplayText ||
-    body?.message?.listResponseMessage?.title ||
     null;
 
-  const text = (buttonTitle || (typeof msg === "string" ? msg : "") || "").toString().trim();
+  const text = (buttonTitle || (typeof msg === "string" ? msg : "") || buttonId || "").toString().trim();
 
   return {
     phone: phone ? String(phone) : null,
@@ -689,9 +710,17 @@ const AGENT_SYSTEM = (ENV.AGENT_SYSTEM_PROMPT || "").trim() || DEFAULT_AGENT_SYS
 function decideFirstChoice(inbound) {
   const id = inbound.buttonId;
   const t = norm(inbound.message);
+  const idNorm = norm(inbound.buttonId);
 
   if (id === "first_new_budget") return "new_budget";
   if (id === "first_other_doubts") return "other_doubts";
+
+  if (t === "orcamento novo") return "new_budget";
+  if (t === "outras duvidas") return "other_doubts";
+
+  if (idNorm.includes("orcamento")) return "new_budget";
+  if (idNorm.includes("duvida")) return "other_doubts";
+
 
   if (t.includes("orcamento") || t.includes("orçamento") || t === "1") return "new_budget";
   if (t.includes("duvida") || t.includes("dúvida") || t.includes("falar") || t === "2") return "other_doubts";
@@ -734,6 +763,14 @@ async function handleInbound(phone, inbound) {
     if (inbound.imageBase64) session.data.referenceImageBase64 = inbound.imageBase64;
     setMediaCache(phone, { imageUrl: inbound.imageUrl, imageBase64: inbound.imageBase64 });
     scheduleSaveStore();
+     if (nowMs() - session.lastMenuAt < 20000) {
+      return;
+    }
+
+    session.lastMenuAt = nowMs();
+    scheduleSaveStore();
+
+
   }
 
   // 2) Tenta body/size no texto
@@ -769,6 +806,10 @@ async function handleInbound(phone, inbound) {
   }
 
   if (session.stage === "await_first_choice") {
+     if (isEmptyInbound(inbound)) {
+      return;
+    }
+
     const choice = decideFirstChoice(inbound);
 
     if (choice === "other_doubts") {
@@ -797,6 +838,15 @@ async function handleInbound(phone, inbound) {
       "Só me confirma como você quer seguir:\n\n" +
       "• Orçamento novo\n" +
       "• Outras dúvidas";
+
+    if (nowMs() - session.lastMenuAt < 20000) {
+      return;
+    }
+
+    session.lastMenuAt = nowMs();
+    scheduleSaveStore();
+
+
     return sendButtons(phone, txt, [
       { id: "first_new_budget", title: "Orçamento novo" },
       { id: "first_other_doubts", title: "Outras dúvidas" },
@@ -1106,6 +1156,11 @@ app.post("/", async (req, res) => {
       imageUrl: inbound.imageUrl ? inbound.imageUrl.slice(0, 120) : null,
       message: inbound.message ? inbound.message.slice(0, 120) : "",
     });
+
+    if (isEmptyInbound(inbound)) {
+      console.log("[IGNORED] empty inbound event (no text/button/media)");
+      return;
+    }
 
     if (!inbound.phone) {
       console.log("[NO PHONE] body sample:", JSON.stringify(req.body || {}).slice(0, 1200));
