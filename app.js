@@ -233,6 +233,10 @@ function resetSession(phone) {
 
 // -------------------- LOCK por telefone (evita paralelismo) --------------------
 const PHONE_LOCKS = new Map();
+
+// ✅ In-flight guards (evita corrida entre webhooks simultâneos)
+const INFLIGHT_MSG = new Set(); // messageId
+const INFLIGHT_FP = new Set();  // fingerprint
 async function withPhoneLock(phone, fn) {
   const prev = PHONE_LOCKS.get(phone) || Promise.resolve();
   let release;
@@ -1297,25 +1301,48 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    // ✅ idempotência: messageId + fingerprint (retry-safe)
+    // ✅ fingerprint calculado já aqui
     const fp = makeFingerprint(inbound);
 
-    if (inbound.messageId && wasProcessed(inbound.messageId)) {
-      console.log("[IGNORED] already processed msgId:", inbound.messageId);
+    // ✅ In-flight guard (bloqueia duplicata simultânea)
+    if (inbound.messageId && INFLIGHT_MSG.has(inbound.messageId)) {
+      console.log("[IGNORED] inflight msgId:", inbound.messageId);
       return;
     }
-    if (fp && wasProcessedFp(fp)) {
-      console.log("[IGNORED] already processed fp:", fp);
+    if (fp && INFLIGHT_FP.has(fp)) {
+      console.log("[IGNORED] inflight fp:", fp);
       return;
     }
 
-    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
-    if (fp) markProcessedFp(fp, inbound.phone);
+    if (inbound.messageId) INFLIGHT_MSG.add(inbound.messageId);
+    if (fp) INFLIGHT_FP.add(fp);
 
+    // ✅ lock por telefone primeiro, depois idempotência
     await withPhoneLock(inbound.phone, async () => {
-      console.log("[LOCK] processing phone:", inbound.phone);
-      await handleInbound(inbound.phone, inbound);
-      console.log("[DONE] processed phone:", inbound.phone);
+      try {
+        console.log("[LOCK] processing phone:", inbound.phone);
+
+        // ✅ idempotência dentro do lock (sem corrida)
+        if (inbound.messageId && wasProcessed(inbound.messageId)) {
+          console.log("[IGNORED] already processed msgId:", inbound.messageId);
+          return;
+        }
+        if (fp && wasProcessedFp(fp)) {
+          console.log("[IGNORED] already processed fp:", fp);
+          return;
+        }
+
+        if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
+        if (fp) markProcessedFp(fp, inbound.phone);
+
+        await handleInbound(inbound.phone, inbound);
+
+        console.log("[DONE] processed phone:", inbound.phone);
+      } finally {
+        // ✅ sempre libera o inflight
+        if (inbound.messageId) INFLIGHT_MSG.delete(inbound.messageId);
+        if (fp) INFLIGHT_FP.delete(fp);
+      }
     });
   } catch (e) {
     console.error("[WEBHOOK ERROR]", e?.message || e);
