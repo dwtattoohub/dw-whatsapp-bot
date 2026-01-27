@@ -1,16 +1,17 @@
 // ============================================================
-// DW WhatsApp Bot — Versão A (AGENTE COMPLETO GPT-4o) — FIXED
+// DW WhatsApp Bot — Versão A (AGENTE COMPLETO GPT-4o) — FIX REAL
 // ============================================================
-// FIX 1) parseInbound robusto (pega phone/message/button/image em vários formatos Z-API)
-// FIX 2) fs errado (callback) -> usar fs/promises corretamente (evita: cb argument must be function)
-// PLUS: ignora fromMe (pra não responder a si mesmo) + log quando vier webhook sem phone
+// FIX PRINCIPAL: força JSON no OpenAI (response_format json_object)
+// + retry se vier inválido
+// + não contamina agentContext com resposta inválida
+// + parseInbound robusto (Z-API varia payload)
 // ============================================================
 
 import express from "express";
 import crypto from "crypto";
 import OpenAI from "openai";
-import fs from "fs/promises"; // ✅ promises
-import fssync from "fs";      // ✅ apenas se precisar sync
+import fs from "fs/promises";
+import fssync from "fs";
 import path from "path";
 
 const app = express();
@@ -30,20 +31,27 @@ const ENV = {
 
   // OpenAI
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-  OPENAI_MODEL: "gpt-4o",
+  OPENAI_MODEL: process.env.OPENAI_MODEL || "gpt-4o",
 
   // Persistência
-  STORE_PATH: "./dw_store.json",
+  STORE_PATH: process.env.STORE_PATH || "./dw_store.json",
 };
 
+function missingEnvs() {
+  const miss = [];
+  if (!ENV.ZAPI_INSTANCE_ID) miss.push("ZAPI_INSTANCE_ID");
+  if (!ENV.ZAPI_INSTANCE_TOKEN) miss.push("ZAPI_INSTANCE_TOKEN");
+  if (!ENV.ZAPI_CLIENT_TOKEN) miss.push("ZAPI_CLIENT_TOKEN");
+  if (!ENV.OPENAI_API_KEY) miss.push("OPENAI_API_KEY");
+  return miss;
+}
+
 // -------------------- Store persistente --------------------
-const STORE = {
-  sessions: {},
-};
+const STORE = { sessions: {} };
 
 async function loadStore() {
   try {
-    const raw = await fs.readFile(ENV.STORE_PATH, "utf8"); // ✅ promises
+    const raw = await fs.readFile(ENV.STORE_PATH, "utf8");
     const data = JSON.parse(raw);
     STORE.sessions = data.sessions || {};
   } catch {
@@ -69,14 +77,13 @@ function scheduleSaveStore() {
     }
   }, 250);
 }
-
 function saveStore() {
   scheduleSaveStore();
 }
 
 // ------- RESET AUTOMÁTICO DO STORE NO BOOT (opcional) -------
-// OBS: Em Render free sem disco persistente, isso não faz diferença.
-// Se você quiser manter sessões entre deploys (com Persistent Disk), DESLIGA isso.
+// Se você NÃO quer resetar, comente esse bloco.
+// OBS: Render free não mantém disco entre restarts (sem Persistent Disk).
 try {
   fssync.writeFileSync(ENV.STORE_PATH, JSON.stringify({ sessions: {} }, null, 2));
   console.log("🔥 Store resetado automaticamente no boot");
@@ -98,10 +105,10 @@ function newSession() {
       imageSummary: "",
       estHours: null,
       estTotal: null,
+      lastScheduleOptions: [],
     },
   };
 }
-
 function getSession(phone) {
   if (!STORE.sessions[phone]) {
     STORE.sessions[phone] = newSession();
@@ -109,7 +116,6 @@ function getSession(phone) {
   }
   return STORE.sessions[phone];
 }
-
 function resetSession(phone) {
   STORE.sessions[phone] = newSession();
   saveStore();
@@ -119,7 +125,6 @@ function resetSession(phone) {
 function hash(t) {
   return crypto.createHash("md5").update(String(t)).digest("hex");
 }
-
 function antiRepeat(session, text) {
   const h = hash(text);
   if (session.lastSentHash === h) return true;
@@ -141,6 +146,9 @@ async function zapiFetch(apiPath, payload) {
   });
 
   const text = await resp.text().catch(() => "");
+  if (!resp.ok) {
+    throw new Error(`ZAPI ${resp.status}: ${text}`);
+  }
   try {
     return JSON.parse(text);
   } catch {
@@ -149,13 +157,14 @@ async function zapiFetch(apiPath, payload) {
 }
 
 async function sendText(phone, text) {
-  await new Promise((r) => setTimeout(r, 1000 + Math.random() * 600));
+  await new Promise((r) => setTimeout(r, 900 + Math.random() * 600));
   return zapiFetch("/send-text", { phone, message: text });
 }
 
 async function sendButtons(phone, text, buttons) {
-  await new Promise((r) => setTimeout(r, 1000 + Math.random() * 600));
+  await new Promise((r) => setTimeout(r, 900 + Math.random() * 600));
 
+  // 1) button-list
   try {
     await zapiFetch("/send-button-list", {
       phone,
@@ -168,6 +177,7 @@ async function sendButtons(phone, text, buttons) {
     return;
   } catch {}
 
+  // 2) buttons
   try {
     await zapiFetch("/send-buttons", {
       phone,
@@ -177,6 +187,7 @@ async function sendButtons(phone, text, buttons) {
     return;
   } catch {}
 
+  // 3) fallback texto
   let fallback = text + "\n";
   buttons.forEach((b, i) => {
     fallback += `${i + 1}) ${b.title}\n`;
@@ -184,7 +195,7 @@ async function sendButtons(phone, text, buttons) {
   await sendText(phone, fallback);
 }
 
-// -------------------- Horários aleatórios --------------------
+// -------------------- Horários aleatórios (4 botões) --------------------
 function randomPick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -200,97 +211,65 @@ function generateScheduleButtons() {
   }
 
   // pós almoço (13-16)
-  const d1 = new Date(today.getTime() + 86400000 * (1 + Math.floor(Math.random() * 3)));
+  const d1 = new Date(today.getTime() + 86400000 * (1 + Math.floor(Math.random() * 4)));
   const h1 = randomPick(["13:00", "14:00", "15:00", "16:00"]);
 
   // noite (19-20)
-  const d2 = new Date(today.getTime() + 86400000 * (2 + Math.floor(Math.random() * 4)));
+  const d2 = new Date(today.getTime() + 86400000 * (2 + Math.floor(Math.random() * 6)));
   const h2 = randomPick(["19:00", "20:00"]);
 
-  // fim de semana
+  // fim de semana (próximo sab/dom)
   const d3 = new Date(today.getTime());
-  while (d3.getDay() !== 0 && d3.getDay() !== 6) d3.setDate(d3.getDate() + 1);
+  for (let i = 0; i < 14; i++) {
+    if (d3.getDay() === 0 || d3.getDay() === 6) break;
+    d3.setDate(d3.getDate() + 1);
+  }
   const h3 = randomPick(["14:00", "15:00", "16:00", "17:00", "18:00", "19:00"]);
 
   return [
     { id: "sched_opt1", title: format(d1, h1) },
     { id: "sched_opt2", title: format(d2, h2) },
     { id: "sched_opt3", title: format(d3, h3) },
-    { id: "sched_other", title: "Outro horário" },
+    { id: "sched_other", title: "Outro horário (me diz qual)" },
   ];
 }
 
-// -------------------- OpenAI (AGENTE COMPLETO) --------------------
+// -------------------- OpenAI --------------------
 const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
 
-// -------------------- AGENT SYSTEM (DW TATTOOER) --------------------
+// -------------------- AGENT SYSTEM --------------------
 const AGENT_SYSTEM = `
-###############################################
-### AGENT SYSTEM — DW TATTOOER (VERSÃO FINAL)
-###############################################
-IDENTIDADE
 Você é o DW Tattooer atendendo no WhatsApp.
-Tom humano, direto, profissional, seguro e simpático — sem ser robótico.
-Nunca diga que é IA, bot, agente, modelo, sistema ou automação.
-Não assine mensagens.
-Você sempre soa como um tatuador real falando com o cliente.
+Tom humano, profissional e direto. Nunca diga que é IA/bot/agente. Não assine.
+Você trabalha apenas com realismo preto e cinza (black & grey) e whip shading.
 
-ESPECIALIDADE
-Você trabalha exclusivamente com:
-• Realismo preto e cinza (black & grey)
-• Whip shading
-• Criação autoral fiel à referência
-• Encaixe real no corpo
-• Técnica para envelhecimento perfeito
+REGRA CRÍTICA:
+Responda SEMPRE em JSON válido (um único objeto). Sem texto fora do JSON.
 
-REGRAS ABSOLUTAS
-1. Nunca use palavras repetidas como “perfeito” em excesso.
-2. Seja humano e profissional, sem puxar saco.
-3. Sempre responda EXCLUSIVAMENTE em JSON com esta estrutura:
+Formato obrigatório:
 {
   "text": "mensagem a enviar",
-  "buttons": [
-    {"id":"id_do_botao","title":"Título do botão"}
-  ],
+  "buttons": [{"id":"x","title":"y"}],
   "action": "NONE | HANDOFF_TO_OWNER | RESET_SESSION",
-  "set": { "stage": "nome_do_stage", "handoff": true/false }
+  "set": {"stage":"nome_stage"}
 }
-4. Não gere texto fora do JSON.
-5. Se faltar qualquer informação do cliente, pergunte de forma direta.
 
-SAUDAÇÃO INICIAL
-"text": "Oi, aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading. Valeu por chegar e confiar no meu trampo. Como posso te ajudar hoje?"
-Botões:
-1) {"id":"first_new_budget","title":"Orçamento novo"}
-2) {"id":"first_other_doubts","title":"Outras dúvidas"}
+FLUXO:
+- FIRST_CONTACT: saudação + botões: Orçamento novo / Outras dúvidas.
+- Outras dúvidas => action HANDOFF_TO_OWNER (mensagem humana).
+- NEW_BUDGET: pedir referência em imagem + local no corpo + tamanho em cm.
+- IMAGE_RECEIVED: confirmar que recebeu e perguntar se quer ajustar algo (edit_yes/edit_no).
+- EDIT_YES: pedir a ideia / o que quer adicionar ou remover.
+- EDIT_NO: seguir para orçamento (explicar em 1–3 linhas e mostrar valores se existirem em session).
+- Quando for hora de agendar, devolver 4 botões de agenda que vêm do backend em extra.scheduleButtons (use exatamente esses botões).
 
-→ Se o cliente escolher “Outras dúvidas”, retorne:
-{ "action":"HANDOFF_TO_OWNER", "text":"Claro, me chama aqui e eu te ajudo direto." }
-
-FLUXO ORÇAMENTO NOVO
-Quando o cliente clicar “Orçamento novo”, peça:
-• referência em imagem • local no corpo • tamanho em cm
-
-Após receber a referência, retorne botões:
-1) {"id":"edit_yes","title":"Quero ajustar algo"}
-2) {"id":"edit_no","title":"Pode seguir"}
-
-ORÇAMENTO
-Explique em 1–3 linhas e depois apresente:
-• R$ session.data.estTotal
-• session.data.estHours horas estimadas
-Pergunte: "Quer que eu te mande opções de datas e horários?"
-
-AGENDAMENTO
-Sempre 4 botões:
-1) pós-almoço 2) noite 3) fim de semana 4) Outro horário
-###############################################
-### FIM DO AGENT SYSTEM
-###############################################
+EVITAR:
+- repetir "perfeito"
+- frases robóticas
 `;
 
-// -------------------- Função: chamar o agente GPT --------------------
-async function agentReply(session, inboundMessage, extraPayload = {}) {
+// -------------------- Agent call (FORÇA JSON) --------------------
+async function callAgentOnce(session, inboundMessage, extraPayload = {}) {
   const messages = [
     { role: "system", content: AGENT_SYSTEM },
     ...session.agentContext,
@@ -306,30 +285,66 @@ async function agentReply(session, inboundMessage, extraPayload = {}) {
 
   const completion = await openai.chat.completions.create({
     model: ENV.OPENAI_MODEL,
-    temperature: 0.2,
+    temperature: 0.1,
     messages,
+    // ✅ ISSO É O QUE RESOLVE O “Tive um probleminha…”
+    response_format: { type: "json_object" },
   });
 
-  const raw = completion.choices[0].message.content || "";
-  let parsed;
+  const raw = completion.choices?.[0]?.message?.content || "{}";
+  return raw;
+}
 
+async function agentReply(session, inboundMessage, extraPayload = {}) {
+  // tentativa 1
+  let raw = await callAgentOnce(session, inboundMessage, extraPayload);
+
+  // parse
+  let parsed = null;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    parsed = {
-      text: "Tive um probleminha pra entender. Pode repetir pra mim?",
-      buttons: [],
+    parsed = null;
+  }
+
+  // retry 1 (sem histórico, mais “limpo”)
+  if (!parsed || typeof parsed !== "object") {
+    const cleanSession = { ...session, agentContext: [] };
+    raw = await callAgentOnce(cleanSession, inboundMessage, extraPayload);
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  // fallback seguro (JSON garantido) — SEM “probleminha”
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      text: "Me diz rapidinho o que você quer fazer: orçamento novo ou tirar uma dúvida?",
+      buttons: [
+        { id: "first_new_budget", title: "Orçamento novo" },
+        { id: "first_other_doubts", title: "Outras dúvidas" },
+      ],
       action: "NONE",
-      set: { stage: session.stage },
+      set: { stage: session.stage || "start" },
     };
   }
 
-  session.agentContext.push({ role: "assistant", content: raw });
+  // normaliza campos
+  parsed.text = typeof parsed.text === "string" ? parsed.text : "";
+  parsed.buttons = Array.isArray(parsed.buttons) ? parsed.buttons : [];
+  parsed.action = typeof parsed.action === "string" ? parsed.action : "NONE";
+  parsed.set = typeof parsed.set === "object" && parsed.set ? parsed.set : {};
+
+  // ✅ só salva no contexto se a resposta foi JSON válido
+  session.agentContext.push({ role: "assistant", content: JSON.stringify(parsed) });
   saveStore();
+
   return parsed;
 }
 
-// -------------------- Interpretar JSON do agente --------------------
+// -------------------- Apply Agent JSON --------------------
 async function applyAgentAction(phone, session, agentJson) {
   const { text, buttons = [], action = "NONE", set = {} } = agentJson || {};
 
@@ -339,40 +354,35 @@ async function applyAgentAction(phone, session, agentJson) {
   }
 
   if (action === "HANDOFF_TO_OWNER") {
-    await sendText(phone, text || "Certo. Vou te ajudar por aqui.");
+    await sendText(phone, text || "Certo. Me chama no meu Whats pessoal e eu te respondo direto.");
     await sendText(
       ENV.OWNER_PHONE,
-      `📲 Handoff automático — Cliente pediu falar com você.\n\nNúmero: ${phone}\nStage: ${session.stage}\n\nMensagem: ${text || "-"}`
+      `📲 HANDOFF — Cliente pediu falar com você.\n\nNúmero: ${phone}\nStage: ${session.stage}\n\nÚltima msg ao cliente: ${text || "-"}`
     );
     return;
   }
 
   if (action === "RESET_SESSION") {
     resetSession(phone);
-    await sendText(phone, text || "Vamos começar de novo. Me manda sua ideia.");
+    await sendText(phone, text || "Beleza. Me manda sua ideia e uma referência em imagem.");
     return;
   }
 
   if (text && !antiRepeat(session, text)) {
-    if (buttons.length > 0) {
-      await sendButtons(phone, text, buttons);
-    } else {
-      await sendText(phone, text);
-    }
+    if (buttons.length > 0) await sendButtons(phone, text, buttons);
+    else await sendText(phone, text);
   }
 }
 
-// -------------------- Normalização inbound (Z-API robusto) --------------------
+// -------------------- Inbound parse (ROBUSTO) --------------------
 function getIncomingText(payload) {
   if (!payload) return "";
   if (typeof payload === "string") return payload;
-
   if (typeof payload === "object") {
     if (payload.buttonId) return payload.buttonTitle || payload.buttonId;
-    const t = payload.text || payload?.message?.text || payload.msg || payload?.message || "";
+    const t = payload.text || payload?.message?.text || payload.msg || "";
     return typeof t === "string" ? t : JSON.stringify(t);
   }
-
   return String(payload || "");
 }
 
@@ -451,15 +461,17 @@ function parseInbound(body) {
   };
 }
 
-// -------------------- Lógica principal --------------------
+// -------------------- Main Flow --------------------
 async function handleInbound(phone, inbound) {
   const session = getSession(phone);
 
+  // FIRST CONTACT
   if (session.stage === "start") {
     const agentJson = await agentReply(session, "FIRST_CONTACT");
     return applyAgentAction(phone, session, agentJson);
   }
 
+  // BUTTON ROUTES
   if (inbound.buttonId) {
     if (inbound.buttonId === "first_new_budget") {
       const agentJson = await agentReply(session, "NEW_BUDGET");
@@ -497,21 +509,26 @@ async function handleInbound(phone, inbound) {
     }
   }
 
+  // IMAGE ROUTE
   if (inbound.imageUrl) {
+    // aqui você pode plugar seu analisador de imagem depois
     const agentJson = await agentReply(session, "IMAGE_RECEIVED", { imageUrl: inbound.imageUrl });
     return applyAgentAction(phone, session, agentJson);
   }
 
-  const agentJson = await agentReply(session, inbound.message);
+  // TEXT ROUTE (inclui quando o cliente digita "quero orçamento")
+  const agentJson = await agentReply(session, inbound.message || "MENSAGEM_VAZIA");
   return applyAgentAction(phone, session, agentJson);
 }
 
-// -------------------- Rotas --------------------
+// -------------------- Routes --------------------
 app.get("/", (req, res) => res.status(200).send("DW Bot Online"));
 
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
+  const miss = missingEnvs();
+  res.status(miss.length ? 500 : 200).json({
+    ok: miss.length === 0,
+    missing: miss,
     sessions: Object.keys(STORE.sessions).length,
     model: ENV.OPENAI_MODEL,
   });
@@ -528,8 +545,7 @@ app.post("/", async (req, res) => {
       console.log("[WEBHOOK] sem phone. keys:", Object.keys(req.body || {}));
       return;
     }
-
-    if (inbound.fromMe) return; // ✅ não responde a si mesmo
+    if (inbound.fromMe) return;
 
     await handleInbound(inbound.phone, inbound);
   } catch (e) {
@@ -540,9 +556,13 @@ app.post("/", async (req, res) => {
 // -------------------- Boot --------------------
 async function boot() {
   await loadStore();
+
   console.log("🚀 DW BOT (AGENTE GPT) ONLINE");
   console.log("Modelo:", ENV.OPENAI_MODEL);
   console.log("Sessions carregadas:", Object.keys(STORE.sessions).length);
+
+  const miss = missingEnvs();
+  if (miss.length) console.log("⚠ Missing ENV:", miss.join(", "));
 
   app.listen(ENV.PORT, () => {
     console.log("Servidor na porta:", ENV.PORT);
