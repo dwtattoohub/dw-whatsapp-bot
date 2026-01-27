@@ -9,8 +9,17 @@
 import express from "express";
 import crypto from "crypto";
 import OpenAI from "openai";
-import fs from "fs/promises";
+import fsPromise from "fs/promises";
 import path from "path";
+import fs from "fs";
+
+// ------- RESET AUTOMÁTICO DO STORE NO BOOT -------
+try {
+  fs.writeFileSync("./dw_store.json", JSON.stringify({ sessions: {} }, null, 2));
+  console.log("🔥 Store resetado automaticamente no boot");
+} catch (e) {
+  console.log("⚠ Não foi possível resetar o store:", e?.message);
+}
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
