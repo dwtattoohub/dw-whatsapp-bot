@@ -1,12 +1,9 @@
 // ============================================================
-// DW WhatsApp Bot — Jeezy Edition (Z-API + AGENTE REAL + HANDOFF)
-// O QUE MUDA AQUI (do jeito que você pediu):
-// 1) QUEM ASSUME O ORÇAMENTO É O AGENTE (OpenAI) — não é “bot de stage” repetindo coisa
-// 2) PRIMEIRO CONTATO: 2 opções -> "Orçamento novo" e "Falar comigo" (sem parecer bot)
-// 3) "Falar comigo" = HANDOFF REAL: notifica seu número pessoal e o bot CALA (não responde mais)
-// 4) PERSISTÊNCIA JSON + IDPOTÊNCIA: sessões + ignorar webhook duplicado (messageId)
-// 5) ORÇAMENTO: só fecha preço quando tiver (referência + local + tamanho). Antes disso, agente conduz.
-// 6) SEM LIGAÇÃO DE VÍDEO (removido)
+// DW WhatsApp Bot — Versão A (AGENTE COMPLETO GPT-4o)
+// ============================================================
+// O agente GPT controla 100% das respostas via JSON.
+// O backend APENAS executa: enviar texto, enviar botões,
+// atualizar sessão, gerar horários e repassar tudo.
 // ============================================================
 
 import express from "express";
@@ -23,138 +20,89 @@ const ENV = {
   PORT: Number(process.env.PORT || 10000),
 
   // Z-API
-  ZAPI_INSTANCE_ID: process.env.ZAPI_INSTANCE_ID || process.env.ID_INSTÂNCIA_ZAPI,
-  ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN || process.env.ZAPI_INSTANCE_TOKEN,
-  ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || process.env.ZAPI_CLIENT_TOKEN,
+  ZAPI_INSTANCE_ID: process.env.ZAPI_INSTANCE_ID,
+  ZAPI_INSTANCE_TOKEN: process.env.ZAPI_INSTANCE_TOKEN,
+  ZAPI_CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN,
 
-  OWNER_PHONE: process.env.OWNER_PHONE || process.env.TELEFONE_DO_PROPRIETÁRIO || "",
-  PIX_KEY: process.env.PIX_KEY || "",
+  // OWNER (handoff)
+  OWNER_PHONE: "5544991373995",
 
   // OpenAI
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  OPENAI_MODEL: "gpt-4o",
 
-  // Google Calendar (mantive flag, mas esse arquivo NÃO mexe na sua agenda sem você plugar GCAL)
-  GCAL_ENABLED:
-    String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "true" ||
-    String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "verdadeiro",
-  GCAL_TZ: process.env.GCAL_TZ || "America/Sao_Paulo",
-
-  // Preço por hora
-  HOUR_FIRST: Number(process.env.HOUR_FIRST || 130),
-  HOUR_NEXT: Number(process.env.HOUR_NEXT || 120),
-
-  // Persistência (JSON)
-  STORE_PATH: process.env.STORE_PATH || "./dw_store.json",
-  IDEMPOTENCY_TTL_HOURS: Number(process.env.IDEMPOTENCY_TTL_HOURS || 48),
-
-  // Slots (quando você plugar agenda de verdade)
-  OFFER_SLOTS_COUNT: Number(process.env.OFFER_SLOTS_COUNT || 3),
+  // Persistência
+  STORE_PATH: "./dw_store.json",
 };
 
-function missingEnvs() {
-  const miss = [];
-  if (!ENV.ZAPI_INSTANCE_ID) miss.push("ZAPI_INSTANCE_ID/ID_INSTÂNCIA_ZAPI");
-  if (!ENV.ZAPI_INSTANCE_TOKEN) miss.push("ZAPI_INSTANCE_TOKEN");
-  if (!ENV.ZAPI_CLIENT_TOKEN) miss.push("ZAPI_CLIENT_TOKEN");
-  return miss;
-}
-
-// -------------------- OpenAI --------------------
-const openai = ENV.OPENAI_API_KEY ? new OpenAI({ apiKey: ENV.OPENAI_API_KEY }) : null;
-
-// ✅ System base (identidade + invisível)
-const BASE_SYSTEM =
-  "Você é o DW Tattooer, tatuador profissional atendendo no WhatsApp (tom humano, direto e profissional). " +
-  "Regras: NUNCA diga que é IA/bot/assistente. Não assine. Não cite 'sistema' nem 'automação'. " +
-  "Trabalha com realismo preto e cinza (black & grey) + whip shading. " +
-  "Se pedirem colorido, alinhe que você atende apenas black & grey. " +
-  "Não oferece ligação de vídeo. " +
-  "Sempre conduz com UMA pergunta prática por mensagem quando precisar avançar.";
-
-// ✅ Playbook do agente (baseado no seu PDF + seu funil)
-const SALES_PLAYBOOK =
-  "Playbook de vendas e atendimento:\n" +
-  "- O cliente no 1º contato está curioso e vulnerável: precisa sentir segurança e clareza.\n" +
-  "- Dor: normalizar, descrever como desconforto suportável e pedir a região.\n" +
-  "- Preço: não dar valor sem qualificar (referência + local + tamanho). Enquadrar valor (design exclusivo, higiene, técnica, durabilidade).\n" +
-  "- 'Está caro': não discutir preço, discutir valor e perguntar o que exatamente preocupa.\n" +
-  "- 'Preciso pensar': perguntar qual ponto falta para decidir e oferecer ajuda/referências.\n" +
-  "- Fechamento por alternativa: quando estiver pronto, oferecer opções (ex.: terça manhã ou quinta tarde).\n" +
-  "- Sempre levar para próximo passo: referência → local/tamanho → orçamento → agenda → sinal → comprovante.";
-
-// ✅ Prompt completo do agente (você pediu para eu te mandar separado também; está no final da resposta)
-const AGENT_SYSTEM = `${BASE_SYSTEM}\n\n${SALES_PLAYBOOK}\n\nRegras duras:\n` +
-  "- Uma mensagem por vez.\n" +
-  "- Sem textos longos.\n" +
-  "- Se faltar referência/local/tamanho: peça exatamente o que falta.\n" +
-  "- Se o cliente pedir 'falar comigo': acione handoff (sem insistir).\n" +
-  "- Se já tiver referência+local+tamanho: pode liberar orçamento (o código calcula) e perguntar se quer horários.\n";
-
-// -------------------- JSON Store (sessions + processed) --------------------
+// -------------------- Store persistente --------------------
 const STORE = {
-  sessions: {},   // phone -> session
-  processed: {},  // msgId -> { at, phone }
+  sessions: {},
 };
-
-function nowMs() {
-  return Date.now();
-}
 
 async function loadStore() {
   try {
-    const raw = await fs.readFile(ENV.STORE_PATH, "utf-8");
+    const raw = await fs.readFile(ENV.STORE_PATH, "utf8");
     const data = JSON.parse(raw);
-    if (data && typeof data === "object") {
-      STORE.sessions = data.sessions || {};
-      STORE.processed = data.processed || {};
-    }
+    STORE.sessions = data.sessions || {};
   } catch {
-    // first run
+    console.log("Primeira execução, sem store.");
   }
 }
 
-let saveTimer = null;
-function scheduleSaveStore() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(async () => {
-    saveTimer = null;
-    try {
-      const dir = path.dirname(ENV.STORE_PATH);
-      if (dir && dir !== ".") await fs.mkdir(dir, { recursive: true }).catch(() => {});
-      await fs.writeFile(
-        ENV.STORE_PATH,
-        JSON.stringify({ sessions: STORE.sessions, processed: STORE.processed }, null, 2),
-        "utf-8"
-      );
-    } catch (e) {
-      console.error("[STORE SAVE ERROR]", e?.message || e);
-    }
-  }, 250);
+function saveStore() {
+  fs.writeFile(
+    ENV.STORE_PATH,
+    JSON.stringify({ sessions: STORE.sessions }, null, 2),
+    "utf8"
+  ).catch(() => {});
 }
 
-function cleanupProcessed() {
-  const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
-  const cut = nowMs() - ttl;
-  for (const [id, v] of Object.entries(STORE.processed)) {
-    if (!v?.at || v.at < cut) delete STORE.processed[id];
+// -------------------- Sessões --------------------
+function newSession() {
+  return {
+    stage: "start",
+    lastSentHash: "",
+    agentContext: [],
+    data: {
+      name: "",
+      reference: "",
+      bodyPart: "",
+      sizeCm: null,
+      imageSummary: "",
+      estHours: null,
+      estTotal: null,
+    },
+  };
+}
+
+function getSession(phone) {
+  if (!STORE.sessions[phone]) {
+    STORE.sessions[phone] = newSession();
+    saveStore();
   }
+  return STORE.sessions[phone];
 }
 
-function wasProcessed(msgId) {
-  if (!msgId) return false;
-  const v = STORE.processed[msgId];
-  if (!v?.at) return false;
-  const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
-  return v.at >= nowMs() - ttl;
+function resetSession(phone) {
+  STORE.sessions[phone] = newSession();
+  saveStore();
 }
 
-function markProcessed(msgId, phone) {
-  if (!msgId) return;
-  STORE.processed[msgId] = { at: nowMs(), phone };
-  scheduleSaveStore();
+// -------------------- Util --------------------
+function hash(t) {
+  return crypto.createHash("md5").update(String(t)).digest("hex");
 }
 
-// -------------------- Z-API helpers --------------------
+function antiRepeat(session, text) {
+  const h = hash(text);
+  if (session.lastSentHash === h) return true;
+  session.lastSentHash = h;
+  saveStore();
+  return false;
+}
+
+// -------------------- Z-API Helpers --------------------
 async function zapiFetch(path, payload) {
   const url = `https://api.z-api.io/instances/${ENV.ZAPI_INSTANCE_ID}/token/${ENV.ZAPI_INSTANCE_TOKEN}${path}`;
   const resp = await fetch(url, {
@@ -163,795 +111,433 @@ async function zapiFetch(path, payload) {
       "Content-Type": "application/json",
       "client-token": ENV.ZAPI_CLIENT_TOKEN,
     },
-    body: JSON.stringify(payload || {}),
+    body: JSON.stringify(payload),
   });
-  const text = await resp.text().catch(() => "");
-  if (!resp.ok) throw new Error(`ZAPI ${resp.status}: ${text}`);
+
+  const text = await resp.text();
   try {
     return JSON.parse(text);
   } catch {
-    return { ok: true, raw: text };
+    return text;
   }
 }
 
-async function zapiSendText(phone, message) {
-  return zapiFetch("/send-text", { phone, message });
+async function sendText(phone, text) {
+  await new Promise(r => setTimeout(r, 1000 + Math.random()*600));
+  return zapiFetch("/send-text", { phone, message: text });
 }
 
-async function humanDelay() {
-  await new Promise((resolve) => setTimeout(resolve, 900 + Math.random() * 700));
-}
-
-async function sendText(phone, message) {
-  await humanDelay();
-  return zapiSendText(phone, message);
-}
-
-async function sendButtons(phone, text, buttons, label = "menu") {
-  await humanDelay();
+async function sendButtons(phone, text, buttons) {
+  await new Promise(r => setTimeout(r, 1000 + Math.random()*600));
 
   try {
-    const resp = await zapiFetch("/send-button-list", {
+    await zapiFetch("/send-button-list", {
       phone,
       message: text,
       buttonList: {
-        title: label,
-        buttons: buttons.map((b) => ({ id: b.id, label: b.title })),
+        title: "menu",
+        buttons: buttons.map(b => ({ id: b.id, label: b.title })),
       },
     });
-    console.log("[SEND BUTTON LIST OK]", resp);
-    return true;
-  } catch (err) {
-    console.log("[SEND BUTTON LIST FAIL]", err?.message || err);
-  }
+    return;
+  } catch {}
 
   try {
-    const resp = await zapiFetch("/send-buttons", {
+    await zapiFetch("/send-buttons", {
       phone,
       message: text,
-      buttons: buttons.map((b) => ({ id: b.id, title: b.title })),
+      buttons: buttons.map(b => ({ id: b.id, title: b.title })),
     });
-    console.log("[SEND BUTTONS OK]", resp);
-    return true;
-  } catch (err) {
-    console.log("[SEND BUTTONS FAIL]", err?.message || err);
-  }
-
-  // fallback texto (2 botões)
-  await zapiSendText(
-    phone,
-    `${text}\n1) ${buttons[0]?.title || ""}\n2) ${buttons[1]?.title || ""}\nResponda 1 ou 2.`
-  );
-  return false;
-}
-
-async function notifyOwner(text) {
-  if (!ENV.OWNER_PHONE) return;
-  try {
-    await zapiSendText(ENV.OWNER_PHONE, text);
+    return;
   } catch {}
+
+  let fallback = text + "\n";
+  buttons.forEach((b, i) => {
+    fallback += `${i+1}) ${b.title}\n`;
+  });
+  await sendText(phone, fallback);
 }
 
-// -------------------- Normalização inbound --------------------
-function getIncomingText(payload) {
-  if (!payload) return "";
-  if (typeof payload === "string") return payload;
-  if (typeof payload === "object") {
-    if (payload.buttonId) return payload.buttonTitle || payload.buttonId;
-    const t = payload.text || payload?.message?.text || payload.msg || "";
-    return typeof t === "string" ? t : JSON.stringify(t);
+// -------------------- Horários aleatórios --------------------
+function randomPick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function generateScheduleButtons() {
+  const today = new Date();
+  const weekdayNames = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
+
+  function format(d, hour) {
+    return `${weekdayNames[d.getDay()]} — ${d.getDate()}/${d.getMonth()+1} às ${hour}`;
   }
-  return String(payload || "");
+
+  // comercial pós almoço
+  const d1 = new Date(today.getTime() + 86400000 * (1 + Math.floor(Math.random()*3)));
+  const h1 = randomPick(["13:00","14:00","15:00","16:00"]);
+
+  // pós comercial
+  const d2 = new Date(today.getTime() + 86400000 * (2 + Math.floor(Math.random()*4)));
+  const h2 = randomPick(["18:00","19:00","20:00"]);
+
+  // fim de semana
+  const d3 = new Date(today.getTime());
+  while (d3.getDay() !== 0 && d3.getDay() !== 6) {
+    d3.setDate(d3.getDate()+1);
+  }
+  const h3 = randomPick(["14:00","15:00","16:00","17:00","18:00","19:00"]);
+
+  return [
+    { id: "sched_opt1", title: format(d1,h1) },
+    { id: "sched_opt2", title: format(d2,h2) },
+    { id: "sched_opt3", title: format(d3,h3) },
+    { id: "sched_other", title: "Outro horário" },
+  ];
 }
 
-function parseZapiInbound(body) {
+// -------------------- OpenAI (AGENTE COMPLETO) --------------------
+const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
+
+// -------------------- AGENT SYSTEM (DW TATTOOER) --------------------
+const AGENT_SYSTEM = `
+###############################################
+### AGENT SYSTEM — DW TATTOOER (VERSÃO FINAL)
+###############################################
+
+IDENTIDADE
+Você é o DW Tattooer atendendo no WhatsApp.
+Tom humano, direto, profissional, seguro e simpático — sem ser robótico.
+Nunca diga que é IA, bot, agente, modelo, sistema ou automação.
+Não assine mensagens.
+Você sempre soa como um tatuador real falando com o cliente.
+
+ESPECIALIDADE
+Você trabalha exclusivamente com:
+• Realismo preto e cinza (black & grey)
+• Whip shading
+• Criação autoral fiel à referência
+• Encaixe real no corpo
+• Técnica para envelhecimento perfeito
+
+REGRAS ABSOLUTAS
+1. Nunca use palavras repetidas como “perfeito” em excesso.
+2. Seja humano e profissional, sem puxar saco.
+3. Sempre responda EXCLUSIVAMENTE em JSON com esta estrutura:
+
+{
+  "text": "mensagem a enviar",
+  "buttons": [
+    {"id":"id_do_botao","title":"Título do botão"},
+    ...
+  ],
+  "action": "NONE | HANDOFF_TO_OWNER | RESET_SESSION",
+  "set": {
+    "stage": "nome_do_stage",
+    "handoff": true/false
+  }
+}
+
+4. Não gere texto fora do JSON.
+5. Se faltar qualquer informação do cliente, pergunte de forma direta.
+
+SAUDAÇÃO INICIAL
+Quando receber um cliente novo:
+"text":
+  "Oi, aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading. Valeu por chegar e confiar no meu trampo. Como posso te ajudar hoje?"
+
+Botões:
+1) {"id":"first_new_budget","title":"Orçamento novo"}
+2) {"id":"first_other_doubts","title":"Outras dúvidas"}
+
+→ Se o cliente escolher “Outras dúvidas”, retorne:
+{
+  "action":"HANDOFF_TO_OWNER",
+  "text":"Claro, me chama aqui e eu te ajudo direto."
+}
+
+FLUXO ORÇAMENTO NOVO
+Quando o cliente clicar “Orçamento novo”:
+Peça:
+• referência em imagem
+• local no corpo
+• tamanho em cm
+
+Após receber a referência:
+Analise a descrição técnica (o backend envia o resumo em session.data.imageSummary)
+E retorne botões:
+1) {"id":"edit_yes","title":"Quero ajustar algo"}
+2) {"id":"edit_no","title":"Pode seguir"}
+
+Se clicar SIM:
+Peça a ideia/ref nova.
+
+Se clicar NÃO:
+Vá para ORÇAMENTO.
+
+ORÇAMENTO
+Antes de mostrar o preço:
+Explique em 1–3 linhas:
+• criação autoral fiel
+• técnica black & grey + whip shading
+• encaixe real
+• durabilidade
+
+Depois apresente:
+• R$ session.data.estTotal
+• session.data.estHours horas estimadas
+
+Pergunte:
+"Quer que eu te mande opções de datas e horários?"
+
+AGENDAMENTO
+Você deve mandar 4 botões (sempre):
+
+1) Horário comercial (pós-almoço)
+2) Pós comercial
+3) Fim de semana
+4) Outro horário
+
+Esses botões virão do backend e você deve apenas enviar no JSON.
+
+SINAL
+Quando o cliente escolher um horário:
+Explique:
+• Sinal R$ 50
+• 4 horas para enviar comprovante
+• Linguagem humana
+
+COMPROVANTE RECEBIDO
+Agradeça e mande cuidados pré tattoo:
+• beber água
+• evitar álcool no dia anterior
+• comer bem
+• hidratar pele
+• evitar sol forte
+
+PRÓXIMOS CONTATOS
+Se o cliente mandar:
+“quero outra tattoo”, “quero orçamento”, “quero fazer outra”
+→ Reinicie o fluxo de orçamento.
+
+Se mandar:
+“tenho dúvida”, “quero falar contigo”, “me chama”
+→ HANDOFF_TO_OWNER
+
+NUNCA FAZER
+• não mencionar IA
+• não sugerir desconto
+• não usar frases robóticas
+• não usar “perfeito” repetidamente
+• não inventar instruções fora do JSON
+
+###############################################
+### FIM DO AGENT SYSTEM
+###############################################
+`;
+
+// -------------------- Função: chamar o agente GPT --------------------
+async function agentReply(session, inboundMessage, extraPayload = {}) {
+  const messages = [
+    { role: "system", content: AGENT_SYSTEM },
+    ...session.agentContext,
+    {
+      role: "user",
+      content: JSON.stringify({
+        message: inboundMessage,
+        session: session.data,
+        ...extraPayload
+      })
+    }
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model: ENV.OPENAI_MODEL,
+    temperature: 0.2,
+    messages
+  });
+
+  const raw = completion.choices[0].message.content;
+  let parsed;
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    parsed = {
+      text: "Tive um probleminha pra entender. Pode repetir pra mim?",
+      buttons: [],
+      action: "NONE",
+      set: { stage: session.stage }
+    };
+  }
+
+  session.agentContext.push({ role: "assistant", content: raw });
+  saveStore();
+  return parsed;
+}
+
+// -------------------- Interpretar JSON do agente --------------------
+async function applyAgentAction(phone, session, agentJson) {
+  const { text, buttons = [], action = "NONE", set = {} } = agentJson;
+
+  // Atualizar stage
+  if (set.stage) {
+    session.stage = set.stage;
+    saveStore();
+  }
+
+  // HANDOFF para seu número pessoal
+  if (action === "HANDOFF_TO_OWNER") {
+    await sendText(phone, text || "Beleza, vou te ajudar por aqui.");
+    await sendText(
+      ENV.OWNER_PHONE,
+      `📲 Handoff automático — Cliente pediu falar com você.\n\nNúmero: ${phone}\nStage: ${session.stage}\n\nMensagem: ${text}`
+    );
+    return;
+  }
+
+  // RESET
+  if (action === "RESET_SESSION") {
+    resetSession(phone);
+    await sendText(phone, text || "Vamos começar de novo, me manda sua ideia.");
+    return;
+  }
+
+  // Normal: enviar texto + botões
+  if (text && !antiRepeat(session, text)) {
+    if (buttons.length > 0) {
+      await sendButtons(phone, text, buttons);
+    } else {
+      await sendText(phone, text);
+    }
+  }
+}
+
+// -------------------- Normalização de inbound --------------------
+function parseInbound(body) {
   const phone =
     body?.phone ||
     body?.from ||
     body?.sender ||
-    body?.senderPhone ||
-    body?.remoteJid ||
     body?.chatId ||
-    body?.data?.phone ||
     body?.data?.from ||
     null;
 
-  const rawMessage =
+  const msg =
     body?.message ||
-    body?.text?.message ||
     body?.text ||
     body?.Body ||
     body?.data?.message ||
-    body?.data?.text ||
     "";
 
   const imageUrl =
     body?.image?.imageUrl ||
     body?.image?.url ||
-    body?.imageUrl ||
-    body?.message?.image?.url ||
-    body?.media?.url ||
-    body?.data?.image?.imageUrl ||
     body?.data?.imageUrl ||
-    body?.data?.mediaUrl ||
     null;
 
-  const imageMime =
-    body?.image?.mimeType ||
-    body?.image?.mimetype ||
-    body?.mimeType ||
-    body?.data?.mimeType ||
-    "image/jpeg";
-
-  const fromMe = Boolean(body?.fromMe || body?.data?.fromMe);
-
-  const contactName =
-    body?.senderName ||
-    body?.pushName ||
-    body?.contact?.name ||
-    body?.data?.senderName ||
-    body?.data?.pushName ||
-    body?.data?.contact?.name ||
-    "";
-
-  const messageId =
-    body?.messageId ||
-    body?.data?.messageId ||
-    body?.id ||
-    body?.data?.id ||
-    body?.message?.id ||
-    body?.data?.message?.id ||
-    body?.data?.key?.id ||
-    body?.message?.key?.id ||
-    null;
-
-  const bId =
+  const buttonId =
     body?.buttonId ||
-    body?.callback?.buttonId ||
     body?.data?.buttonId ||
-    body?.message?.button?.id ||
     body?.message?.interactive?.button_reply?.id ||
-    body?.message?.interactive?.list_reply?.id ||
-    body?.message?.button_reply?.id ||
-    body?.message?.buttonsResponseMessage?.selectedButtonId ||
-    body?.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    body?.listReply?.id ||
-    body?.data?.listReply?.id ||
     null;
 
-  const bTitle =
+  const buttonTitle =
     body?.buttonTitle ||
-    body?.callback?.buttonTitle ||
     body?.data?.buttonTitle ||
-    body?.message?.button?.title ||
     body?.message?.interactive?.button_reply?.title ||
-    body?.message?.interactive?.list_reply?.title ||
-    body?.message?.button_reply?.title ||
-    body?.message?.buttonsResponseMessage?.selectedDisplayText ||
-    body?.message?.listResponseMessage?.title ||
-    body?.listReply?.title ||
     null;
 
-  const inbound = {
-    phone: phone ? String(phone) : null,
-    message: getIncomingText(rawMessage).trim(),
-    imageUrl: imageUrl ? String(imageUrl) : null,
-    imageMime: String(imageMime || "image/jpeg"),
-    fromMe,
-    contactName: String(contactName || "").trim(),
-    messageId: messageId ? String(messageId) : null,
-    buttonId: null,
-    buttonTitle: null,
-    messageType: "",
-    raw: body,
-  };
-
-  if (bId || bTitle) {
-    inbound.buttonId = bId ? String(bId) : null;
-    inbound.buttonTitle = bTitle ? String(bTitle) : "";
-    inbound.messageType = "button";
-    inbound.message = inbound.buttonTitle || inbound.buttonId || inbound.message;
-  }
-
-  if (!inbound.messageType) inbound.messageType = inbound.imageUrl ? "image" : "text";
-  return inbound;
-}
-
-// -------------------- Util --------------------
-function norm(s) {
-  return String(s || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .trim();
-}
-
-function safeName(name) {
-  const n = String(name || "").trim();
-  if (!n) return "";
-  if (n.length > 24) return n.slice(0, 24);
-  if (/undefined|null|unknown/i.test(n)) return "";
-  return n;
-}
-
-function detectColorIntent(text) {
-  const t = norm(text);
-  return /colorid|color|cores|vermelh|azul|amarel|verde|roxo|rosa|laranj|aquarel|new school/.test(t);
-}
-
-function askedPain(text) {
-  const t = norm(text);
-  return /doi|dor|vai doer|anestes|sensivel|aguenta/.test(t);
-}
-
-function askedAddress(text) {
-  const t = norm(text);
-  return /onde fica|endereco|localizacao|como chego|qual o endereco/.test(t);
-}
-
-function askedPix(text) {
-  const t = norm(text);
-  return /pix|chave pix|qual o pix|me passa o pix/.test(t);
-}
-
-function askedTalkToDw(text) {
-  const t = norm(text);
-  return /falar comigo|falar com voce|falar com vc|falar contigo|falar direto|quero falar|prefiro falar|me chama voce|quero falar com o dw|falar com o dw/.test(t);
-}
-
-function parseSizeCm(text) {
-  const t = norm(text);
-  let m = t.match(/(\d{1,2})\s*(cm|centimetros|centimetro)\b/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 60) return n;
-  }
-  const hasContext = /\b(tamanho|aprox|aproximado|mais ou menos|uns|cerca|medida)\b/.test(t);
-  if (hasContext) {
-    m = t.match(/\b(\d{1,2})\b/);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      if (n >= 1 && n <= 60) return n;
-    }
-  }
-  return null;
-}
-
-function parseBodyPart(text) {
-  const t = norm(text);
-  const parts = [
-    { match: /antebraco/, label: "antebraço" },
-    { match: /\bbraco\b/, label: "braço" },
-    { match: /\bombro\b/, label: "ombro" },
-    { match: /\bcostas\b/, label: "costas" },
-    { match: /\bpeito\b/, label: "peito" },
-    { match: /\bperna\b/, label: "perna" },
-    { match: /\bpanturrilha\b/, label: "panturrilha" },
-    { match: /\bcanela\b/, label: "canela" },
-    { match: /\bcoxa\b/, label: "coxa" },
-    { match: /\bjoelho\b/, label: "joelho" },
-    { match: /\bcostela\b/, label: "costela" },
-    { match: /\bpescoco\b/, label: "pescoço" },
-    { match: /\bmao\b/, label: "mão" },
-    { match: /\bpunho\b/, label: "punho" },
-    { match: /\bdedo\b/, label: "dedo" },
-    { match: /\bpe\b/, label: "pé" },
-    { match: /\btornozelo\b/, label: "tornozelo" },
-    { match: /\bnuca\b/, label: "nuca" },
-    { match: /\bescapula\b/, label: "escápula" },
-  ];
-  for (const p of parts) if (p.match.test(t)) return p.label;
-  return null;
-}
-
-function calcHoursAndPrice(sizeCm, complexityLevel) {
-  const s = Number(sizeCm || 0);
-  const base = s <= 12 ? 1.2 : s <= 18 ? 2 : s <= 25 ? 3 : 4;
-  const multiplier = complexityLevel === "alta" ? 1.5 : complexityLevel === "media" ? 1.2 : 1.0;
-
-  const hours = Math.max(1, base * multiplier);
-  const firstHour = ENV.HOUR_FIRST;
-  const nextHours = Math.max(0, hours - 1) * ENV.HOUR_NEXT;
-  const finalPrice = Math.round(firstHour + nextHours);
-
-  return { hours, finalPrice };
-}
-
-function detectComplexityFromSummary(summary) {
-  const t = norm(summary);
-  if (t.includes("detalh")) return "alta";
-  return "media";
-}
-
-// -------------------- Mensagens fixas --------------------
-function msgAddress() {
-  return "Claro.\n\n• Endereço: *Av. Mauá, 1308* — próximo à rodoviária.";
-}
-
-function msgDorResposta() {
-  return (
-    "Entendo perfeitamente sua preocupação com a dor — é uma dúvida bem comum.\n" +
-    "A sensação varia de pessoa pra pessoa e também depende da área.\n\n" +
-    "A maioria descreve como um desconforto suportável (ardência/arranhão intenso), e eu trabalho num ritmo que minimiza isso, com pausas quando precisar.\n\n" +
-    "Me diz em qual região você quer tatuar?"
-  );
-}
-
-function msgSoBlackGrey() {
-  return (
-    "Só pra alinhar rapidinho:\n\n" +
-    "• Eu trabalho com *black & grey* (preto e cinza).\n" +
-    "• Não faço tatuagem totalmente colorida.\n\n" +
-    "Se você curtir em preto e cinza, eu sigo e deixo bem forte."
-  );
-}
-
-function msgAskNewBudgetBasics() {
-  return (
-    "Fechado. Pra eu te passar um orçamento bem fiel, me manda:\n\n" +
-    "• *referência em imagem* (print/foto)\n" +
-    "• *onde no corpo* + *tamanho aproximado em cm*\n"
-  );
-}
-
-function msgAskBodyAndSize() {
-  return (
-    "Me confirma só:\n\n" +
-    "• onde no corpo\n" +
-    "• tamanho aproximado em cm (ex: 10cm, 15cm, 18cm)\n"
-  );
-}
-
-function msgQuoteHours(hours, total) {
-  const h = Number(hours || 1);
-  return (
-    "Eu trabalho com criação autoral e encaixe real no corpo, em *black & grey* com *whip shading*, pra ficar bonito hoje e envelhecer bem.\n\n" +
-    `Pelo tamanho e complexidade do trabalho, o investimento fica em *R$ ${Number(total).toFixed(0)}*.\n` +
-    `Estimativa profissional: cerca de *${h.toFixed(1)}h* de execução.\n\n` +
-    "Formas de pagamento:\n" +
-    "• Pix\n" +
-    "• Débito\n" +
-    "• Crédito em até 12x (+ acréscimo da máquina)\n\n" +
-    "Você quer que eu te mande opções de datas e horários agora?"
-  );
-}
-
-function msgPixSinal() {
-  const pixLine = ENV.PIX_KEY ? ENV.PIX_KEY : "SEU_PIX_AQUI";
-  return (
-    "Show! Para garantir seu horário, o sinal é de *R$ 50,00* (abatido do total no dia).\n\n" +
-    "Chave Pix:\n" +
-    `${pixLine}\n\n` +
-    "Assim que fizer, me manda a *foto do comprovante* aqui no Whats ✅"
-  );
-}
-
-// -------------------- Image analysis (OpenAI) --------------------
-async function analyzeImageDetails(url) {
-  if (!openai) return "";
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o",
-    temperature: 0.2,
-    messages: [
-      { role: "system", content: BASE_SYSTEM },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text:
-              "Analise a referência e descreva:\n" +
-              "• Complexidade de sombras\n" +
-              "• Contraste\n" +
-              "• Volume e formas\n" +
-              "• Detalhes finos\n" +
-              "• Dificuldade técnica\n" +
-              "• Áreas que exigem mais tempo\n" +
-              "Escreva como tatuador profissional. Não cite preços.",
-          },
-          { type: "image_url", image_url: { url } },
-        ],
-      },
-    ],
-  });
-
-  return resp.choices?.[0]?.message?.content?.trim() || "";
-}
-
-// -------------------- AGENTE (OpenAI) --------------------
-async function agentReply(session, inbound) {
-  if (!openai) return null;
-
-  const ctx = {
-    name: session.name || "",
-    stage: session.stage,
-    bodyPart: session.bodyPart || "",
-    sizeCm: session.sizeCm || null,
-    hasReference: Boolean(session.referenceImageUrl || inbound.imageUrl),
-    imageSummary: session.imageSummary || "",
-    changeNotes: session.changeNotes || "",
-    // IMPORTANTES (pra evitar loop)
-    missing: {
-      reference: !Boolean(session.referenceImageUrl || inbound.imageUrl),
-      bodyPart: !Boolean(session.bodyPart),
-      sizeCm: !Boolean(session.sizeCm),
-    },
-  };
-
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.35,
-    messages: [
-      { role: "system", content: AGENT_SYSTEM },
-      { role: "user", content: "Contexto (JSON):\n" + JSON.stringify(ctx) },
-      { role: "user", content: "Mensagem do cliente:\n" + (inbound.message || "") },
-    ],
-  });
-
-  return resp.choices?.[0]?.message?.content?.trim() || null;
-}
-
-// -------------------- Sessions --------------------
-function newSession() {
   return {
-    stage: "start",
-    name: "",
-
-    // handoff real (quando true, o bot não responde mais)
-    handoff: false,
-
-    // dados do orçamento
-    bodyPart: "",
-    sizeCm: null,
-    referenceImageUrl: "",
-    imageSummary: "",
-    changeNotes: "",
-
-    // quote
-    estHours: null,
-    estTotal: null,
-
-    // flags
-    didIntro: false,
-    awaitingBWAnswer: false,
-
-    // anti-repeat
-    lastSentHash: null,
+    phone: phone ? String(phone) : null,
+    message: (buttonTitle || msg || "").toString().trim(),
+    buttonId: buttonId ? String(buttonId) : null,
+    imageUrl,
   };
 }
 
-function getSession(phone) {
-  if (!STORE.sessions[phone]) {
-    STORE.sessions[phone] = newSession();
-    scheduleSaveStore();
-  }
-  return STORE.sessions[phone];
-}
-
-function resetSession(phone) {
-  STORE.sessions[phone] = newSession();
-  scheduleSaveStore();
-}
-
-// -------------------- Anti-repeat --------------------
-function hash(s) {
-  return crypto.createHash("md5").update(String(s)).digest("hex");
-}
-function antiRepeat(session, text) {
-  const h = hash(text);
-  if (session.lastSentHash === h) return true;
-  session.lastSentHash = h;
-  scheduleSaveStore();
-  return false;
-}
-
-// -------------------- Primeiro contato --------------------
-async function sendFirstContactButtons(phone, session, contactName) {
-  const nm = safeName(contactName);
-  const greet = nm ? `Oi, ${nm}!` : "Oi!";
-  const text = `${greet}\nMe diz como você quer seguir por aqui:`;
-
-  const buttons = [
-    { id: "first_new_budget", title: "Orçamento novo" },
-    { id: "first_talk_dw", title: "Falar comigo" },
-  ];
-
-  await sendButtons(phone, text, buttons, "início");
-  session.didIntro = true;
-  session.stage = "await_first_contact";
-  scheduleSaveStore();
-}
-
-function decideFirstContactFromText(message) {
-  const t = norm(message);
-  if (t.includes("orcamento novo") || t === "1") return 1;
-  if (t.includes("falar comigo") || t.includes("falar com") || t === "2") return 2;
-  return null;
-}
-
-// -------------------- HANDOFF REAL --------------------
-async function handoffToDw(phone, session, reason, lastMessage) {
-  session.handoff = true;
-  session.stage = "HANDOFF";
-  scheduleSaveStore();
-
-  const reply = "Fechado. Só um instante que já te respondo por aqui ✅";
-  if (!antiRepeat(session, reply)) await sendText(phone, reply);
-
-  await notifyOwner(
-    `📌 HANDOFF (${reason})\n` +
-      `Cliente: ${phone} (${session.name || "-"})\n` +
-      `Última msg: ${(lastMessage || "-").slice(0, 220)}`
-  );
-}
-
-// -------------------- Core flow (AGENTE) --------------------
+// -------------------- Lógica principal --------------------
 async function handleInbound(phone, inbound) {
   const session = getSession(phone);
 
-  const message = inbound.message || "";
-  const lower = norm(message);
-  const buttonId = inbound.buttonId || null;
-  const hasImage = Boolean(inbound.imageUrl);
-  const name = safeName(inbound.contactName);
-
-  if (name && !session.name) {
-    session.name = name;
-    scheduleSaveStore();
+  // 1) Se for primeira mensagem → Saudação do agente
+  if (session.stage === "start") {
+    const agentJson = await agentReply(session, "FIRST_CONTACT");
+    return applyAgentAction(phone, session, agentJson);
   }
 
-  console.log("[IN]", {
-    phone,
-    stage: session.stage,
-    buttonId,
-    hasImageUrl: !!inbound.imageUrl,
-    preview: (message || "").slice(0, 120),
-  });
+  // 2) Cliente clicou botões padrão
+  if (inbound.buttonId) {
+    // Fluxo ORÇAMENTO NOVO
+    if (inbound.buttonId === "first_new_budget") {
+      const agentJson = await agentReply(session, "NEW_BUDGET");
+      return applyAgentAction(phone, session, agentJson);
+    }
 
-  // Se já está em handoff: cala
-  if (session.handoff) return;
+    // Outras dúvidas → handoff
+    if (inbound.buttonId === "first_other_doubts") {
+      const agentJson = {
+        text: "Claro, pode falar comigo aqui direto.",
+        buttons: [],
+        action: "HANDOFF_TO_OWNER",
+        set: { stage: "handoff" }
+      };
+      return applyAgentAction(phone, session, agentJson);
+    }
 
-  // Reset
-  if (/^reset$|^reiniciar$|^comecar novamente$|^começar novamente$/.test(lower)) {
-    resetSession(phone);
-    const s2 = getSession(phone);
-    const reply = "Atendimento reiniciado.";
-    if (!antiRepeat(s2, reply)) await sendText(phone, reply);
-    await sendFirstContactButtons(phone, s2, s2.name || "");
-    return;
-  }
+    // Ajustes na arte
+    if (inbound.buttonId === "edit_yes") {
+      const agentJson = await agentReply(session, "EDIT_YES");
+      return applyAgentAction(phone, session, agentJson);
+    }
+    if (inbound.buttonId === "edit_no") {
+      const agentJson = await agentReply(session, "EDIT_NO");
+      return applyAgentAction(phone, session, agentJson);
+    }
 
-  // Pedidos rápidos
-  if (askedAddress(message)) {
-    const reply = msgAddress();
-    if (!antiRepeat(session, reply)) await sendText(phone, reply);
-    return;
-  }
-  if (askedPain(message)) {
-    const reply = msgDorResposta();
-    if (!antiRepeat(session, reply)) await sendText(phone, reply);
-    return;
-  }
+    // Agendamento — cliente clicou em uma opção
+    if (inbound.buttonId.startsWith("sched_opt")) {
+      const agentJson = await agentReply(session, "SCHEDULE_SELECTED");
+      return applyAgentAction(phone, session, agentJson);
+    }
 
-  // Se o cliente pediu falar com você em qualquer momento:
-  if (askedTalkToDw(message) || buttonId === "first_talk_dw") {
-    await handoffToDw(phone, session, "cliente pediu falar com você", message);
-    return;
-  }
-
-  // Color gating
-  if (!session.awaitingBWAnswer && detectColorIntent(message)) {
-    session.awaitingBWAnswer = true;
-    scheduleSaveStore();
-    const reply = msgSoBlackGrey();
-    if (!antiRepeat(session, reply)) await sendText(phone, reply);
-    return;
-  }
-  if (session.awaitingBWAnswer) {
-    if (/\b(sim|aceito|pode|fechado|ok|bora)\b/.test(lower)) {
-      session.awaitingBWAnswer = false;
-      scheduleSaveStore();
-    } else if (/\b(nao|não|quero colorido|prefiro colorido)\b/.test(lower)) {
-      const reply =
-        "Entendi.\n\nComo eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender no colorido do jeito que você quer.\n\nSe decidir fazer em preto e cinza, é só me chamar.";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      session.stage = "finalizado";
-      scheduleSaveStore();
-      return;
-    } else {
-      const reply = "Só confirma pra mim: você topa fazer em *preto e cinza*? (Sim/Não)";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      return;
+    if (inbound.buttonId === "sched_other") {
+      const agentJson = await agentReply(session, "SCHEDULE_OTHER");
+      return applyAgentAction(phone, session, agentJson);
     }
   }
 
-  // PRIMEIRO CONTATO
-  if (!session.didIntro || session.stage === "start") {
-    await sendFirstContactButtons(phone, session, session.name || "");
-    return;
+  // 3) Se o cliente mandou imagem → mandar para o agente com resumo
+  if (inbound.imageUrl) {
+    const agentJson = await agentReply(session, "IMAGE_RECEIVED", {
+      imageUrl: inbound.imageUrl
+    });
+    return applyAgentAction(phone, session, agentJson);
   }
 
-  // Escolha do menu (se não veio buttonId)
-  if (session.stage === "await_first_contact") {
-    let choice = null;
-    if (buttonId === "first_new_budget") choice = 1;
-    if (buttonId === "first_talk_dw") choice = 2;
-    if (!choice) choice = decideFirstContactFromText(message);
-
-    if (choice === 2) {
-      await handoffToDw(phone, session, "cliente escolheu falar comigo", message);
-      return;
-    }
-
-    // orçamento novo -> entra no modo AGENTE
-    if (choice === 1) {
-      session.stage = "AGENT_BUDGET";
-      scheduleSaveStore();
-
-      const start = msgAskNewBudgetBasics();
-      if (!antiRepeat(session, start)) await sendText(phone, start);
-      return;
-    }
-
-    const retry = "Só me confirma: *Orçamento novo* ou *Falar comigo*?";
-    if (!antiRepeat(session, retry)) await sendText(phone, retry);
-    return;
-  }
-
-  // -------------------- MODO AGENTE (ORÇAMENTO) --------------------
-  if (session.stage === "AGENT_BUDGET") {
-    // Captura dados (sem travar)
-    if (hasImage) {
-      session.referenceImageUrl = inbound.imageUrl;
-      scheduleSaveStore();
-
-      // análise técnica opcional
-      const summary = await analyzeImageDetails(inbound.imageUrl);
-      session.imageSummary = summary;
-      scheduleSaveStore();
-    }
-
-    const maybeBody = parseBodyPart(message);
-    const maybeSize = parseSizeCm(message);
-    if (maybeBody) session.bodyPart = maybeBody;
-    if (maybeSize) session.sizeCm = maybeSize;
-    scheduleSaveStore();
-
-    // Se já tem referência + body + size -> fecha orçamento
-    if (session.referenceImageUrl && session.bodyPart && session.sizeCm) {
-      const complexity = detectComplexityFromSummary(session.imageSummary || "");
-      const estimate = calcHoursAndPrice(session.sizeCm, complexity);
-      session.estHours = estimate.hours;
-      session.estTotal = estimate.finalPrice;
-      session.stage = "POST_QUOTE";
-      scheduleSaveStore();
-
-      const quote = msgQuoteHours(session.estHours, session.estTotal);
-      if (!antiRepeat(session, quote)) await sendText(phone, quote);
-      return;
-    }
-
-    // Senão: agente conduz (sem repetição)
-    const reply = await agentReply(session, inbound);
-
-    // fallback se OpenAI não estiver configurado
-    const fallback = msgAskNewBudgetBasics();
-
-    const out = reply || fallback;
-    if (!antiRepeat(session, out)) await sendText(phone, out);
-    return;
-  }
-
-  // -------------------- Pós orçamento (sim/não) + Pix --------------------
-  if (session.stage === "POST_QUOTE") {
-    // se pedir pix
-    if (askedPix(message)) {
-      const pix = msgPixSinal();
-      if (!antiRepeat(session, pix)) await sendText(phone, pix);
-      session.stage = "AWAIT_RECEIPT";
-      scheduleSaveStore();
-      return;
-    }
-
-    // heurística simples: se ele disser “sim / quero / pode / agenda”
-    if (/\b(sim|quero|pode|manda|agendar|agenda|vamos|fechado)\b/.test(lower)) {
-      // aqui você vai plugar agenda de verdade depois.
-      // por enquanto, joga pro handoff de confirmação (pra não prometer hora ocupada)
-      await notifyOwner(
-        `📅 Cliente quer agendar (precisa confirmar): ${phone}\n` +
-          `Peça: ${session.bodyPart} ${session.sizeCm}cm | ≈ ${session.estHours}h | R$ ${Number(session.estTotal).toFixed(0)}`
-      );
-      const msg = "Fechado ✅ Me manda sua preferência de dia/horário (ex: 15/01 16:00) que eu confirmo certinho.";
-      if (!antiRepeat(session, msg)) await sendText(phone, msg);
-      session.stage = "MANUAL_SCHEDULE";
-      scheduleSaveStore();
-      return;
-    }
-
-    // se disser não
-    if (/\b(nao|não|depois|vou ver|mais pra frente)\b/.test(lower)) {
-      const msg = "Tranquilo. Quando quiser seguir, é só me chamar aqui ✅";
-      if (!antiRepeat(session, msg)) await sendText(phone, msg);
-      return;
-    }
-
-    // agente pode tratar objeção pós-valor também
-    const reply = await agentReply(session, inbound);
-    if (reply && !antiRepeat(session, reply)) await sendText(phone, reply);
-    return;
-  }
-
-  if (session.stage === "MANUAL_SCHEDULE") {
-    // se pedir pix/sinal
-    if (askedPix(message) || /\b(sinal|pix|pagar|pagamento)\b/.test(lower)) {
-      const pix = msgPixSinal();
-      if (!antiRepeat(session, pix)) await sendText(phone, pix);
-      session.stage = "AWAIT_RECEIPT";
-      scheduleSaveStore();
-      return;
-    }
-
-    const msg = "Perfeito. Me manda o dia/horário que você quer e eu confirmo o melhor disponível.";
-    if (!antiRepeat(session, msg)) await sendText(phone, msg);
-    return;
-  }
-
-  if (session.stage === "AWAIT_RECEIPT") {
-    if (hasImage) {
-      const reply =
-        "Comprovante recebido ✅\n\n" +
-        "Agendamento confirmado. Qualquer dúvida até o dia, é só me chamar.\n\n" +
-        "Antes da sessão:\n" +
-        "• Beba bastante água.\n" +
-        "• Evite álcool no dia anterior.\n" +
-        "• Se alimente bem antes de vir.\n" +
-        "• Se puder, hidratar a região nos dias anteriores ajuda bastante.";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      session.stage = "finalizado";
-      scheduleSaveStore();
-      await notifyOwner(`💸 Comprovante recebido: ${phone}`);
-      return;
-    }
-
-    const reply = "Pra confirmar, preciso da *foto do comprovante* aqui no Whats ✅";
-    if (!antiRepeat(session, reply)) await sendText(phone, reply);
-    return;
-  }
-
-  // fallback geral (se cair fora)
-  const fallback =
-    "Pra eu te atender certinho, me manda a *referência em imagem* e me diz *onde no corpo + tamanho em cm*.";
-  if (!antiRepeat(session, fallback)) await sendText(phone, fallback);
+  // 4) Mensagem normal → mandar para o agente interpretar
+  const agentJson = await agentReply(session, inbound.message);
+  return applyAgentAction(phone, session, agentJson);
 }
 
-// -------------------- Routes --------------------
-app.get("/", (req, res) => res.status(200).send("OK"));
+// -------------------- Rotas --------------------
+app.get("/", (req, res) => {
+  res.status(200).send("DW Bot Online");
+});
+
 app.get("/health", (req, res) => {
-  const miss = missingEnvs();
-  res.status(miss.length ? 500 : 200).json({
-    ok: miss.length === 0,
-    missing: miss,
-    hasOwner: Boolean(ENV.OWNER_PHONE),
-    hasPix: Boolean(ENV.PIX_KEY),
-    gcalEnabled: ENV.GCAL_ENABLED,
-    storePath: ENV.STORE_PATH,
-    openai: Boolean(ENV.OPENAI_API_KEY),
+  res.json({
+    ok: true,
+    sessions: Object.keys(STORE.sessions).length,
+    model: ENV.OPENAI_MODEL,
   });
 });
 
-// ✅ Webhook principal
+// Webhook principal Z-API
 app.post("/", async (req, res) => {
   res.status(200).json({ ok: true });
 
   try {
-    const inbound = parseZapiInbound(req.body || {});
+    const inbound = parseInbound(req.body || {});
     if (!inbound.phone) return;
-    if (inbound.fromMe) return;
-
-    // Idempotência
-    if (inbound.messageId && wasProcessed(inbound.messageId)) return;
-    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
-    cleanupProcessed();
 
     await handleInbound(inbound.phone, inbound);
   } catch (e) {
@@ -962,13 +548,12 @@ app.post("/", async (req, res) => {
 // -------------------- Boot --------------------
 async function boot() {
   await loadStore();
-  cleanupProcessed();
-  console.log("✅ Store carregado:", { sessions: Object.keys(STORE.sessions).length });
+  console.log("🚀 DW BOT (AGENTE GPT) ONLINE");
+  console.log("Modelo:", ENV.OPENAI_MODEL);
+  console.log("Sessions carregadas:", Object.keys(STORE.sessions).length);
 
   app.listen(ENV.PORT, () => {
-    const miss = missingEnvs();
-    console.log("🚀 DW BOT ONLINE port", ENV.PORT);
-    if (miss.length) console.log("⚠️ Missing ENV:", miss.join(", "));
+    console.log("Servidor na porta:", ENV.PORT);
   });
 }
 
