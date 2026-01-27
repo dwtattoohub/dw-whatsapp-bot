@@ -3,12 +3,13 @@
 // - fs/promises
 // - Sem reset do store no boot
 // - Idempotência por messageId (TTL) + fallback por fingerprint (quando messageId vem vazio)
+// - ✅ In-flight guards (evita corrida entre webhooks simultâneos)
 // - Lock por telefone (evita paralelo)
 // - Fluxo com botões conforme combinado
-// - ✅ IMAGEM + LOCAL = suficiente (tamanho vira opcional e é estimado)
-// - ✅ Análise técnica da referência (sem firula) ANTES do preço
-// - ✅ Tempo/horas estimado pela IA (com fallback), preço: 1ª hora R$150, demais R$100
-// - ✅ In-flight guards (evita corrida entre webhooks simultâneos)
+// - ✅ NOVO: Referência + local = suficiente (tamanho é opcional)
+// - ✅ NOVO: Descreve a imagem (texto técnico) + estima horas com o AGENTE
+// - ✅ NOVO: Preço calculado por regra: 1ª hora R$150, demais R$100
+// - ✅ NOVO: Cache de mídia por telefone (quando imagem e texto chegam em webhooks separados)
 // ============================================================
 
 import express from "express";
@@ -16,7 +17,6 @@ import crypto from "crypto";
 import OpenAI from "openai";
 import fsp from "fs/promises";
 
-// -------------------- APP --------------------
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
@@ -40,17 +40,20 @@ const ENV = {
   STORE_PATH: process.env.STORE_PATH || "./dw_store.json",
   IDEMPOTENCY_TTL_HOURS: Number(process.env.IDEMPOTENCY_TTL_HOURS || 48),
 
-  // Preço (ajustado conforme você pediu)
-  HOUR_FIRST: Number(process.env.HOUR_FIRST || 150), // ✅ 1ª hora 150
-  HOUR_NEXT: Number(process.env.HOUR_NEXT || 100),   // ✅ demais 100
+  // Preço (regra fixa)
+  HOUR_FIRST: Number(process.env.HOUR_FIRST || 150), // ✅ 150 primeira hora
+  HOUR_NEXT: Number(process.env.HOUR_NEXT || 100),   // ✅ 100 demais horas
 
   // PIX + sinal
   PIX_KEY: process.env.PIX_KEY || "",
   SIGNAL_VALUE: Number(process.env.SIGNAL_VALUE || 50),
   SIGNAL_DEADLINE_HOURS: Number(process.env.SIGNAL_DEADLINE_HOURS || 4),
 
-  // System prompt opcional no ENV (se vazio, usa o padrão do código)
+  // System prompt opcional
   AGENT_SYSTEM_PROMPT: process.env.AGENT_SYSTEM_PROMPT || "",
+
+  // Cache de mídia (minutos)
+  MEDIA_CACHE_TTL_MIN: Number(process.env.MEDIA_CACHE_TTL_MIN || 20),
 };
 
 function missingEnvs() {
@@ -136,23 +139,22 @@ function markProcessed(msgId, phone) {
   scheduleSaveStore();
 }
 
-// ✅ fallback idempotência (quando o Z-API não manda messageId ou manda ids diferentes em retry)
+// fingerprint idempotência
 function fpHash(s) {
   return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
-
 function makeFingerprint(inbound) {
   const base = [
     inbound.phone || "",
     inbound.buttonId || "",
     inbound.message || "",
     inbound.imageUrl || "",
-    inbound.imageBase64 ? "b64" : "",
+    inbound.imageCacheKey || "",
+    inbound.imageBase64 ? "has_b64" : "",
     inbound.raw?.timestamp || inbound.raw?.data?.timestamp || inbound.raw?.t || ""
   ].join("|");
   return fpHash(base);
 }
-
 function wasProcessedFp(fp) {
   if (!fp) return false;
   const v = STORE.processedFp[fp];
@@ -160,7 +162,6 @@ function wasProcessedFp(fp) {
   const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
   return v.at >= nowMs() - ttl;
 }
-
 function markProcessedFp(fp, phone) {
   if (!fp) return;
   STORE.processedFp[fp] = { at: nowMs(), phone };
@@ -173,24 +174,17 @@ function newSession() {
     stage: "start",
     lastSentHash: "",
     agentContext: [],
-
     data: {
       name: "",
       bodyPart: "",
-      sizeCm: null, // opcional (estimado se não vier)
+      sizeCm: null,              // opcional
       referenceImageUrl: "",
+      referenceImageBase64: "",  // opcional
       changeNotes: "",
-
-      // análise
       imageSummary: "",
       imageSummaryAt: null,
-      imageEstSizeCm: null,
-      imageEstHours: null,
-
-      // orçamento final
       estHours: null,
       estTotal: null,
-
       chosenSchedule: "",
       wantsSchedule: false,
       signalSentAt: null,
@@ -212,13 +206,8 @@ function resetSession(phone) {
   scheduleSaveStore();
 }
 
-// -------------------- LOCK por telefone (evita paralelismo) --------------------
+// -------------------- LOCK por telefone --------------------
 const PHONE_LOCKS = new Map();
-
-// ✅ In-flight guards (evita corrida entre webhooks simultâneos)
-const INFLIGHT_MSG = new Set(); // messageId
-const INFLIGHT_FP = new Set();  // fingerprint
-
 async function withPhoneLock(phone, fn) {
   const prev = PHONE_LOCKS.get(phone) || Promise.resolve();
   let release;
@@ -234,11 +223,14 @@ async function withPhoneLock(phone, fn) {
   }
 }
 
+// ✅ In-flight guards (evita corrida entre webhooks simultâneos)
+const INFLIGHT_MSG = new Set(); // messageId
+const INFLIGHT_FP = new Set();  // fingerprint
+
 // -------------------- UTIL --------------------
 function hash(t) {
   return crypto.createHash("md5").update(String(t)).digest("hex");
 }
-
 function antiRepeat(session, text) {
   const h = hash(text);
   if (session.lastSentHash === h) return true;
@@ -246,7 +238,6 @@ function antiRepeat(session, text) {
   scheduleSaveStore();
   return false;
 }
-
 function norm(s) {
   return String(s || "")
     .normalize("NFD")
@@ -254,14 +245,12 @@ function norm(s) {
     .toLowerCase()
     .trim();
 }
-
 function safeName(name) {
   const n = String(name || "").trim();
   if (!n) return "";
   if (/undefined|null|unknown/i.test(n)) return "";
   return n.length > 24 ? n.slice(0, 24) : n;
 }
-
 function parseSizeCm(text) {
   const t = norm(text);
   let m = t.match(/(\d{1,2})\s*(cm|centimetros|centimetro)\b/);
@@ -279,7 +268,6 @@ function parseSizeCm(text) {
   }
   return null;
 }
-
 function parseBodyPart(text) {
   const t = norm(text);
   const parts = [
@@ -306,32 +294,56 @@ function parseBodyPart(text) {
   for (const p of parts) if (p.r.test(t)) return p.v;
   return null;
 }
-
-function clamp(n, a, b) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return a;
-  return Math.max(a, Math.min(b, x));
-}
-
-// preço: 1ª hora 150 + demais 100
-function priceFromHours(hours) {
-  const h = clamp(hours, 1, 20);
+function calcTotalFromHours(hours) {
+  const h = Math.max(1, Number(hours || 1));
   const first = ENV.HOUR_FIRST;
   const rest = Math.max(0, h - 1) * ENV.HOUR_NEXT;
   return Math.round(first + rest);
 }
 
-// fallback (se IA falhar)
-function fallbackHoursBySize(sizeCm, complexity = "media") {
-  const s = Number(sizeCm || 0);
-  const base = s <= 12 ? 1.2 : s <= 18 ? 2.0 : s <= 25 ? 3.0 : 4.0;
-  const mult = complexity === "alta" ? 1.4 : complexity === "baixa" ? 1.0 : 1.15;
-  return clamp(Number((Math.max(1, base * mult)).toFixed(1)), 1, 20);
+// -------------------- CACHE DE MÍDIA (quando webhooks chegam separados) --------------------
+const MEDIA_CACHE = new Map(); // phone -> { imageUrl, imageBase64, at }
+function mediaCacheCleanup() {
+  const ttl = ENV.MEDIA_CACHE_TTL_MIN * 60 * 1000;
+  const cut = nowMs() - ttl;
+  for (const [phone, v] of MEDIA_CACHE.entries()) {
+    if (!v?.at || v.at < cut) MEDIA_CACHE.delete(phone);
+  }
+}
+function setMediaCache(phone, { imageUrl, imageBase64 }) {
+  if (!phone) return;
+  MEDIA_CACHE.set(phone, { imageUrl: imageUrl || "", imageBase64: imageBase64 || "", at: nowMs() });
+}
+function getMediaCache(phone) {
+  mediaCacheCleanup();
+  return MEDIA_CACHE.get(phone) || null;
 }
 
 // ============================================================================
-// ✅ ANALISAR REFERÊNCIA (IMAGEM) — retorna descrição técnica + estimativas (JSON)
+// ✅ AGENTE: descreve imagem + estima horas (tamanho opcional)
 // ============================================================================
+
+function summarizeToBullets(summary) {
+  const s = String(summary || "").trim();
+  if (!s) return "";
+  const parts = s
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?])\s+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  if (parts.length === 0) return "";
+  return parts.map((p) => `• ${p.replace(/[.]+$/g, "")}`).join("\n");
+}
+
+async function fetchAsDataUrl(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`fetch image failed: ${resp.status}`);
+  const ct = resp.headers.get("content-type") || "image/jpeg";
+  const ab = await resp.arrayBuffer();
+  const b64 = Buffer.from(ab).toString("base64");
+  return `data:${ct};base64,${b64}`;
+}
 
 function safeJsonParse(raw) {
   const s = String(raw || "").trim();
@@ -350,68 +362,27 @@ function safeJsonParse(raw) {
   return null;
 }
 
-function descriptionToBullets(summary) {
-  const s = String(summary || "").trim();
-  if (!s) return "";
-  const lines = s
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  // se já veio em bullets, mantém
-  if (lines.some((l) => l.startsWith("•") || l.startsWith("-"))) {
-    return lines
-      .slice(0, 8)
-      .map((l) => (l.startsWith("•") ? l : `• ${l.replace(/^-+\s*/, "")}`))
-      .join("\n");
-  }
-
-  // quebra por frases curtas
-  const parts = s
-    .replace(/\s+/g, " ")
-    .split(/(?<=[.!?])\s+/)
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .slice(0, 6);
-
-  return parts.map((p) => `• ${p.replace(/[.]+$/g, "")}`).join("\n");
-}
-
-async function fetchAsDataUrl(url) {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`fetch image failed: ${resp.status}`);
-  const ct = resp.headers.get("content-type") || "image/jpeg";
-  const ab = await resp.arrayBuffer();
-  const b64 = Buffer.from(ab).toString("base64");
-  return `data:${ct};base64,${b64}`;
-}
-
-/**
- * Retorna:
- * {
- *   description: "texto técnico curto e claro",
- *   estSizeCm: number (8..60),
- *   estHours: number (1..20)
- * }
- */
-async function analyzeReferenceImage(imageUrlOrDataUrl, bodyPart = "", changeNotes = "") {
-  if (!imageUrlOrDataUrl) return { description: "", estSizeCm: null, estHours: null };
-
-  const promptText =
-    "Você é um tatuador especialista. Analise a imagem de referência e responda SOMENTE em JSON válido.\n\n" +
+async function analyzeAndEstimate({ imageUrl, imageBase64, bodyPart, sizeCm, changeNotes }) {
+  // retorna { summaryText, estHours }
+  const prompt =
+    "Você é um tatuador especialista em realismo preto e cinza.\n" +
+    "Analise a referência e responda APENAS em JSON válido com este schema:\n\n" +
+    "{\n" +
+    '  "summary": "texto curto e técnico em português (sem preço)",\n' +
+    '  "estHours": 2.5\n' +
+    "}\n\n" +
     "Regras:\n" +
-    "- Descrição técnica SEM firula, clara e útil pro cliente.\n" +
-    "- Cite: tema/assunto, elementos principais, nível de detalhe, sombras/contraste, texturas, pontos que dão mais trabalho.\n" +
-    "- Estime TAMANHO BASE em cm para ficar proporcional no local informado (se local vazio, use um tamanho médio).\n" +
-    "- Estime HORAS de execução (realismo preto e cinza/whip shading), considerando a complexidade da referência.\n" +
-    "- Não dê preço.\n\n" +
-    "Schema exato:\n" +
-    '{ "description": "string", "estSizeCm": number, "estHours": number }\n\n' +
-    `Local no corpo: ${bodyPart || "(não informado)"}\n` +
-    `Ajustes/pedidos extras do cliente: ${changeNotes || "(nenhum)"}\n`;
+    "- summary: explicar objetivamente o que existe na referência (elementos, sombras/contraste, texturas, pontos críticos).\n" +
+    "- estHours: estimativa realista em horas para executar bem (acabamento limpo), considerando o local informado.\n" +
+    "- Se sizeCm estiver vazio, estime um tamanho coerente pro local baseado na composição (não precisa escrever o tamanho; só use pra estimar horas).\n" +
+    "- Se changeNotes existir, considere mais tempo.\n" +
+    "- Não invente firula, mas agregue valor técnico.\n";
 
-  // 1) tenta direto com URL/DataURL
-  try {
+  let imgInput = imageUrl || "";
+  if (!imgInput && imageBase64) imgInput = imageBase64;
+
+  // se tiver URL mas OpenAI não conseguir buscar, cai pro base64
+  const tryCall = async (finalUrl) => {
     const completion = await openai.chat.completions.create({
       model: ENV.OPENAI_MODEL,
       temperature: 0.2,
@@ -419,66 +390,41 @@ async function analyzeReferenceImage(imageUrlOrDataUrl, bodyPart = "", changeNot
         {
           role: "user",
           content: [
-            { type: "text", text: promptText },
-            { type: "image_url", image_url: { url: imageUrlOrDataUrl } },
+            { type: "text", text: prompt + `\nDados:\nlocal=${bodyPart || ""}\nsizeCm=${sizeCm || ""}\nchangeNotes=${changeNotes || ""}` },
+            { type: "image_url", image_url: { url: finalUrl } },
           ],
         },
       ],
     });
+    return completion.choices?.[0]?.message?.content || "";
+  };
 
-    const raw = String(completion.choices?.[0]?.message?.content || "").trim();
-    const parsed = safeJsonParse(raw);
+  try {
+    if (!imgInput) return { summaryText: "", estHours: 2.0 };
 
-    if (parsed && typeof parsed === "object") {
-      const desc = String(parsed.description || "").trim();
-      const estSizeCm = parsed.estSizeCm != null ? clamp(parsed.estSizeCm, 8, 60) : null;
-      const estHours = parsed.estHours != null ? clamp(parsed.estHours, 1, 20) : null;
-
-      return { description: desc, estSizeCm, estHours };
-    }
-
-    // fallback: se a IA não seguiu JSON, usa texto como descrição
-    return { description: raw, estSizeCm: null, estHours: null };
-  } catch (e1) {
-    console.error("[IMAGE ANALYSIS DIRECT ERROR]", e1?.message || e1);
-
-    // 2) fallback: se for URL http(s), baixa e manda base64
-    try {
-      if (/^https?:\/\//i.test(imageUrlOrDataUrl)) {
-        const dataUrl = await fetchAsDataUrl(imageUrlOrDataUrl);
-
-        const completion2 = await openai.chat.completions.create({
-          model: ENV.OPENAI_MODEL,
-          temperature: 0.2,
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: promptText },
-                { type: "image_url", image_url: { url: dataUrl } },
-              ],
-            },
-          ],
-        });
-
-        const raw2 = String(completion2.choices?.[0]?.message?.content || "").trim();
-        const parsed2 = safeJsonParse(raw2);
-
-        if (parsed2 && typeof parsed2 === "object") {
-          const desc = String(parsed2.description || "").trim();
-          const estSizeCm = parsed2.estSizeCm != null ? clamp(parsed2.estSizeCm, 8, 60) : null;
-          const estHours = parsed2.estHours != null ? clamp(parsed2.estHours, 1, 20) : null;
-          return { description: desc, estSizeCm, estHours };
-        }
-
-        return { description: raw2, estSizeCm: null, estHours: null };
+    let raw = "";
+    if (imgInput.startsWith("data:")) {
+      raw = await tryCall(imgInput);
+    } else {
+      try {
+        raw = await tryCall(imgInput);
+      } catch {
+        const dataUrl = await fetchAsDataUrl(imgInput);
+        raw = await tryCall(dataUrl);
       }
-
-      return { description: "", estSizeCm: null, estHours: null };
-    } catch (e2) {
-      console.error("[IMAGE ANALYSIS BASE64 ERROR]", e2?.message || e2);
-      return { description: "", estSizeCm: null, estHours: null };
     }
+
+    const parsed = safeJsonParse(raw) || {};
+    const summaryText = String(parsed.summary || "").trim();
+    const estHours = Number(parsed.estHours || 0);
+
+    return {
+      summaryText,
+      estHours: Number.isFinite(estHours) && estHours > 0 ? Math.max(1, Number(estHours.toFixed(1))) : 2.0,
+    };
+  } catch (e) {
+    console.error("[AGENT IMAGE ESTIMATE ERROR]", e?.message || e);
+    return { summaryText: "", estHours: 2.0 };
   }
 }
 
@@ -511,7 +457,6 @@ async function sendText(phone, message) {
   return zapiFetch("/send-text", { phone, message });
 }
 
-// ✅ envia texto respeitando antiRepeat
 async function sendTextOnce(phone, session, message) {
   if (!message) return;
   if (antiRepeat(session, message)) return;
@@ -562,6 +507,17 @@ function pickFirstString(...vals) {
   }
   return null;
 }
+function pickFirstBase64(...vals) {
+  for (const v of vals) {
+    if (typeof v === "string" && v.trim()) {
+      const s = v.trim();
+      if (s.startsWith("data:image/")) return s;
+      // às vezes vem só o base64 puro
+      if (/^[A-Za-z0-9+/=]+$/.test(s) && s.length > 2000) return `data:image/jpeg;base64,${s}`;
+    }
+  }
+  return null;
+}
 
 function parseInbound(body) {
   const phone =
@@ -594,7 +550,6 @@ function parseInbound(body) {
     body?.data?.text ||
     "";
 
-  // URL de imagem em vários formatos
   const imageUrl = pickFirstString(
     body?.image?.imageUrl,
     body?.image?.url,
@@ -613,19 +568,29 @@ function parseInbound(body) {
     body?.message?.image?.imageUrl,
     body?.message?.media?.url,
     body?.message?.mediaUrl,
-    // whatsapp-like
     body?.data?.message?.imageMessage?.url,
     body?.data?.message?.documentMessage?.url,
     body?.data?.message?.videoMessage?.url
   );
 
-  // base64/data url (se algum provedor mandar)
-  const imageBase64 = pickFirstString(
+  const imageBase64 = pickFirstBase64(
     body?.image?.base64,
+    body?.image?.data,
     body?.data?.image?.base64,
+    body?.data?.image?.data,
     body?.data?.message?.image?.base64,
-    body?.data?.message?.imageMessage?.base64,
-    body?.data?.message?.imageMessage?.jpegThumbnail // às vezes é miniatura; ainda ajuda
+    body?.data?.message?.image?.data,
+    body?.message?.image?.base64,
+    body?.message?.image?.data,
+    body?.data?.message?.imageMessage?.jpegThumbnail // às vezes vem miniatura
+  );
+
+  // opcional: algum "cacheKey" (se você estiver usando isso em outra parte)
+  const imageCacheKey = pickFirstString(
+    body?.image?.cacheKey,
+    body?.data?.image?.cacheKey,
+    body?.data?.message?.image?.cacheKey,
+    body?.message?.image?.cacheKey
   );
 
   const messageId =
@@ -657,14 +622,6 @@ function parseInbound(body) {
 
   const text = (buttonTitle || (typeof msg === "string" ? msg : "") || "").toString().trim();
 
-  // normaliza imageBase64 para dataURL se parecer base64 puro
-  let imageDataUrl = null;
-  if (imageBase64) {
-    const b = imageBase64.trim();
-    if (/^data:image\//i.test(b)) imageDataUrl = b;
-    else if (/^[A-Za-z0-9+/=]+$/.test(b) && b.length > 200) imageDataUrl = `data:image/jpeg;base64,${b}`;
-  }
-
   return {
     phone: phone ? String(phone) : null,
     fromMe,
@@ -673,7 +630,8 @@ function parseInbound(body) {
     buttonId: buttonId ? String(buttonId) : null,
     message: text,
     imageUrl: imageUrl ? String(imageUrl) : null,
-    imageBase64: imageDataUrl, // data:image/...;base64,...
+    imageBase64: imageBase64 ? String(imageBase64) : null,
+    imageCacheKey: imageCacheKey ? String(imageCacheKey) : null,
     raw: body,
   };
 }
@@ -682,14 +640,12 @@ function parseInbound(body) {
 function randomPick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
-
 function formatScheduleLabel(d, hour) {
   const weekday = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"][d.getDay()];
   const dd = String(d.getDate()).padStart(2, "0");
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   return `${weekday} — ${dd}/${mm} às ${hour}`;
 }
-
 function generateScheduleButtons() {
   const now = new Date();
 
@@ -711,163 +667,25 @@ function generateScheduleButtons() {
   ];
 }
 
-// -------------------- SYSTEM PROMPT (final) --------------------
+// -------------------- SYSTEM PROMPT (fluxo) --------------------
 const DEFAULT_AGENT_SYSTEM = `
 Você é o DW Tattooer atendendo no WhatsApp.
 
 TOM
 - Humano, profissional e direto.
 - Simpático sem bajular.
-- NÃO repita palavras tipo “perfeito”.
 - Sempre escreva com parágrafos curtos (use \\n\\n).
 - Nunca diga que é IA/bot/sistema.
 
-FORMATO
-Responda SEMPRE e APENAS em JSON válido (sem crases, sem texto fora).
-Schema:
-
-{
-  "text": "mensagem",
-  "buttons": [{"id":"...","title":"..."}],
-  "action": "NONE | HANDOFF_TO_OWNER | RESET_SESSION",
-  "set": {
-    "stage": "string",
-    "data": { "changeNotes": "...", "wantsSchedule": true/false }
-  }
-}
-
-REGRAS DO FLUXO
-1) Saudação inicial (primeiro contato ou reinício):
-Texto (com \\n\\n):
-"Oi! Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\\n\\nObrigado por me procurar e confiar no meu trabalho. Como você quer seguir?"
-Botões:
-- Orçamento novo
-- Outras dúvidas
-
-2) Outras dúvidas => action HANDOFF_TO_OWNER.
-Texto: "Fechado. Me chama no meu Whats pessoal que eu te respondo por lá."
-
-3) Orçamento novo:
-Peça (com \\n\\n):
-- referência em imagem
-- local no corpo
-- (tamanho em cm é opcional)
-
-4) Quando tiver referência + local:
-Pergunte com botões:
-"Você quer ajustar algo na ideia antes do orçamento?"
-Botões:
-- Quero ajustar
-- Está tudo certo
-
-5) Ajustar => peça a ideia/ajustes.
-6) Está tudo certo => backend monta a análise técnica e o orçamento final (com horas estimadas e preço).
-Depois pergunte se quer agendar.
-
-7) Se quiser agendar: backend manda 4 botões de horário. Você confirma e pede o sinal:
-- Sinal R$ 50 (ou valor do sistema)
-- Prazo pra enviar comprovante e segurar a reserva
-
-8) Comprovante recebido:
-Agradeça e mande cuidados pré tattoo (com \\n\\n):
-- água
-- evitar álcool véspera
-- comer bem
-- hidratar pele
-- evitar sol forte na área
-
-9) Se o cliente pedir "quero falar com você / dúvidas": HANDOFF.
+OBJETIVO DO FLUXO
+- Para orçamento, o mínimo é: referência em imagem + local no corpo.
+- Tamanho em cm é opcional (se vier, use; se não vier, estime internamente).
+- Antes do preço: agregue valor descrevendo tecnicamente a referência (sem exagero).
 `;
 
 const AGENT_SYSTEM = (ENV.AGENT_SYSTEM_PROMPT || "").trim() || DEFAULT_AGENT_SYSTEM;
 
-// -------------------- AGENT CALL --------------------
-async function agentReply(session, eventName, extra = {}) {
-  const messages = [
-    { role: "system", content: AGENT_SYSTEM },
-    ...session.agentContext,
-    {
-      role: "user",
-      content: JSON.stringify({
-        event: eventName,
-        message: extra.message || "",
-        session: session.data,
-        extra,
-      }),
-    },
-  ];
-
-  const completion = await openai.chat.completions.create({
-    model: ENV.OPENAI_MODEL,
-    temperature: 0.2,
-    messages,
-  });
-
-  const raw = completion.choices?.[0]?.message?.content || "";
-  const parsed = safeJsonParse(raw);
-
-  session.agentContext.push({ role: "assistant", content: raw });
-  if (session.agentContext.length > 10) session.agentContext = session.agentContext.slice(-10);
-  scheduleSaveStore();
-
-  if (!parsed) {
-    return {
-      text: "Não peguei sua mensagem direito.\n\nPode me mandar de novo, por favor?",
-      buttons: [],
-      action: "NONE",
-      set: { stage: session.stage },
-    };
-  }
-
-  if (!parsed.buttons) parsed.buttons = [];
-  if (!parsed.action) parsed.action = "NONE";
-  if (!parsed.set) parsed.set = { stage: session.stage, data: {} };
-  if (!parsed.set.data) parsed.set.data = {};
-
-  return parsed;
-}
-
-async function applyAgentAction(phone, session, agentJson, forcedButtons = null) {
-  const { text = "", buttons = [], action = "NONE", set = {} } = agentJson;
-
-  if (set.stage) session.stage = String(set.stage);
-
-  if (set.data && typeof set.data === "object") {
-    session.data = { ...session.data, ...set.data };
-  }
-  scheduleSaveStore();
-
-  if (action === "HANDOFF_TO_OWNER") {
-    if (text) await sendTextOnce(phone, session, text);
-
-    await notifyOwner(
-      `📩 HANDOFF — cliente pediu falar com você\n\n` +
-      `Número: ${phone}\n` +
-      `Stage: ${session.stage}\n` +
-      `Última msg: ${String(text).slice(0, 200)}`
-    );
-    return;
-  }
-
-  if (action === "RESET_SESSION") {
-    resetSession(phone);
-    if (text) await sendText(phone, text);
-    return;
-  }
-
-  if (!text) return;
-
-  if (antiRepeat(session, text)) return;
-
-  const b = forcedButtons || buttons;
-  if (Array.isArray(b) && b.length > 0) {
-    await sendButtons(phone, text, b);
-  } else {
-    await sendText(phone, text);
-  }
-}
-
-// -------------------- FLOW CONTROLLER (backend) --------------------
+// -------------------- FLOW CONTROLLER --------------------
 function decideFirstChoice(inbound) {
   const id = inbound.buttonId;
   const t = norm(inbound.message);
@@ -875,12 +693,11 @@ function decideFirstChoice(inbound) {
   if (id === "first_new_budget") return "new_budget";
   if (id === "first_other_doubts") return "other_doubts";
 
-  if (t.includes("orcamento") || t === "1") return "new_budget";
+  if (t.includes("orcamento") || t.includes("orçamento") || t === "1") return "new_budget";
   if (t.includes("duvida") || t.includes("dúvida") || t.includes("falar") || t === "2") return "other_doubts";
 
   return null;
 }
-
 function decideEditChoice(inbound) {
   const id = inbound.buttonId;
   const t = norm(inbound.message);
@@ -893,91 +710,87 @@ function decideEditChoice(inbound) {
 
   return null;
 }
-
 function decideScheduleChoice(inbound) {
   const id = inbound.buttonId;
   if (id === "sched_1" || id === "sched_2" || id === "sched_3") return "picked";
   if (id === "sched_other") return "other";
   return null;
 }
-
 function messageLooksLikeReceipt(text) {
   const t = norm(text);
   return /comprovante|paguei|pix feito|enviei o pix|ta pago/.test(t);
 }
 
+// -------------------- CORE HANDLER --------------------
 async function handleInbound(phone, inbound) {
   const session = getSession(phone);
 
   const nm = safeName(inbound.contactName);
   if (nm && !session.data.name) session.data.name = nm;
 
-  // texto: tenta local/tamanho (tamanho opcional)
+  // 1) Captura imagem (URL/base64) e guarda também no cache por telefone
+  if (inbound.imageUrl || inbound.imageBase64) {
+    if (inbound.imageUrl) session.data.referenceImageUrl = inbound.imageUrl;
+    if (inbound.imageBase64) session.data.referenceImageBase64 = inbound.imageBase64;
+    setMediaCache(phone, { imageUrl: inbound.imageUrl, imageBase64: inbound.imageBase64 });
+    scheduleSaveStore();
+  }
+
+  // 2) Tenta body/size no texto
   if (inbound.message) {
     const bp = parseBodyPart(inbound.message);
     const sz = parseSizeCm(inbound.message);
     if (bp) session.data.bodyPart = bp;
-    if (sz) session.data.sizeCm = sz;
+    if (sz) session.data.sizeCm = sz; // opcional
   }
 
-  // ✅ imagem: guarda + analisa (se for nova)
-  const incomingImageRef = inbound.imageUrl || inbound.imageBase64 || null;
-  if (incomingImageRef) {
-    const isNew = incomingImageRef !== session.data.referenceImageUrl;
-    session.data.referenceImageUrl = incomingImageRef;
-
-    if (isNew) {
-      const r = await analyzeReferenceImage(
-        incomingImageRef,
-        session.data.bodyPart || "",
-        session.data.changeNotes || ""
-      );
-
-      session.data.imageSummary = r.description || "";
-      session.data.imageEstSizeCm = r.estSizeCm != null ? r.estSizeCm : null;
-      session.data.imageEstHours = r.estHours != null ? r.estHours : null;
-      session.data.imageSummaryAt = nowMs();
-
-      console.log("[IMAGE ANALYZED]", {
-        ok: Boolean(session.data.imageSummary),
-        chars: (session.data.imageSummary || "").length,
-        estSizeCm: session.data.imageEstSizeCm,
-        estHours: session.data.imageEstHours,
-      });
+  // 3) Se não veio imagem neste webhook, tenta recuperar do cache (caso a imagem tenha chegado separada)
+  if (!session.data.referenceImageUrl && !session.data.referenceImageBase64) {
+    const cached = getMediaCache(phone);
+    if (cached?.imageUrl || cached?.imageBase64) {
+      session.data.referenceImageUrl = cached.imageUrl || "";
+      session.data.referenceImageBase64 = cached.imageBase64 || "";
+      scheduleSaveStore();
     }
   }
-
-  scheduleSaveStore();
 
   // -------------------- STAGES --------------------
   if (session.stage === "start") {
     session.stage = "await_first_choice";
     scheduleSaveStore();
 
-    const agentJson = await agentReply(session, "FIRST_CONTACT");
-    const forcedButtons = [
+    const txt =
+      "Oi! Aqui é o DW Tattooer — realismo preto e cinza e whip shading.\n\n" +
+      "Como você quer seguir?";
+    return sendButtons(phone, txt, [
       { id: "first_new_budget", title: "Orçamento novo" },
       { id: "first_other_doubts", title: "Outras dúvidas" },
-    ];
-    return applyAgentAction(phone, session, agentJson, forcedButtons);
+    ], "início");
   }
 
   if (session.stage === "await_first_choice") {
     const choice = decideFirstChoice(inbound);
 
     if (choice === "other_doubts") {
-      const agentJson = await agentReply(session, "OTHER_DOUBTS");
-      agentJson.action = "HANDOFF_TO_OWNER";
-      agentJson.set = { ...(agentJson.set || {}), stage: "handoff", data: {} };
-      return applyAgentAction(phone, session, agentJson);
+      session.stage = "handoff";
+      scheduleSaveStore();
+
+      const txt = "Fechado. Me chama no meu Whats pessoal que eu te respondo por lá.";
+      await sendTextOnce(phone, session, txt);
+      await notifyOwner(`📩 HANDOFF — cliente pediu dúvidas\n\nNúmero: ${phone}\nStage: ${session.stage}`);
+      return;
     }
 
     if (choice === "new_budget") {
       session.stage = "collect_ref_body";
       scheduleSaveStore();
 
-      const agentJson = await agentReply(session, "NEW_BUDGET");
-      return applyAgentAction(phone, session, agentJson);
+      const txt =
+        "Pra eu te passar o orçamento certinho, me manda:\n\n" +
+        "• a referência em imagem\n" +
+        "• o local no corpo\n\n" +
+        "Se você souber o tamanho em cm, manda também (opcional).";
+      return sendTextOnce(phone, session, txt);
     }
 
     const txt =
@@ -990,37 +803,31 @@ async function handleInbound(phone, inbound) {
     ], "início");
   }
 
-  if (session.stage === "handoff") {
-    return;
-  }
+  if (session.stage === "handoff") return;
 
-  // ✅ AGORA: só precisa IMAGEM + LOCAL (tamanho opcional)
+  // ✅ agora o mínimo é: referência + local (tamanho é opcional)
   if (session.stage === "collect_ref_body") {
     const missing = [];
-    if (!session.data.referenceImageUrl) missing.push("referência em imagem");
+    const hasRef = Boolean(session.data.referenceImageUrl || session.data.referenceImageBase64);
+    if (!hasRef) missing.push("referência em imagem");
     if (!session.data.bodyPart) missing.push("local no corpo");
 
     if (missing.length > 0) {
-      const agentJson = await agentReply(session, "MISSING_INFO", { missing, message: inbound.message || "" });
-      return applyAgentAction(phone, session, agentJson);
-    }
-
-    // se não veio tamanho, usa estimativa da análise; se ainda não tiver, fallback simples
-    if (!session.data.sizeCm) {
-      if (session.data.imageEstSizeCm) session.data.sizeCm = session.data.imageEstSizeCm;
-      else session.data.sizeCm = 18; // fallback neutro
-      scheduleSaveStore();
+      const txt =
+        "Pra eu te atender certinho, só falta:\n\n" +
+        missing.map((m) => `• ${m}`).join("\n") +
+        "\n\nTamanho em cm é opcional.";
+      return sendTextOnce(phone, session, txt);
     }
 
     session.stage = "ask_edit";
     scheduleSaveStore();
 
-    const agentJson = await agentReply(session, "HAVE_MIN_INFO");
-    const forcedButtons = [
+    const txt = "Você quer ajustar algo na ideia antes do orçamento?";
+    return sendButtons(phone, txt, [
       { id: "edit_yes", title: "Quero ajustar" },
       { id: "edit_no", title: "Está tudo certo" },
-    ];
-    return applyAgentAction(phone, session, agentJson, forcedButtons);
+    ], "ajustes");
   }
 
   if (session.stage === "ask_edit") {
@@ -1030,8 +837,8 @@ async function handleInbound(phone, inbound) {
       session.stage = "collect_changes";
       scheduleSaveStore();
 
-      const agentJson = await agentReply(session, "EDIT_YES");
-      return applyAgentAction(phone, session, agentJson);
+      const txt = "Me diz o que você quer ajustar (detalhes, elementos, estilo, etc.).";
+      return sendTextOnce(phone, session, txt);
     }
 
     if (ch === "no") {
@@ -1050,74 +857,63 @@ async function handleInbound(phone, inbound) {
     const msg = (inbound.message || "").trim();
     if (msg) session.data.changeNotes = (session.data.changeNotes ? session.data.changeNotes + "\n" : "") + msg;
 
-    // se já tem imagem, reanalisa com os changeNotes (pra ajustar horas)
-    if (session.data.referenceImageUrl) {
-      const r = await analyzeReferenceImage(
-        session.data.referenceImageUrl,
-        session.data.bodyPart || "",
-        session.data.changeNotes || ""
-      );
-      session.data.imageSummary = r.description || session.data.imageSummary || "";
-      session.data.imageEstSizeCm = r.estSizeCm != null ? r.estSizeCm : session.data.imageEstSizeCm;
-      session.data.imageEstHours = r.estHours != null ? r.estHours : session.data.imageEstHours;
-      session.data.imageSummaryAt = nowMs();
-      if (!session.data.sizeCm && session.data.imageEstSizeCm) session.data.sizeCm = session.data.imageEstSizeCm;
-      scheduleSaveStore();
-
-      console.log("[IMAGE RE-ANALYZED]", {
-        ok: Boolean(session.data.imageSummary),
-        chars: (session.data.imageSummary || "").length,
-        estSizeCm: session.data.imageEstSizeCm,
-        estHours: session.data.imageEstHours,
-      });
-    }
-
     session.stage = "quote";
     scheduleSaveStore();
   }
 
   if (session.stage === "quote") {
-    // horas: IA primeiro; fallback por tamanho/complexidade
-    const complexity = session.data.changeNotes ? "alta" : "media";
+    const hasRef = Boolean(session.data.referenceImageUrl || session.data.referenceImageBase64);
+    if (!hasRef || !session.data.bodyPart) {
+      session.stage = "collect_ref_body";
+      scheduleSaveStore();
+      const txt =
+        "Pra eu fechar o orçamento, preciso da referência e do local no corpo.\n\n" +
+        "• referência em imagem\n" +
+        "• local no corpo";
+      return sendTextOnce(phone, session, txt);
+    }
 
-    let hours = session.data.imageEstHours;
-    if (!hours) hours = fallbackHoursBySize(session.data.sizeCm, complexity);
-    hours = clamp(hours, 1, 20);
+    // ✅ descreve + estima horas com AGENTE (tamanho opcional)
+    const imgUrl = session.data.referenceImageUrl || "";
+    const imgB64 = session.data.referenceImageBase64 || "";
 
-    const total = priceFromHours(hours);
+    const { summaryText, estHours } = await analyzeAndEstimate({
+      imageUrl: imgUrl,
+      imageBase64: imgB64,
+      bodyPart: session.data.bodyPart,
+      sizeCm: session.data.sizeCm,
+      changeNotes: session.data.changeNotes,
+    });
 
-    session.data.estHours = Number(hours.toFixed(1));
-    session.data.estTotal = total;
+    session.data.imageSummary = summaryText || "";
+    session.data.imageSummaryAt = nowMs();
+    session.data.estHours = estHours;
+    session.data.estTotal = calcTotalFromHours(estHours);
     scheduleSaveStore();
 
-    const agentJson = await agentReply(session, "QUOTE_READY");
+    console.log("[IMAGE ANALYZED]", { ok: true, chars: (summaryText || "").length, estHours });
 
-    const bullets = descriptionToBullets(session.data.imageSummary);
-    const sizeLine = session.data.sizeCm ? `• Tamanho base estimado: ${session.data.sizeCm}cm (ajustável)\n` : "";
-
+    const bullets = summarizeToBullets(summaryText);
     const preface =
       bullets
-        ? "Pela sua referência, o trabalho envolve:\n\n" +
-          `${bullets}\n\n`
-        : "Fechado.\n\n";
+        ? "Pelo que eu vi na sua referência:\n\n" +
+          `${bullets}\n\n` +
+          `No(a) ${session.data.bodyPart}, isso pede atenção pra manter as transições limpas e o acabamento bem fechado.\n\n`
+        : `Fechado.\n\nNo(a) ${session.data.bodyPart}, eu vou focar em acabamento limpo e bom envelhecimento.\n\n`;
 
     const quoteText =
       preface +
-      `No(a) ${session.data.bodyPart}, a estimativa fica assim:\n\n` +
-      (sizeLine || "") +
-      `• Tempo: ${session.data.estHours}h (estimativa)\n` +
-      `• Investimento: R$ ${session.data.estTotal}\n\n` +
+      `Estimativa de tempo: ${session.data.estHours}h\n` +
+      `Investimento: R$ ${session.data.estTotal}\n\n` +
       "Quer que eu te mande opções de datas e horários pra agendar?";
-
-    agentJson.text = quoteText;
 
     session.stage = "ask_schedule";
     scheduleSaveStore();
 
-    return applyAgentAction(phone, session, agentJson, [
+    return sendButtons(phone, quoteText, [
       { id: "sched_go", title: "Quero agendar" },
       { id: "sched_no", title: "Agora não" },
-    ]);
+    ], "agenda");
   }
 
   if (session.stage === "ask_schedule") {
@@ -1157,8 +953,7 @@ async function handleInbound(phone, inbound) {
     session.stage = "await_schedule_pick";
     scheduleSaveStore();
 
-    const txt =
-      "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
+    const txt = "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
     return sendButtons(phone, txt, scheduleButtons, "horários");
   }
 
@@ -1201,6 +996,7 @@ async function handleInbound(phone, inbound) {
       `Chave Pix:\n${pix}\n\n` +
       `Depois que fizer, me manda o comprovante aqui no Whats.\n\n` +
       `Obs: o sinal precisa ser enviado em até ${ENV.SIGNAL_DEADLINE_HOURS} horas pra garantir a reserva.`;
+
     session.data.signalSentAt = nowMs();
     session.stage = "await_receipt";
     scheduleSaveStore();
@@ -1209,7 +1005,7 @@ async function handleInbound(phone, inbound) {
   }
 
   if (session.stage === "await_receipt") {
-    if (incomingImageRef || messageLooksLikeReceipt(inbound.message)) {
+    if (inbound.imageUrl || inbound.imageBase64 || messageLooksLikeReceipt(inbound.message)) {
       session.data.receiptReceived = true;
       session.stage = "done";
       scheduleSaveStore();
@@ -1223,6 +1019,7 @@ async function handleInbound(phone, inbound) {
         "• Hidrate a pele da região nos dias anteriores.\n" +
         "• Evite sol forte na área.\n\n" +
         "Qualquer dúvida até o dia, me chama por aqui.";
+
       await notifyOwner(`✅ Comprovante recebido — ${phone}\nHorário: ${session.data.chosenSchedule}`);
       return sendTextOnce(phone, session, txt);
     }
@@ -1263,12 +1060,12 @@ async function handleInbound(phone, inbound) {
     return;
   }
 
-  // fallback (sem triplicar)
+  // fallback
   const fb =
     "Pra eu te atender certinho:\n\n" +
     "• me manda a referência em imagem\n" +
-    "• local no corpo\n" +
-    "(tamanho em cm é opcional)";
+    "• local no corpo\n\n" +
+    "Tamanho em cm é opcional.";
   return sendTextOnce(phone, session, fb);
 }
 
@@ -1283,6 +1080,7 @@ app.get("/health", (req, res) => {
     sessions: Object.keys(STORE.sessions).length,
     model: ENV.OPENAI_MODEL,
     storePath: ENV.STORE_PATH,
+    mediaCache: MEDIA_CACHE.size,
   });
 });
 
@@ -1290,10 +1088,12 @@ app.post("/", async (req, res) => {
   res.status(200).json({ ok: true });
 
   try {
+    mediaCacheCleanup();
+    cleanupProcessed();
+
     console.log("[WEBHOOK HIT] keys:", Object.keys(req.body || {}));
 
     const inbound = parseInbound(req.body || {});
-    const fp = makeFingerprint(inbound);
 
     console.log("[INBOUND PARSED]", {
       phone: inbound.phone,
@@ -1302,6 +1102,7 @@ app.post("/", async (req, res) => {
       buttonId: inbound.buttonId,
       hasImageUrl: Boolean(inbound.imageUrl),
       hasImageBase64: Boolean(inbound.imageBase64),
+      hasImageCacheKey: Boolean(inbound.imageCacheKey),
       imageUrl: inbound.imageUrl ? inbound.imageUrl.slice(0, 120) : null,
       message: inbound.message ? inbound.message.slice(0, 120) : "",
     });
@@ -1316,49 +1117,47 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    // ✅ In-flight guard: bloqueia duplicado simultâneo antes de qualquer coisa
-    if (inbound.messageId) {
-      if (INFLIGHT_MSG.has(inbound.messageId)) {
-        console.log("[IGNORED] inflight messageId:", inbound.messageId);
-        return;
-      }
-      INFLIGHT_MSG.add(inbound.messageId);
-    } else {
-      if (INFLIGHT_FP.has(fp)) {
-        console.log("[IGNORED] inflight fingerprint:", fp);
-        return;
-      }
-      INFLIGHT_FP.add(fp);
+    // ✅ fingerprint calculado já aqui
+    const fp = makeFingerprint(inbound);
+
+    // ✅ In-flight guard (bloqueia duplicata simultânea)
+    if (inbound.messageId && INFLIGHT_MSG.has(inbound.messageId)) {
+      console.log("[IGNORED] inflight msgId:", inbound.messageId);
+      return;
+    }
+    if (fp && INFLIGHT_FP.has(fp)) {
+      console.log("[IGNORED] inflight fp:", fp);
+      return;
     }
 
-    try {
-      // idempotência por messageId
-      if (inbound.messageId && wasProcessed(inbound.messageId)) {
-        console.log("[IGNORED] already processed:", inbound.messageId);
-        return;
-      }
+    if (inbound.messageId) INFLIGHT_MSG.add(inbound.messageId);
+    if (fp) INFLIGHT_FP.add(fp);
 
-      // fallback idempotência por fingerprint (quando não tem messageId)
-      if (!inbound.messageId && wasProcessedFp(fp)) {
-        console.log("[IGNORED] already processed fp:", fp);
-        return;
-      }
-
-      if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
-      else markProcessedFp(fp, inbound.phone);
-
-      cleanupProcessed();
-
-      await withPhoneLock(inbound.phone, async () => {
+    // ✅ lock por telefone primeiro, depois idempotência (sem corrida)
+    await withPhoneLock(inbound.phone, async () => {
+      try {
         console.log("[LOCK] processing phone:", inbound.phone);
+
+        if (inbound.messageId && wasProcessed(inbound.messageId)) {
+          console.log("[IGNORED] already processed msgId:", inbound.messageId);
+          return;
+        }
+        if (fp && wasProcessedFp(fp)) {
+          console.log("[IGNORED] already processed fp:", fp);
+          return;
+        }
+
+        if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
+        if (fp) markProcessedFp(fp, inbound.phone);
+
         await handleInbound(inbound.phone, inbound);
+
         console.log("[DONE] processed phone:", inbound.phone);
-      });
-    } finally {
-      // libera inflight
-      if (inbound.messageId) INFLIGHT_MSG.delete(inbound.messageId);
-      else INFLIGHT_FP.delete(fp);
-    }
+      } finally {
+        if (inbound.messageId) INFLIGHT_MSG.delete(inbound.messageId);
+        if (fp) INFLIGHT_FP.delete(fp);
+      }
+    });
   } catch (e) {
     console.error("[WEBHOOK ERROR]", e?.message || e);
   }
@@ -1368,6 +1167,7 @@ app.post("/", async (req, res) => {
 async function boot() {
   await loadStore();
   cleanupProcessed();
+  mediaCacheCleanup();
 
   console.log("🚀 DW BOT ONLINE");
   console.log("Modelo:", ENV.OPENAI_MODEL);
