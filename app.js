@@ -1,12 +1,10 @@
 // ============================================================
-// DW WhatsApp Bot — Versão AGENTE (GPT-4o) + Antiduplicação real
-// - fs/promises
-// - Sem reset do store no boot
-// - Idempotência por messageId (TTL) + fallback por fingerprint (quando messageId vem vazio)
-// - Lock por telefone (evita paralelo)
-// - Fluxo com botões conforme combinado
-// - ✅ NOVO: Captura imagem em mais formatos + analisa referência (texto técnico) antes do preço
-// - ✅ NOVO: Anti-duplicação também no fallback (evita 2~3 mensagens iguais)
+// DW WhatsApp Bot — Versão AGENTE (GPT-4o) + Antiduplicação real (FIXES)
+// - ✅ Idempotência real: messageId + fingerprint SEM timestamp (retry-safe)
+// - ✅ Usa processedFp de verdade no webhook (antes estava definido mas não aplicado)
+// - ✅ Captura imagem: URL + base64/thumbnail do webhook (sem depender de URL pública)
+// - ✅ Cache em memória p/ base64 (não grava base64 no store)
+// - ✅ Logs úteis p/ diagnosticar imagem/análise
 // ============================================================
 
 import express from "express";
@@ -39,7 +37,7 @@ const ENV = {
   IDEMPOTENCY_TTL_HOURS: Number(process.env.IDEMPOTENCY_TTL_HOURS || 48),
 
   // Preço (default ajustado)
-  HOUR_FIRST: Number(process.env.HOUR_FIRST || 150), // ✅ default 150
+  HOUR_FIRST: Number(process.env.HOUR_FIRST || 150),
   HOUR_NEXT: Number(process.env.HOUR_NEXT || 120),
 
   // PIX + sinal
@@ -49,6 +47,9 @@ const ENV = {
 
   // System prompt opcional no ENV (se vazio, usa o padrão do código)
   AGENT_SYSTEM_PROMPT: process.env.AGENT_SYSTEM_PROMPT || "",
+
+  // Cache de mídia (base64) em memória
+  MEDIA_CACHE_TTL_MIN: Number(process.env.MEDIA_CACHE_TTL_MIN || 60),
 };
 
 function missingEnvs() {
@@ -65,9 +66,9 @@ const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
 
 // -------------------- STORE --------------------
 const STORE = {
-  sessions: {},     // phone -> session
-  processed: {},    // messageId -> { at, phone }
-  processedFp: {},  // fingerprint -> { at, phone }  ✅ fallback idempotência quando messageId não vem
+  sessions: {}, // phone -> session
+  processed: {}, // messageId -> { at, phone }
+  processedFp: {}, // fingerprint -> { at, phone }
 };
 
 const saveDebounce = { t: null };
@@ -92,7 +93,11 @@ function scheduleSaveStore() {
       await fsp.writeFile(
         ENV.STORE_PATH,
         JSON.stringify(
-          { sessions: STORE.sessions, processed: STORE.processed, processedFp: STORE.processedFp },
+          {
+            sessions: STORE.sessions,
+            processed: STORE.processed,
+            processedFp: STORE.processedFp,
+          },
           null,
           2
         ),
@@ -134,7 +139,7 @@ function markProcessed(msgId, phone) {
   scheduleSaveStore();
 }
 
-// ✅ fallback idempotência (quando o Z-API não manda messageId ou manda ids diferentes em retry)
+// ✅ fingerprint idempotência (retry-safe): NÃO usa timestamp
 function fpHash(s) {
   return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
@@ -145,8 +150,7 @@ function makeFingerprint(inbound) {
     inbound.buttonId || "",
     inbound.message || "",
     inbound.imageUrl || "",
-    // se existir algo de tempo no payload, ajuda. Se não existir, não tem.
-    inbound.raw?.timestamp || inbound.raw?.data?.timestamp || inbound.raw?.t || ""
+    inbound.imageCacheKey || "", // quando vier base64
   ].join("|");
   return fpHash(base);
 }
@@ -165,25 +169,47 @@ function markProcessedFp(fp, phone) {
   scheduleSaveStore();
 }
 
+// -------------------- MEDIA CACHE (base64 em memória) --------------------
+// Evita salvar base64 no store e mantém disponível p/ análise.
+const MEDIA_CACHE = new Map(); // key -> { dataUrl, at }
+
+function mediaCachePut(dataUrl) {
+  const key = crypto.randomBytes(12).toString("hex");
+  MEDIA_CACHE.set(key, { dataUrl, at: nowMs() });
+  return key;
+}
+
+function mediaCacheGet(key) {
+  const v = MEDIA_CACHE.get(key);
+  if (!v?.dataUrl) return null;
+  return v.dataUrl;
+}
+
+function mediaCacheCleanup() {
+  const ttl = ENV.MEDIA_CACHE_TTL_MIN * 60 * 1000;
+  const cut = nowMs() - ttl;
+  for (const [k, v] of MEDIA_CACHE.entries()) {
+    if (!v?.at || v.at < cut) MEDIA_CACHE.delete(k);
+  }
+}
+
 // -------------------- SESSIONS --------------------
 function newSession() {
   return {
     stage: "start",
     lastSentHash: "",
     agentContext: [],
-
     data: {
       name: "",
       bodyPart: "",
       sizeCm: null,
       referenceImageUrl: "",
+      referenceImageCacheKey: "", // ✅ quando a imagem vier em base64
       changeNotes: "",
       imageSummary: "",
       imageSummaryAt: null,
-
       estHours: null,
       estTotal: null,
-
       chosenSchedule: "",
       wantsSchedule: false,
       signalSentAt: null,
@@ -309,7 +335,7 @@ function calcHoursAndPrice(sizeCm, complexity = "media") {
 }
 
 // ============================================================================
-// ✅ ANALISAR REFERÊNCIA (IMAGEM) — robusto (url público OU base64)
+// ✅ ANALISAR REFERÊNCIA (IMAGEM) — aceita URL ou dataURL (base64)
 // ============================================================================
 
 function summarizeToBullets(summary) {
@@ -335,8 +361,8 @@ async function fetchAsDataUrl(url) {
   return `data:${ct};base64,${b64}`;
 }
 
-async function analyzeReferenceImage(imageUrl) {
-  if (!imageUrl) return "";
+async function analyzeReferenceImage(imageUrlOrDataUrl) {
+  if (!imageUrlOrDataUrl) return "";
 
   const promptText =
     "Analise a imagem de referência da tatuagem e descreva tecnicamente, em português, " +
@@ -345,7 +371,30 @@ async function analyzeReferenceImage(imageUrl) {
     "áreas que exigem mais tempo (rostos, mãos, fundo, transições). " +
     "Não dê preço. Retorne só texto.";
 
-  // 1) tenta direto com URL
+  // 1) se já veio dataURL (base64), manda direto
+  if (String(imageUrlOrDataUrl).startsWith("data:")) {
+    try {
+      const completion = await openai.chat.completions.create({
+        model: ENV.OPENAI_MODEL,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: promptText },
+              { type: "image_url", image_url: { url: imageUrlOrDataUrl } },
+            ],
+          },
+        ],
+      });
+      return String(completion.choices?.[0]?.message?.content || "").trim();
+    } catch (e0) {
+      console.error("[IMAGE ANALYSIS DATAURL ERROR]", e0?.message || e0);
+      return "";
+    }
+  }
+
+  // 2) tenta direto com URL
   try {
     const completion = await openai.chat.completions.create({
       model: ENV.OPENAI_MODEL,
@@ -355,7 +404,7 @@ async function analyzeReferenceImage(imageUrl) {
           role: "user",
           content: [
             { type: "text", text: promptText },
-            { type: "image_url", image_url: { url: imageUrl } },
+            { type: "image_url", image_url: { url: imageUrlOrDataUrl } },
           ],
         },
       ],
@@ -364,10 +413,9 @@ async function analyzeReferenceImage(imageUrl) {
   } catch (e1) {
     console.error("[IMAGE ANALYSIS URL ERROR]", e1?.message || e1);
 
-    // 2) fallback: baixa e manda base64 (resolve quando URL não é público pro OpenAI)
+    // 3) fallback: baixa e manda base64 (resolve quando URL não é público)
     try {
-      const dataUrl = await fetchAsDataUrl(imageUrl);
-
+      const dataUrl = await fetchAsDataUrl(imageUrlOrDataUrl);
       const completion2 = await openai.chat.completions.create({
         model: ENV.OPENAI_MODEL,
         temperature: 0.2,
@@ -418,7 +466,6 @@ async function sendText(phone, message) {
   return zapiFetch("/send-text", { phone, message });
 }
 
-// ✅ envia texto respeitando antiRepeat
 async function sendTextOnce(phone, session, message) {
   if (!message) return;
   if (antiRepeat(session, message)) return;
@@ -470,6 +517,29 @@ function pickFirstString(...vals) {
   return null;
 }
 
+function pickFirstBase64(...vals) {
+  for (const v of vals) {
+    if (typeof v === "string" && v.trim().length > 64) return v.trim();
+  }
+  return null;
+}
+
+function normalizeMime(m) {
+  const s = String(m || "").toLowerCase().trim();
+  if (!s) return "image/jpeg";
+  if (s.includes("png")) return "image/png";
+  if (s.includes("webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+// Monta dataURL se vier base64 no webhook
+function buildDataUrlFromBase64(b64, mime) {
+  if (!b64) return null;
+  const clean = b64.replace(/^data:.*;base64,/, "");
+  const mt = normalizeMime(mime);
+  return `data:${mt};base64,${clean}`;
+}
+
 function parseInbound(body) {
   const phone =
     body?.phone ||
@@ -501,7 +571,6 @@ function parseInbound(body) {
     body?.data?.text ||
     "";
 
-  // ✅ MUITO MAIS ROBUSTO: tenta achar URL de mídia em vários formatos
   const imageUrl = pickFirstString(
     body?.image?.imageUrl,
     body?.image?.url,
@@ -520,12 +589,36 @@ function parseInbound(body) {
     body?.message?.image?.imageUrl,
     body?.message?.media?.url,
     body?.message?.mediaUrl,
-    // alguns payloads “whatsapp-like”
+    // whatsapp-like
     body?.data?.message?.imageMessage?.url,
-    body?.data?.message?.imageMessage?.directPath,
     body?.data?.message?.documentMessage?.url,
     body?.data?.message?.videoMessage?.url
   );
+
+  // ✅ base64/thumbnail (alguns webhooks mandam isso em vez de URL)
+  const b64 = pickFirstBase64(
+    body?.image?.base64,
+    body?.image?.data,
+    body?.data?.image?.base64,
+    body?.data?.image?.data,
+    body?.data?.message?.image?.base64,
+    body?.data?.message?.image?.data,
+    body?.data?.message?.imageMessage?.jpegThumbnail, // comum em payloads
+    body?.message?.image?.base64,
+    body?.message?.image?.data
+  );
+
+  const mime = pickFirstString(
+    body?.image?.mimetype,
+    body?.image?.mimeType,
+    body?.data?.image?.mimetype,
+    body?.data?.image?.mimeType,
+    body?.data?.message?.image?.mimetype,
+    body?.data?.message?.image?.mimeType,
+    body?.data?.message?.imageMessage?.mimetype
+  );
+
+  const imageDataUrl = b64 ? buildDataUrlFromBase64(b64, mime) : null;
 
   const messageId =
     body?.messageId ||
@@ -556,6 +649,12 @@ function parseInbound(body) {
 
   const text = (buttonTitle || (typeof msg === "string" ? msg : "") || "").toString().trim();
 
+  // ✅ se veio dataUrl, guarda em cache e usa key (sem persistir base64 no store)
+  let imageCacheKey = null;
+  if (imageDataUrl) {
+    imageCacheKey = mediaCachePut(imageDataUrl);
+  }
+
   return {
     phone: phone ? String(phone) : null,
     fromMe,
@@ -564,6 +663,7 @@ function parseInbound(body) {
     buttonId: buttonId ? String(buttonId) : null,
     message: text,
     imageUrl: imageUrl ? String(imageUrl) : null,
+    imageCacheKey, // ✅ chave do cache se veio base64
     raw: body,
   };
 }
@@ -601,7 +701,7 @@ function generateScheduleButtons() {
   ];
 }
 
-// -------------------- SYSTEM PROMPT (final) --------------------
+// -------------------- SYSTEM PROMPT --------------------
 const DEFAULT_AGENT_SYSTEM = `
 Você é o DW Tattooer atendendo no WhatsApp.
 
@@ -651,23 +751,14 @@ Botões:
 - Está tudo certo
 
 5) Ajustar => peça a ideia/ajustes.
-6) Está tudo certo => faça orçamento (texto curto explicando criação autoral, black & grey + whip, encaixe e durabilidade) e mostre:
+6) Está tudo certo => faça orçamento e mostre:
 - R$ {{estTotal}}
 - {{estHours}}h (estimativa)
 Depois pergunte se quer agendar.
 
-7) Se quiser agendar: o backend vai mandar 4 botões de horário. Você só confirma e pede o sinal:
-- Sinal R$ 50 (ou valor do sistema)
-- 4 horas pra enviar comprovante e segurar a reserva
-Tom humano e profissional.
+7) Se quiser agendar: o backend manda 4 botões. Confirma e pede o sinal.
 
-8) Comprovante recebido:
-Agradeça e mande cuidados pré tattoo (com \\n\\n):
-- água
-- evitar álcool véspera
-- comer bem
-- hidratar pele
-- evitar sol forte na área
+8) Comprovante recebido: agradeça e mande cuidados pré tattoo.
 
 9) Se o cliente pedir "quero falar com você / dúvidas": HANDOFF.
 `;
@@ -742,10 +833,7 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
   const { text = "", buttons = [], action = "NONE", set = {} } = agentJson;
 
   if (set.stage) session.stage = String(set.stage);
-
-  if (set.data && typeof set.data === "object") {
-    session.data = { ...session.data, ...set.data };
-  }
+  if (set.data && typeof set.data === "object") session.data = { ...session.data, ...set.data };
   scheduleSaveStore();
 
   if (action === "HANDOFF_TO_OWNER") {
@@ -753,9 +841,9 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
 
     await notifyOwner(
       `📩 HANDOFF — cliente pediu falar com você\n\n` +
-      `Número: ${phone}\n` +
-      `Stage: ${session.stage}\n` +
-      `Última msg: ${String(text).slice(0, 200)}`
+        `Número: ${phone}\n` +
+        `Stage: ${session.stage}\n` +
+        `Última msg: ${String(text).slice(0, 200)}`
     );
     return;
   }
@@ -768,7 +856,6 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
 
   if (!text) return;
 
-  // anti-repeat aqui
   if (antiRepeat(session, text)) return;
 
   const b = forcedButtons || buttons;
@@ -779,7 +866,7 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
   }
 }
 
-// -------------------- FLOW CONTROLLER (backend) --------------------
+// -------------------- FLOW CONTROLLER --------------------
 function decideFirstChoice(inbound) {
   const id = inbound.buttonId;
   const t = norm(inbound.message);
@@ -824,15 +911,44 @@ async function handleInbound(phone, inbound) {
   const nm = safeName(inbound.contactName);
   if (nm && !session.data.name) session.data.name = nm;
 
-  // ✅ se chegou imagem, guarda + analisa (se for nova)
-  if (inbound.imageUrl) {
-    const isNew = inbound.imageUrl !== session.data.referenceImageUrl;
-    session.data.referenceImageUrl = inbound.imageUrl;
+  // ✅ se chegou imagem: URL OU base64(cacheKey)
+  if (inbound.imageUrl || inbound.imageCacheKey) {
+    const newUrl = inbound.imageUrl || "";
+    const newKey = inbound.imageCacheKey || "";
+
+    const isNew =
+      (newUrl && newUrl !== session.data.referenceImageUrl) ||
+      (newKey && newKey !== session.data.referenceImageCacheKey);
+
+    if (newUrl) session.data.referenceImageUrl = newUrl;
+    if (newKey) session.data.referenceImageCacheKey = newKey;
+
+    scheduleSaveStore();
 
     if (isNew) {
-      const summary = await analyzeReferenceImage(inbound.imageUrl);
-      session.data.imageSummary = summary || "";
-      session.data.imageSummaryAt = nowMs();
+      try {
+        console.log("[IMAGE RECEIVED]", {
+          hasUrl: Boolean(newUrl),
+          hasCacheKey: Boolean(newKey),
+          url: newUrl ? newUrl.slice(0, 120) : null,
+        });
+
+        const dataUrl = newKey ? mediaCacheGet(newKey) : null;
+        const toAnalyze = dataUrl || newUrl;
+
+        const summary = await analyzeReferenceImage(toAnalyze);
+        session.data.imageSummary = summary || "";
+        session.data.imageSummaryAt = nowMs();
+
+        console.log("[IMAGE ANALYZED]", {
+          ok: Boolean(summary),
+          chars: (summary || "").length,
+        });
+
+        scheduleSaveStore();
+      } catch (e) {
+        console.error("[IMAGE ANALYSIS UNCAUGHT]", e?.message || e);
+      }
     }
   }
 
@@ -877,23 +993,23 @@ async function handleInbound(phone, inbound) {
       return applyAgentAction(phone, session, agentJson);
     }
 
-    const txt =
-      "Só me confirma como você quer seguir:\n\n" +
-      "• Orçamento novo\n" +
-      "• Outras dúvidas";
-    return sendButtons(phone, txt, [
-      { id: "first_new_budget", title: "Orçamento novo" },
-      { id: "first_other_doubts", title: "Outras dúvidas" },
-    ], "início");
+    const txt = "Só me confirma como você quer seguir:\n\n• Orçamento novo\n• Outras dúvidas";
+    return sendButtons(
+      phone,
+      txt,
+      [
+        { id: "first_new_budget", title: "Orçamento novo" },
+        { id: "first_other_doubts", title: "Outras dúvidas" },
+      ],
+      "início"
+    );
   }
 
-  if (session.stage === "handoff") {
-    return;
-  }
+  if (session.stage === "handoff") return;
 
   if (session.stage === "collect_ref_body_size") {
     const missing = [];
-    if (!session.data.referenceImageUrl) missing.push("referência em imagem");
+    if (!session.data.referenceImageUrl && !session.data.referenceImageCacheKey) missing.push("referência em imagem");
     if (!session.data.bodyPart) missing.push("local no corpo");
     if (!session.data.sizeCm) missing.push("tamanho em cm");
 
@@ -929,10 +1045,15 @@ async function handleInbound(phone, inbound) {
       scheduleSaveStore();
     } else {
       const txt = "Você quer ajustar algo na ideia antes do orçamento?";
-      return sendButtons(phone, txt, [
-        { id: "edit_yes", title: "Quero ajustar" },
-        { id: "edit_no", title: "Está tudo certo" },
-      ], "ajustes");
+      return sendButtons(
+        phone,
+        txt,
+        [
+          { id: "edit_yes", title: "Quero ajustar" },
+          { id: "edit_no", title: "Está tudo certo" },
+        ],
+        "ajustes"
+      );
     }
   }
 
@@ -954,12 +1075,11 @@ async function handleInbound(phone, inbound) {
     const agentJson = await agentReply(session, "QUOTE_READY");
 
     const bullets = summarizeToBullets(session.data.imageSummary);
-    const preface =
-      bullets
-        ? "Pelo que eu vi na sua referência, o projeto tem esses pontos principais:\n\n" +
-          `${bullets}\n\n` +
-          "Isso influencia direto no tempo (sombras, transições e acabamento) pra ficar limpo e com bom envelhecimento.\n\n"
-        : "Fechado.\n\n";
+    const preface = bullets
+      ? "Pelo que eu vi na sua referência, o projeto tem esses pontos principais:\n\n" +
+        `${bullets}\n\n` +
+        "Isso influencia direto no tempo (sombras, transições e acabamento) pra ficar limpo e com bom envelhecimento.\n\n"
+      : "Fechado.\n\n";
 
     const quoteText =
       preface +
@@ -983,22 +1103,11 @@ async function handleInbound(phone, inbound) {
     const t = norm(inbound.message);
     const id = inbound.buttonId;
 
-    const wants =
-      id === "sched_go" ||
-      t.includes("agendar") ||
-      t.includes("quero") ||
-      t === "1";
-
-    const notNow =
-      id === "sched_no" ||
-      t.includes("agora nao") ||
-      t.includes("agora não") ||
-      t.includes("depois") ||
-      t === "2";
+    const wants = id === "sched_go" || t.includes("agendar") || t.includes("quero") || t === "1";
+    const notNow = id === "sched_no" || t.includes("agora nao") || t.includes("agora não") || t.includes("depois") || t === "2";
 
     if (notNow) {
-      const txt =
-        "Fechado.\n\nQuando você quiser seguir com o agendamento, é só me chamar aqui que eu te mando as opções.";
+      const txt = "Fechado.\n\nQuando você quiser seguir com o agendamento, é só me chamar aqui que eu te mando as opções.";
       session.stage = "post_quote";
       scheduleSaveStore();
       return sendTextOnce(phone, session, txt);
@@ -1006,18 +1115,22 @@ async function handleInbound(phone, inbound) {
 
     if (!wants) {
       const txt = "Quer que eu te mande opções de datas e horários agora?";
-      return sendButtons(phone, txt, [
-        { id: "sched_go", title: "Quero agendar" },
-        { id: "sched_no", title: "Agora não" },
-      ], "agenda");
+      return sendButtons(
+        phone,
+        txt,
+        [
+          { id: "sched_go", title: "Quero agendar" },
+          { id: "sched_no", title: "Agora não" },
+        ],
+        "agenda"
+      );
     }
 
     const scheduleButtons = generateScheduleButtons();
     session.stage = "await_schedule_pick";
     scheduleSaveStore();
 
-    const txt =
-      "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
+    const txt = "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
     return sendButtons(phone, txt, scheduleButtons, "horários");
   }
 
@@ -1032,8 +1145,7 @@ async function handleInbound(phone, inbound) {
       session.stage = "await_custom_schedule";
       scheduleSaveStore();
 
-      const txt =
-        "Fechado.\n\nMe manda o dia e horário que você prefere (ex: terça 19h / sábado 15h) que eu tento encaixar na agenda.";
+      const txt = "Fechado.\n\nMe manda o dia e horário que você prefere (ex: terça 19h / sábado 15h) que eu tento encaixar na agenda.";
       return sendTextOnce(phone, session, txt);
     } else {
       const scheduleButtons = generateScheduleButtons();
@@ -1060,6 +1172,7 @@ async function handleInbound(phone, inbound) {
       `Chave Pix:\n${pix}\n\n` +
       `Depois que fizer, me manda o comprovante aqui no Whats.\n\n` +
       `Obs: o sinal precisa ser enviado em até ${ENV.SIGNAL_DEADLINE_HOURS} horas pra garantir a reserva.`;
+
     session.data.signalSentAt = nowMs();
     session.stage = "await_receipt";
     scheduleSaveStore();
@@ -1068,7 +1181,7 @@ async function handleInbound(phone, inbound) {
   }
 
   if (session.stage === "await_receipt") {
-    if (inbound.imageUrl || messageLooksLikeReceipt(inbound.message)) {
+    if (inbound.imageUrl || inbound.imageCacheKey || messageLooksLikeReceipt(inbound.message)) {
       session.data.receiptReceived = true;
       session.stage = "done";
       scheduleSaveStore();
@@ -1082,6 +1195,7 @@ async function handleInbound(phone, inbound) {
         "• Hidrate a pele da região nos dias anteriores.\n" +
         "• Evite sol forte na área.\n\n" +
         "Qualquer dúvida até o dia, me chama por aqui.";
+
       await notifyOwner(`✅ Comprovante recebido — ${phone}\nHorário: ${session.data.chosenSchedule}`);
       return sendTextOnce(phone, session, txt);
     }
@@ -1098,10 +1212,15 @@ async function handleInbound(phone, inbound) {
       s2.stage = "await_first_choice";
       scheduleSaveStore();
       const txt = "Beleza.\n\nComo você quer seguir?";
-      return sendButtons(phone, txt, [
-        { id: "first_new_budget", title: "Orçamento novo" },
-        { id: "first_other_doubts", title: "Outras dúvidas" },
-      ], "início");
+      return sendButtons(
+        phone,
+        txt,
+        [
+          { id: "first_new_budget", title: "Orçamento novo" },
+          { id: "first_other_doubts", title: "Outras dúvidas" },
+        ],
+        "início"
+      );
     }
     return;
   }
@@ -1114,20 +1233,21 @@ async function handleInbound(phone, inbound) {
       s2.stage = "await_first_choice";
       scheduleSaveStore();
       const txt = "Como você quer seguir?";
-      return sendButtons(phone, txt, [
-        { id: "first_new_budget", title: "Orçamento novo" },
-        { id: "first_other_doubts", title: "Outras dúvidas" },
-      ], "início");
+      return sendButtons(
+        phone,
+        txt,
+        [
+          { id: "first_new_budget", title: "Orçamento novo" },
+          { id: "first_other_doubts", title: "Outras dúvidas" },
+        ],
+        "início"
+      );
     }
     return;
   }
 
-  // ✅ fallback agora também respeita antiRepeat (para não triplicar)
-  const fb =
-    "Pra eu te atender certinho:\n\n" +
-    "• me manda a referência em imagem\n" +
-    "• local no corpo\n" +
-    "• tamanho em cm";
+  // fallback (anti duplicação)
+  const fb = "Pra eu te atender certinho:\n\n• me manda a referência em imagem\n• local no corpo\n• tamanho em cm";
   return sendTextOnce(phone, session, fb);
 }
 
@@ -1149,23 +1269,24 @@ app.post("/", async (req, res) => {
   res.status(200).json({ ok: true });
 
   try {
-    // LOG 1: confirma que chegou algo
+    mediaCacheCleanup();
+    cleanupProcessed();
+
     console.log("[WEBHOOK HIT] keys:", Object.keys(req.body || {}));
 
     const inbound = parseInbound(req.body || {});
 
-    // LOG 2: mostra o que o parseInbound conseguiu extrair
     console.log("[INBOUND PARSED]", {
       phone: inbound.phone,
       fromMe: inbound.fromMe,
       messageId: inbound.messageId,
       buttonId: inbound.buttonId,
       hasImageUrl: Boolean(inbound.imageUrl),
+      hasImageCacheKey: Boolean(inbound.imageCacheKey),
       imageUrl: inbound.imageUrl ? inbound.imageUrl.slice(0, 120) : null,
       message: inbound.message ? inbound.message.slice(0, 120) : "",
     });
 
-    // LOG 3: se não pegou phone, imprime um recorte do body pra ajustar parseInbound
     if (!inbound.phone) {
       console.log("[NO PHONE] body sample:", JSON.stringify(req.body || {}).slice(0, 1200));
       return;
@@ -1176,15 +1297,21 @@ app.post("/", async (req, res) => {
       return;
     }
 
-    // idempotência por messageId
+    // ✅ idempotência: messageId + fingerprint (retry-safe)
+    const fp = makeFingerprint(inbound);
+
     if (inbound.messageId && wasProcessed(inbound.messageId)) {
-      console.log("[IGNORED] already processed:", inbound.messageId);
+      console.log("[IGNORED] already processed msgId:", inbound.messageId);
       return;
     }
-    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
-    cleanupProcessed();
+    if (fp && wasProcessedFp(fp)) {
+      console.log("[IGNORED] already processed fp:", fp);
+      return;
+    }
 
-    // lock por telefone (evita paralelo)
+    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
+    if (fp) markProcessedFp(fp, inbound.phone);
+
     await withPhoneLock(inbound.phone, async () => {
       console.log("[LOCK] processing phone:", inbound.phone);
       await handleInbound(inbound.phone, inbound);
@@ -1199,6 +1326,7 @@ app.post("/", async (req, res) => {
 async function boot() {
   await loadStore();
   cleanupProcessed();
+  mediaCacheCleanup();
 
   console.log("🚀 DW BOT ONLINE");
   console.log("Modelo:", ENV.OPENAI_MODEL);
