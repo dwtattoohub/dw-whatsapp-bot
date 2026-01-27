@@ -1062,7 +1062,7 @@ app.get("/health", (req, res) => {
     model: ENV.OPENAI_MODEL,
     storePath: ENV.STORE_PATH,
   });
-}
+});
 
 app.post("/", async (req, res) => {
   res.status(200).json({ ok: true });
@@ -1074,7 +1074,7 @@ app.post("/", async (req, res) => {
 
     cleanupProcessed();
 
-    // ✅ Anti-duplicação:
+    // Anti-duplicação:
     // 1) usa messageId quando existe
     // 2) se messageId vier vazio/instável, usa assinatura (phone+texto+img+botao)
     const primaryKey = inbound.messageId ? `mid:${inbound.messageId}` : "";
