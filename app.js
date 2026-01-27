@@ -1149,25 +1149,46 @@ app.post("/", async (req, res) => {
   res.status(200).json({ ok: true });
 
   try {
+    // LOG 1: confirma que chegou algo
+    console.log("[WEBHOOK HIT] keys:", Object.keys(req.body || {}));
+
     const inbound = parseInbound(req.body || {});
-    if (!inbound.phone) return;
-    if (inbound.fromMe) return;
 
-    // idempotência por messageId
-    if (inbound.messageId && wasProcessed(inbound.messageId)) return;
-    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
+    // LOG 2: mostra o que o parseInbound conseguiu extrair
+    console.log("[INBOUND PARSED]", {
+      phone: inbound.phone,
+      fromMe: inbound.fromMe,
+      messageId: inbound.messageId,
+      buttonId: inbound.buttonId,
+      hasImageUrl: Boolean(inbound.imageUrl),
+      imageUrl: inbound.imageUrl ? inbound.imageUrl.slice(0, 120) : null,
+      message: inbound.message ? inbound.message.slice(0, 120) : "",
+    });
 
-    // ✅ fallback idempotência por fingerprint (quando messageId vem vazio ou muda em retry)
-    const fp = makeFingerprint(inbound);
-    if (!inbound.messageId) {
-      if (wasProcessedFp(fp)) return;
-      markProcessedFp(fp, inbound.phone);
+    // LOG 3: se não pegou phone, imprime um recorte do body pra ajustar parseInbound
+    if (!inbound.phone) {
+      console.log("[NO PHONE] body sample:", JSON.stringify(req.body || {}).slice(0, 1200));
+      return;
     }
 
+    if (inbound.fromMe) {
+      console.log("[IGNORED] fromMe");
+      return;
+    }
+
+    // idempotência por messageId
+    if (inbound.messageId && wasProcessed(inbound.messageId)) {
+      console.log("[IGNORED] already processed:", inbound.messageId);
+      return;
+    }
+    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
     cleanupProcessed();
 
+    // lock por telefone (evita paralelo)
     await withPhoneLock(inbound.phone, async () => {
+      console.log("[LOCK] processing phone:", inbound.phone);
       await handleInbound(inbound.phone, inbound);
+      console.log("[DONE] processed phone:", inbound.phone);
     });
   } catch (e) {
     console.error("[WEBHOOK ERROR]", e?.message || e);
