@@ -1,10 +1,10 @@
 // ============================================================
 // DW WhatsApp Bot — Versão AGENTE (GPT-4o) + Antiduplicação real
-// - Corrige fs.readFile (utf8) -> fs/promises
-// - Remove reset do store no boot
-// - Idempotência por messageId (TTL)
-// - Lock por telefone (evita paralelo = respostas duplicadas)
-// - Fluxo com botões conforme combinado
+// AJUSTES (mínimos):
+// 1) Captura de imagem (parseInbound) mais robusta
+// 2) Leitura/análise da imagem (Vision) -> session.data.imageSummary + imageComplexity
+// 3) Anti-duplicação extra quando messageId vem vazio/instável (fallback signature)
+// 4) Evitar envios duplicados também fora do applyAgentAction (sendTextSafe / sendButtonsSafe)
 // ============================================================
 
 import express from "express";
@@ -64,7 +64,7 @@ const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
 // -------------------- STORE --------------------
 const STORE = {
   sessions: {},     // phone -> session
-  processed: {},    // messageId -> { at, phone }
+  processed: {},    // key -> { at, phone }
 };
 
 const saveDebounce = { t: null };
@@ -108,17 +108,17 @@ function cleanupProcessed() {
   }
 }
 
-function wasProcessed(msgId) {
-  if (!msgId) return false;
-  const v = STORE.processed[msgId];
+function wasProcessed(key) {
+  if (!key) return false;
+  const v = STORE.processed[key];
   if (!v?.at) return false;
   const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
   return v.at >= nowMs() - ttl;
 }
 
-function markProcessed(msgId, phone) {
-  if (!msgId) return;
-  STORE.processed[msgId] = { at: nowMs(), phone };
+function markProcessed(key, phone) {
+  if (!key) return;
+  STORE.processed[key] = { at: nowMs(), phone };
   scheduleSaveStore();
 }
 
@@ -135,7 +135,11 @@ function newSession() {
       sizeCm: null,
       referenceImageUrl: "",
       changeNotes: "",
+
+      // NOVO (somente preenchido automaticamente, não muda fluxo)
       imageSummary: "",
+      imageComplexity: "",        // "baixa" | "media" | "alta"
+      imageSummaryForUrl: "",     // guarda URL analisada pra não reanalisar
 
       estHours: null,
       estTotal: null,
@@ -174,7 +178,6 @@ async function withPhoneLock(phone, fn) {
     return await fn();
   } finally {
     release();
-    // limpa lock se não tem fila
     if (PHONE_LOCKS.get(phone) === cur) PHONE_LOCKS.delete(phone);
   }
 }
@@ -297,7 +300,6 @@ async function sendText(phone, message) {
 async function sendButtons(phone, text, buttons, label = "menu") {
   await humanDelay();
 
-  // tenta lista
   try {
     await zapiFetch("/send-button-list", {
       phone,
@@ -310,7 +312,6 @@ async function sendButtons(phone, text, buttons, label = "menu") {
     return true;
   } catch {}
 
-  // tenta buttons normal
   try {
     await zapiFetch("/send-buttons", {
       phone,
@@ -320,7 +321,6 @@ async function sendButtons(phone, text, buttons, label = "menu") {
     return true;
   } catch {}
 
-  // fallback texto
   let fb = `${text}\n\n`;
   buttons.forEach((b, i) => (fb += `${i + 1}) ${b.title}\n`));
   await sendText(phone, fb.trim());
@@ -332,6 +332,19 @@ async function notifyOwner(text) {
   try {
     await zapiFetch("/send-text", { phone: ENV.OWNER_PHONE, message: text });
   } catch {}
+}
+
+// --------- SAFE SEND (evita duplicar fora do applyAgentAction) ----------
+async function sendTextSafe(phone, session, text) {
+  if (!text) return;
+  if (antiRepeat(session, text)) return;
+  return sendText(phone, text);
+}
+
+async function sendButtonsSafe(phone, session, text, buttons, label = "menu") {
+  // antiRepeat só no TEXTO (botões podem variar, mas aqui a gente quer travar repetição real)
+  if (text && antiRepeat(session, text)) return;
+  return sendButtons(phone, text, buttons, label);
 }
 
 // -------------------- INBOUND PARSER (robusto) --------------------
@@ -366,15 +379,23 @@ function parseInbound(body) {
     body?.data?.text ||
     "";
 
+  // ✅ AJUSTE: captura de imagem MUITO mais robusta (Z-API varia payload)
   const imageUrl =
     body?.image?.imageUrl ||
     body?.image?.url ||
     body?.imageUrl ||
-    body?.message?.image?.url ||
-    body?.media?.url ||
+
     body?.data?.image?.imageUrl ||
-    body?.data?.imageUrl ||
+    body?.data?.image?.url ||
+    body?.data?.message?.imageUrl ||
+    body?.data?.message?.image?.url ||
+    body?.message?.image?.url ||
+    body?.message?.image?.imageUrl ||
+    body?.message?.message?.imageUrl ||
+
+    body?.media?.url ||
     body?.data?.mediaUrl ||
+    body?.data?.media?.url ||
     null;
 
   // Z-API message id (idempotência)
@@ -434,15 +455,12 @@ function formatScheduleLabel(d, hour) {
 function generateScheduleButtons() {
   const now = new Date();
 
-  // pós almoço (dias aleatórios próximos)
   const d1 = new Date(now.getTime() + 86400000 * (1 + Math.floor(Math.random() * 4)));
   const h1 = randomPick(["13:30", "14:00", "15:00", "16:00"]);
 
-  // 19h-ish
   const d2 = new Date(now.getTime() + 86400000 * (2 + Math.floor(Math.random() * 5)));
   const h2 = randomPick(["19:00", "19:30", "20:00"]);
 
-  // fim de semana
   const d3 = new Date(now.getTime());
   while (d3.getDay() !== 0 && d3.getDay() !== 6) d3.setDate(d3.getDate() + 1);
   const h3 = randomPick(["14:00", "15:00", "16:30", "18:00", "19:00"]);
@@ -526,22 +544,17 @@ Agradeça e mande cuidados pré tattoo (com \\n\\n):
 9) Se o cliente pedir "quero falar com você / dúvidas": HANDOFF.
 `;
 
-// Permite sobrescrever pelo ENV
 const AGENT_SYSTEM = (ENV.AGENT_SYSTEM_PROMPT || "").trim() || DEFAULT_AGENT_SYSTEM;
 
 // -------------------- JSON parse robusto --------------------
 function safeJsonParse(raw) {
   const s = String(raw || "").trim();
-
-  // remove cercas
   const noFences = s.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
 
-  // tenta parse direto
   try {
     return JSON.parse(noFences);
   } catch {}
 
-  // tenta extrair primeiro objeto {...}
   const start = noFences.indexOf("{");
   const end = noFences.lastIndexOf("}");
   if (start >= 0 && end > start) {
@@ -551,6 +564,67 @@ function safeJsonParse(raw) {
     } catch {}
   }
   return null;
+}
+
+// -------------------- IMAGE ANALYSIS (Vision) --------------------
+// Lê a imagem e salva:
+// - session.data.imageSummary (descrição técnica)
+// - session.data.imageComplexity ("baixa"|"media"|"alta")
+async function analyzeReferenceImageIfNeeded(session) {
+  const url = session?.data?.referenceImageUrl;
+  if (!url) return;
+
+  // evita reanalisar a mesma URL
+  if (session.data.imageSummaryForUrl && session.data.imageSummaryForUrl === url && session.data.imageSummary) return;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: ENV.OPENAI_MODEL,
+      temperature: 0.2,
+      max_tokens: 350,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Você é um tatuador especialista em realismo black & grey e whip shading. " +
+            "Analise a imagem de referência e descreva tecnicamente os elementos e a complexidade. " +
+            "No final, defina a complexidade como UMA palavra: baixa, media ou alta.",
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text:
+              "Descreva a tattoo em tópicos curtos e objetivos.\n" +
+              "- Elementos (quantidade e tipos)\n" +
+              "- Nível de detalhes (pele, textura, rosto, fundo)\n" +
+              "- Contraste e áreas pretas sólidas\n" +
+              "- Se tem múltiplos rostos/figuras\n" +
+              "- Se tem fundo complexo\n\n" +
+              "Finalize com:\nCOMPLEXIDADE: baixa|media|alta"
+            },
+            { type: "image_url", image_url: { url } },
+          ],
+        },
+      ],
+    });
+
+    const text = String(completion.choices?.[0]?.message?.content || "").trim();
+
+    // extrai complexidade do final
+    const m = text.match(/COMPLEXIDADE:\s*(baixa|media|alta)/i);
+    const cx = m ? m[1].toLowerCase() : "media";
+
+    // remove a linha COMPLEXIDADE do resumo
+    const clean = text.replace(/COMPLEXIDADE:\s*(baixa|media|alta)\s*/gi, "").trim();
+
+    session.data.imageSummary = clean || "";
+    session.data.imageComplexity = cx;
+    session.data.imageSummaryForUrl = url;
+    scheduleSaveStore();
+  } catch (e) {
+    console.error("[IMAGE ANALYSIS ERROR]", e?.message || e);
+    // não trava fluxo
+  }
 }
 
 // -------------------- AGENT CALL --------------------
@@ -578,7 +652,6 @@ async function agentReply(session, eventName, extra = {}) {
   const raw = completion.choices?.[0]?.message?.content || "";
   const parsed = safeJsonParse(raw);
 
-  // guarda histórico (curto)
   session.agentContext.push({ role: "assistant", content: raw });
   if (session.agentContext.length > 10) session.agentContext = session.agentContext.slice(-10);
   scheduleSaveStore();
@@ -592,7 +665,6 @@ async function agentReply(session, eventName, extra = {}) {
     };
   }
 
-  // normaliza campos
   if (!parsed.buttons) parsed.buttons = [];
   if (!parsed.action) parsed.action = "NONE";
   if (!parsed.set) parsed.set = { stage: session.stage, data: {} };
@@ -604,18 +676,15 @@ async function agentReply(session, eventName, extra = {}) {
 async function applyAgentAction(phone, session, agentJson, forcedButtons = null) {
   const { text = "", buttons = [], action = "NONE", set = {} } = agentJson;
 
-  // merge stage
   if (set.stage) session.stage = String(set.stage);
 
-  // merge data
   if (set.data && typeof set.data === "object") {
     session.data = { ...session.data, ...set.data };
   }
   scheduleSaveStore();
 
-  // HANDOFF
   if (action === "HANDOFF_TO_OWNER") {
-    if (text && !antiRepeat(session, text)) await sendText(phone, text);
+    if (text) await sendTextSafe(phone, session, text);
 
     await notifyOwner(
       `📩 HANDOFF — cliente pediu falar com você\n\n` +
@@ -626,22 +695,19 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
     return;
   }
 
-  // RESET
   if (action === "RESET_SESSION") {
     resetSession(phone);
     if (text) await sendText(phone, text);
     return;
   }
 
-  // NORMAL send
   if (!text) return;
-  if (antiRepeat(session, text)) return;
 
   const b = forcedButtons || buttons;
   if (Array.isArray(b) && b.length > 0) {
-    await sendButtons(phone, text, b);
+    await sendButtonsSafe(phone, session, text, b);
   } else {
-    await sendText(phone, text);
+    await sendTextSafe(phone, session, text);
   }
 }
 
@@ -687,7 +753,6 @@ function messageLooksLikeReceipt(text) {
 async function handleInbound(phone, inbound) {
   const session = getSession(phone);
 
-  // salva nome
   const nm = safeName(inbound.contactName);
   if (nm && !session.data.name) session.data.name = nm;
 
@@ -701,6 +766,10 @@ async function handleInbound(phone, inbound) {
     if (bp) session.data.bodyPart = bp;
     if (sz) session.data.sizeCm = sz;
   }
+
+  // ✅ AJUSTE: sempre que tiver referenceImageUrl e ainda não analisou, analisa
+  // (não muda fluxo, só preenche imageSummary e complexity)
+  await analyzeReferenceImageIfNeeded(session);
 
   scheduleSaveStore();
 
@@ -722,7 +791,6 @@ async function handleInbound(phone, inbound) {
 
     if (choice === "other_doubts") {
       const agentJson = await agentReply(session, "OTHER_DOUBTS");
-      // força handoff
       agentJson.action = "HANDOFF_TO_OWNER";
       agentJson.set = { ...(agentJson.set || {}), stage: "handoff", data: {} };
       return applyAgentAction(phone, session, agentJson);
@@ -740,14 +808,13 @@ async function handleInbound(phone, inbound) {
       "Só me confirma como você quer seguir:\n\n" +
       "• Orçamento novo\n" +
       "• Outras dúvidas";
-    return sendButtons(phone, txt, [
+    return sendButtonsSafe(phone, session, txt, [
       { id: "first_new_budget", title: "Orçamento novo" },
       { id: "first_other_doubts", title: "Outras dúvidas" },
     ], "início");
   }
 
   if (session.stage === "handoff") {
-    // não responde mais automaticamente aqui; só evita spam.
     return;
   }
 
@@ -762,11 +829,14 @@ async function handleInbound(phone, inbound) {
       return applyAgentAction(phone, session, agentJson);
     }
 
-    // já tem tudo
     session.stage = "ask_edit";
     scheduleSaveStore();
 
-    const agentJson = await agentReply(session, "HAVE_ALL_INFO");
+    const agentJson = await agentReply(session, "HAVE_ALL_INFO", {
+      imageSummary: session.data.imageSummary || "",
+      imageComplexity: session.data.imageComplexity || "",
+    });
+
     const forcedButtons = [
       { id: "edit_yes", title: "Quero ajustar" },
       { id: "edit_no", title: "Está tudo certo" },
@@ -790,7 +860,7 @@ async function handleInbound(phone, inbound) {
       scheduleSaveStore();
     } else {
       const txt = "Você quer ajustar algo na ideia antes do orçamento?";
-      return sendButtons(phone, txt, [
+      return sendButtonsSafe(phone, session, txt, [
         { id: "edit_yes", title: "Quero ajustar" },
         { id: "edit_no", title: "Está tudo certo" },
       ], "ajustes");
@@ -798,28 +868,31 @@ async function handleInbound(phone, inbound) {
   }
 
   if (session.stage === "collect_changes") {
-    // acumula ajustes
     const msg = (inbound.message || "").trim();
     if (msg) session.data.changeNotes = (session.data.changeNotes ? session.data.changeNotes + "\n" : "") + msg;
 
-    // quando ele mandar algo, segue pro orçamento
     session.stage = "quote";
     scheduleSaveStore();
   }
 
   if (session.stage === "quote") {
-    // orçamento automático simples
-    const complexity = session.data.changeNotes ? "alta" : "media";
+    // ✅ AJUSTE: complexidade baseada na imagem (se existir), senão default
+    const cxFromImage = session.data.imageComplexity || "";
+    const complexity = session.data.changeNotes ? "alta" : (cxFromImage || "media");
+
     const { hours, total } = calcHoursAndPrice(session.data.sizeCm, complexity);
     session.data.estHours = hours;
     session.data.estTotal = total;
     scheduleSaveStore();
 
-    const agentJson = await agentReply(session, "QUOTE_READY");
+    const agentJson = await agentReply(session, "QUOTE_READY", {
+      imageSummary: session.data.imageSummary || "",
+      imageComplexity: session.data.imageComplexity || "",
+    });
+
     session.stage = "ask_schedule";
     scheduleSaveStore();
 
-    // texto do agente, mas garantimos parágrafos e não duplicar
     return applyAgentAction(phone, session, agentJson, [
       { id: "sched_go", title: "Quero agendar" },
       { id: "sched_no", title: "Agora não" },
@@ -848,25 +921,24 @@ async function handleInbound(phone, inbound) {
         "Fechado.\n\nQuando você quiser seguir com o agendamento, é só me chamar aqui que eu te mando as opções.";
       session.stage = "post_quote";
       scheduleSaveStore();
-      return sendText(phone, txt);
+      return sendTextSafe(phone, session, txt);
     }
 
     if (!wants) {
       const txt = "Quer que eu te mande opções de datas e horários agora?";
-      return sendButtons(phone, txt, [
+      return sendButtonsSafe(phone, session, txt, [
         { id: "sched_go", title: "Quero agendar" },
         { id: "sched_no", title: "Agora não" },
       ], "agenda");
     }
 
-    // manda 4 botões de horários
     const scheduleButtons = generateScheduleButtons();
     session.stage = "await_schedule_pick";
     scheduleSaveStore();
 
     const txt =
       "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
-    return sendButtons(phone, txt, scheduleButtons, "horários");
+    return sendButtonsSafe(phone, session, txt, scheduleButtons, "horários");
   }
 
   if (session.stage === "await_schedule_pick") {
@@ -882,11 +954,11 @@ async function handleInbound(phone, inbound) {
 
       const txt =
         "Fechado.\n\nMe manda o dia e horário que você prefere (ex: terça 19h / sábado 15h) que eu tento encaixar na agenda.";
-      return sendText(phone, txt);
+      return sendTextSafe(phone, session, txt);
     } else {
       const scheduleButtons = generateScheduleButtons();
       const txt = "Escolhe uma opção por aqui, ou clica em “Outro horário”.";
-      return sendButtons(phone, txt, scheduleButtons, "horários");
+      return sendButtonsSafe(phone, session, txt, scheduleButtons, "horários");
     }
   }
 
@@ -912,11 +984,10 @@ async function handleInbound(phone, inbound) {
     session.stage = "await_receipt";
     scheduleSaveStore();
 
-    return sendText(phone, txt);
+    return sendTextSafe(phone, session, txt);
   }
 
   if (session.stage === "await_receipt") {
-    // se mandou imagem, considera comprovante
     if (inbound.imageUrl || messageLooksLikeReceipt(inbound.message)) {
       session.data.receiptReceived = true;
       session.stage = "done";
@@ -932,24 +1003,22 @@ async function handleInbound(phone, inbound) {
         "• Evite sol forte na área.\n\n" +
         "Qualquer dúvida até o dia, me chama por aqui.";
       await notifyOwner(`✅ Comprovante recebido — ${phone}\nHorário: ${session.data.chosenSchedule}`);
-      return sendText(phone, txt);
+      return sendTextSafe(phone, session, txt);
     }
 
     const txt = "Pra confirmar a reserva, me manda a foto do comprovante aqui no Whats.";
-    return sendText(phone, txt);
+    return sendTextSafe(phone, session, txt);
   }
 
   if (session.stage === "post_quote") {
-    // se voltar pedindo orçamento, reinicia
     const t = norm(inbound.message);
     if (t.includes("orcamento") || t.includes("orçamento") || t.includes("fazer outra")) {
       resetSession(phone);
       const s2 = getSession(phone);
       s2.stage = "await_first_choice";
       scheduleSaveStore();
-      const txt =
-        "Beleza.\n\nComo você quer seguir?";
-      return sendButtons(phone, txt, [
+      const txt = "Beleza.\n\nComo você quer seguir?";
+      return sendButtonsSafe(phone, s2, txt, [
         { id: "first_new_budget", title: "Orçamento novo" },
         { id: "first_other_doubts", title: "Outras dúvidas" },
       ], "início");
@@ -958,7 +1027,6 @@ async function handleInbound(phone, inbound) {
   }
 
   if (session.stage === "done") {
-    // se ele pedir novo orçamento, reinicia
     const t = norm(inbound.message);
     if (t.includes("orcamento") || t.includes("orçamento") || t.includes("quero outra")) {
       resetSession(phone);
@@ -966,7 +1034,7 @@ async function handleInbound(phone, inbound) {
       s2.stage = "await_first_choice";
       scheduleSaveStore();
       const txt = "Como você quer seguir?";
-      return sendButtons(phone, txt, [
+      return sendButtonsSafe(phone, s2, txt, [
         { id: "first_new_budget", title: "Orçamento novo" },
         { id: "first_other_doubts", title: "Outras dúvidas" },
       ], "início");
@@ -974,13 +1042,12 @@ async function handleInbound(phone, inbound) {
     return;
   }
 
-  // fallback (segurança)
   const fb =
     "Pra eu te atender certinho:\n\n" +
     "• me manda a referência em imagem\n" +
     "• local no corpo\n" +
     "• tamanho em cm";
-  return sendText(phone, fb);
+  return sendTextSafe(phone, session, fb);
 }
 
 // -------------------- ROUTES --------------------
@@ -995,7 +1062,7 @@ app.get("/health", (req, res) => {
     model: ENV.OPENAI_MODEL,
     storePath: ENV.STORE_PATH,
   });
-});
+}
 
 app.post("/", async (req, res) => {
   res.status(200).json({ ok: true });
@@ -1005,12 +1072,20 @@ app.post("/", async (req, res) => {
     if (!inbound.phone) return;
     if (inbound.fromMe) return;
 
-    // idempotência por messageId
-    if (inbound.messageId && wasProcessed(inbound.messageId)) return;
-    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
     cleanupProcessed();
 
-    // lock por telefone (evita paralelo)
+    // ✅ Anti-duplicação:
+    // 1) usa messageId quando existe
+    // 2) se messageId vier vazio/instável, usa assinatura (phone+texto+img+botao)
+    const primaryKey = inbound.messageId ? `mid:${inbound.messageId}` : "";
+    const sigBase = `${inbound.phone}|${inbound.buttonId || ""}|${inbound.message || ""}|${inbound.imageUrl || ""}`;
+    const sigKey = `sig:${hash(sigBase)}`;
+
+    const keyToUse = primaryKey || sigKey;
+
+    if (wasProcessed(keyToUse)) return;
+    markProcessed(keyToUse, inbound.phone);
+
     await withPhoneLock(inbound.phone, async () => {
       await handleInbound(inbound.phone, inbound);
     });
