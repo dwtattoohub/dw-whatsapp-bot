@@ -15,7 +15,7 @@
 import express from "express";
 import crypto from "crypto";
 import OpenAI from "openai";
-import fsp from "fs/promises";f
+import fsp from "fs/promises";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
