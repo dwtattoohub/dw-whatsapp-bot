@@ -1,12 +1,12 @@
 // ============================================================
 // DW WhatsApp Bot — Versão AGENTE (GPT-4o) + Antiduplicação real
-// - Corrige fs.readFile (utf8) -> fs/promises
-// - Remove reset do store no boot
-// - Idempotência (messageId OU hash fallback) (TTL)
-// - Lock por telefone (evita paralelo = respostas duplicadas)
+// - fs/promises
+// - Sem reset do store no boot
+// - Idempotência por messageId (TTL) + fallback por fingerprint (quando messageId vem vazio)
+// - Lock por telefone (evita paralelo)
 // - Fluxo com botões conforme combinado
-// - ✅ Captura imagem em payloads variados (Z-API) + análise técnica antes do preço
-// - ✅ Anti-spam de "faltando info" (evita metralhadora de mensagens)
+// - ✅ NOVO: Captura imagem em mais formatos + analisa referência (texto técnico) antes do preço
+// - ✅ NOVO: Anti-duplicação também no fallback (evita 2~3 mensagens iguais)
 // ============================================================
 
 import express from "express";
@@ -38,8 +38,8 @@ const ENV = {
   STORE_PATH: process.env.STORE_PATH || "./dw_store.json",
   IDEMPOTENCY_TTL_HOURS: Number(process.env.IDEMPOTENCY_TTL_HOURS || 48),
 
-  // Preço (se quiser manter automático)
-  HOUR_FIRST: Number(process.env.HOUR_FIRST || 150), // ✅ default ajustado pra 150
+  // Preço (default ajustado)
+  HOUR_FIRST: Number(process.env.HOUR_FIRST || 150), // ✅ default 150
   HOUR_NEXT: Number(process.env.HOUR_NEXT || 120),
 
   // PIX + sinal
@@ -65,8 +65,9 @@ const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY });
 
 // -------------------- STORE --------------------
 const STORE = {
-  sessions: {}, // phone -> session
-  processed: {}, // messageId/dedupeKey -> { at, phone }
+  sessions: {},     // phone -> session
+  processed: {},    // messageId -> { at, phone }
+  processedFp: {},  // fingerprint -> { at, phone }  ✅ fallback idempotência quando messageId não vem
 };
 
 const saveDebounce = { t: null };
@@ -77,6 +78,7 @@ async function loadStore() {
     const data = JSON.parse(raw);
     STORE.sessions = data.sessions || {};
     STORE.processed = data.processed || {};
+    STORE.processedFp = data.processedFp || {};
   } catch {
     // primeira execução
   }
@@ -89,7 +91,11 @@ function scheduleSaveStore() {
     try {
       await fsp.writeFile(
         ENV.STORE_PATH,
-        JSON.stringify({ sessions: STORE.sessions, processed: STORE.processed }, null, 2),
+        JSON.stringify(
+          { sessions: STORE.sessions, processed: STORE.processed, processedFp: STORE.processedFp },
+          null,
+          2
+        ),
         "utf8"
       );
     } catch (e) {
@@ -105,8 +111,12 @@ function nowMs() {
 function cleanupProcessed() {
   const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
   const cut = nowMs() - ttl;
+
   for (const [id, v] of Object.entries(STORE.processed)) {
     if (!v?.at || v.at < cut) delete STORE.processed[id];
+  }
+  for (const [fp, v] of Object.entries(STORE.processedFp)) {
+    if (!v?.at || v.at < cut) delete STORE.processedFp[fp];
   }
 }
 
@@ -121,6 +131,37 @@ function wasProcessed(msgId) {
 function markProcessed(msgId, phone) {
   if (!msgId) return;
   STORE.processed[msgId] = { at: nowMs(), phone };
+  scheduleSaveStore();
+}
+
+// ✅ fallback idempotência (quando o Z-API não manda messageId ou manda ids diferentes em retry)
+function fpHash(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
+}
+
+function makeFingerprint(inbound) {
+  const base = [
+    inbound.phone || "",
+    inbound.buttonId || "",
+    inbound.message || "",
+    inbound.imageUrl || "",
+    // se existir algo de tempo no payload, ajuda. Se não existir, não tem.
+    inbound.raw?.timestamp || inbound.raw?.data?.timestamp || inbound.raw?.t || ""
+  ].join("|");
+  return fpHash(base);
+}
+
+function wasProcessedFp(fp) {
+  if (!fp) return false;
+  const v = STORE.processedFp[fp];
+  if (!v?.at) return false;
+  const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
+  return v.at >= nowMs() - ttl;
+}
+
+function markProcessedFp(fp, phone) {
+  if (!fp) return;
+  STORE.processedFp[fp] = { at: nowMs(), phone };
   scheduleSaveStore();
 }
 
@@ -147,10 +188,6 @@ function newSession() {
       wantsSchedule: false,
       signalSentAt: null,
       receiptReceived: false,
-
-      // anti-spam missing
-      _lastMissingKey: "",
-      _lastMissingAt: 0,
     },
   };
 }
@@ -271,90 +308,13 @@ function calcHoursAndPrice(sizeCm, complexity = "media") {
   return { hours: Number(hours.toFixed(1)), total };
 }
 
-// -------------------- DEDUPE KEY (fallback quando messageId não vem) --------------------
-function computeDedupeKey(inbound) {
-  if (inbound?.messageId) return inbound.messageId;
-
-  const base =
-    `${inbound?.phone || ""}|` +
-    `${inbound?.buttonId || ""}|` +
-    `${String(inbound?.message || "").slice(0, 220)}|` +
-    `${inbound?.imageUrl || ""}`;
-
-  return "h_" + hash(base);
-}
-
-// -------------------- MEDIA URL EXTRACTOR (robusto) --------------------
-function isLikelyUrl(s) {
-  if (!s) return false;
-  const t = String(s);
-  return /^https?:\/\//i.test(t);
-}
-
-function deepFindUrl(obj, keysWanted = new Set(["imageUrl", "mediaUrl", "url", "downloadUrl", "fileUrl"])) {
-  const seen = new Set();
-  function walk(x) {
-    if (!x || typeof x !== "object") return null;
-    if (seen.has(x)) return null;
-    seen.add(x);
-
-    if (Array.isArray(x)) {
-      for (const it of x) {
-        const r = walk(it);
-        if (r) return r;
-      }
-      return null;
-    }
-
-    for (const [k, v] of Object.entries(x)) {
-      if (keysWanted.has(k) && typeof v === "string" && isLikelyUrl(v)) return v;
-
-      if (k === "image" && v && typeof v === "object") {
-        const a = v.imageUrl || v.url || v.downloadUrl;
-        if (typeof a === "string" && isLikelyUrl(a)) return a;
-      }
-
-      const r = walk(v);
-      if (r) return r;
-    }
-    return null;
-  }
-  return walk(obj);
-}
-
-function extractInboundImageUrl(body) {
-  const direct =
-    body?.image?.imageUrl ||
-    body?.image?.url ||
-    body?.imageUrl ||
-    body?.message?.image?.url ||
-    body?.message?.image?.imageUrl ||
-    body?.media?.url ||
-    body?.data?.image?.imageUrl ||
-    body?.data?.imageUrl ||
-    body?.data?.mediaUrl ||
-    body?.data?.message?.image?.imageUrl ||
-    body?.data?.message?.imageUrl ||
-    body?.data?.message?.mediaUrl ||
-    null;
-
-  if (typeof direct === "string" && isLikelyUrl(direct)) return direct;
-
-  const deep = deepFindUrl(body);
-  if (typeof deep === "string" && isLikelyUrl(deep)) return deep;
-
-  return null;
-}
-
 // ============================================================================
-// 🔥 AJUSTE — ANALISAR REFERÊNCIA (IMAGEM) E GERAR DESCRIÇÃO TÉCNICA
-// - Salva em session.data.imageSummary
+// ✅ ANALISAR REFERÊNCIA (IMAGEM) — robusto (url público OU base64)
 // ============================================================================
 
 function summarizeToBullets(summary) {
   const s = String(summary || "").trim();
   if (!s) return "";
-
   const parts = s
     .replace(/\s+/g, " ")
     .split(/(?<=[.!?])\s+/)
@@ -363,13 +323,29 @@ function summarizeToBullets(summary) {
     .slice(0, 4);
 
   if (parts.length === 0) return "";
-
   return parts.map((p) => `• ${p.replace(/[.]+$/g, "")}`).join("\n");
+}
+
+async function fetchAsDataUrl(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`fetch image failed: ${resp.status}`);
+  const ct = resp.headers.get("content-type") || "image/jpeg";
+  const ab = await resp.arrayBuffer();
+  const b64 = Buffer.from(ab).toString("base64");
+  return `data:${ct};base64,${b64}`;
 }
 
 async function analyzeReferenceImage(imageUrl) {
   if (!imageUrl) return "";
 
+  const promptText =
+    "Analise a imagem de referência da tatuagem e descreva tecnicamente, em português, " +
+    "de forma curta e objetiva, destacando: tema/assunto, quantidade de elementos, " +
+    "nível de detalhe, sombras/contraste, texturas (pele, cabelo, metal, tecido), " +
+    "áreas que exigem mais tempo (rostos, mãos, fundo, transições). " +
+    "Não dê preço. Retorne só texto.";
+
+  // 1) tenta direto com URL
   try {
     const completion = await openai.chat.completions.create({
       model: ENV.OPENAI_MODEL,
@@ -378,29 +354,38 @@ async function analyzeReferenceImage(imageUrl) {
         {
           role: "user",
           content: [
-            {
-              type: "text",
-              text:
-                "Analise a imagem de referência da tatuagem e descreva tecnicamente, em português, " +
-                "de forma curta e objetiva, destacando: tema/assunto, quantidade de elementos, " +
-                "nível de detalhe, sombras/contraste, texturas (pele, cabelo, metal, tecido), " +
-                "áreas que exigem mais tempo (rostos, mãos, fundo, transições). " +
-                "Não dê preço. Retorne só texto.",
-            },
-            {
-              type: "image_url",
-              image_url: { url: imageUrl },
-            },
+            { type: "text", text: promptText },
+            { type: "image_url", image_url: { url: imageUrl } },
           ],
         },
       ],
     });
+    return String(completion.choices?.[0]?.message?.content || "").trim();
+  } catch (e1) {
+    console.error("[IMAGE ANALYSIS URL ERROR]", e1?.message || e1);
 
-    const raw = completion.choices?.[0]?.message?.content || "";
-    return String(raw || "").trim();
-  } catch (e) {
-    console.error("[IMAGE ANALYSIS ERROR]", e?.message || e);
-    return "";
+    // 2) fallback: baixa e manda base64 (resolve quando URL não é público pro OpenAI)
+    try {
+      const dataUrl = await fetchAsDataUrl(imageUrl);
+
+      const completion2 = await openai.chat.completions.create({
+        model: ENV.OPENAI_MODEL,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: promptText },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      });
+      return String(completion2.choices?.[0]?.message?.content || "").trim();
+    } catch (e2) {
+      console.error("[IMAGE ANALYSIS BASE64 ERROR]", e2?.message || e2);
+      return "";
+    }
   }
 }
 
@@ -431,6 +416,13 @@ async function humanDelay() {
 async function sendText(phone, message) {
   await humanDelay();
   return zapiFetch("/send-text", { phone, message });
+}
+
+// ✅ envia texto respeitando antiRepeat
+async function sendTextOnce(phone, session, message) {
+  if (!message) return;
+  if (antiRepeat(session, message)) return;
+  return sendText(phone, message);
 }
 
 async function sendButtons(phone, text, buttons, label = "menu") {
@@ -471,6 +463,13 @@ async function notifyOwner(text) {
 }
 
 // -------------------- INBOUND PARSER (robusto) --------------------
+function pickFirstString(...vals) {
+  for (const v of vals) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 function parseInbound(body) {
   const phone =
     body?.phone ||
@@ -502,7 +501,31 @@ function parseInbound(body) {
     body?.data?.text ||
     "";
 
-  const imageUrl = extractInboundImageUrl(body);
+  // ✅ MUITO MAIS ROBUSTO: tenta achar URL de mídia em vários formatos
+  const imageUrl = pickFirstString(
+    body?.image?.imageUrl,
+    body?.image?.url,
+    body?.imageUrl,
+    body?.media?.url,
+    body?.mediaUrl,
+    body?.data?.image?.imageUrl,
+    body?.data?.imageUrl,
+    body?.data?.mediaUrl,
+    body?.data?.media?.url,
+    body?.data?.message?.image?.url,
+    body?.data?.message?.image?.imageUrl,
+    body?.data?.message?.media?.url,
+    body?.data?.message?.mediaUrl,
+    body?.message?.image?.url,
+    body?.message?.image?.imageUrl,
+    body?.message?.media?.url,
+    body?.message?.mediaUrl,
+    // alguns payloads “whatsapp-like”
+    body?.data?.message?.imageMessage?.url,
+    body?.data?.message?.imageMessage?.directPath,
+    body?.data?.message?.documentMessage?.url,
+    body?.data?.message?.videoMessage?.url
+  );
 
   const messageId =
     body?.messageId ||
@@ -644,23 +667,20 @@ Agradeça e mande cuidados pré tattoo (com \\n\\n):
 - evitar álcool véspera
 - comer bem
 - hidratar pele
-- evitar sol forte
+- evitar sol forte na área
 
 9) Se o cliente pedir "quero falar com você / dúvidas": HANDOFF.
 `;
 
-// Permite sobrescrever pelo ENV
 const AGENT_SYSTEM = (ENV.AGENT_SYSTEM_PROMPT || "").trim() || DEFAULT_AGENT_SYSTEM;
 
 // -------------------- JSON parse robusto --------------------
 function safeJsonParse(raw) {
   const s = String(raw || "").trim();
   const noFences = s.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-
   try {
     return JSON.parse(noFences);
   } catch {}
-
   const start = noFences.indexOf("{");
   const end = noFences.lastIndexOf("}");
   if (start >= 0 && end > start) {
@@ -729,13 +749,13 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
   scheduleSaveStore();
 
   if (action === "HANDOFF_TO_OWNER") {
-    if (text && !antiRepeat(session, text)) await sendText(phone, text);
+    if (text) await sendTextOnce(phone, session, text);
 
     await notifyOwner(
       `📩 HANDOFF — cliente pediu falar com você\n\n` +
-        `Número: ${phone}\n` +
-        `Stage: ${session.stage}\n` +
-        `Última msg: ${String(text).slice(0, 200)}`
+      `Número: ${phone}\n` +
+      `Stage: ${session.stage}\n` +
+      `Última msg: ${String(text).slice(0, 200)}`
     );
     return;
   }
@@ -747,6 +767,8 @@ async function applyAgentAction(phone, session, agentJson, forcedButtons = null)
   }
 
   if (!text) return;
+
+  // anti-repeat aqui
   if (antiRepeat(session, text)) return;
 
   const b = forcedButtons || buttons;
@@ -802,7 +824,7 @@ async function handleInbound(phone, inbound) {
   const nm = safeName(inbound.contactName);
   if (nm && !session.data.name) session.data.name = nm;
 
-  // se chegou imagem, guarda + analisa
+  // ✅ se chegou imagem, guarda + analisa (se for nova)
   if (inbound.imageUrl) {
     const isNew = inbound.imageUrl !== session.data.referenceImageUrl;
     session.data.referenceImageUrl = inbound.imageUrl;
@@ -811,11 +833,10 @@ async function handleInbound(phone, inbound) {
       const summary = await analyzeReferenceImage(inbound.imageUrl);
       session.data.imageSummary = summary || "";
       session.data.imageSummaryAt = nowMs();
-      scheduleSaveStore();
     }
   }
 
-  // se chegou texto, tenta extrair body/size
+  // texto: tenta body/size
   if (inbound.message) {
     const bp = parseBodyPart(inbound.message);
     const sz = parseSizeCm(inbound.message);
@@ -856,19 +877,19 @@ async function handleInbound(phone, inbound) {
       return applyAgentAction(phone, session, agentJson);
     }
 
-    const txt = "Só me confirma como você quer seguir:\n\n" + "• Orçamento novo\n" + "• Outras dúvidas";
-    return sendButtons(
-      phone,
-      txt,
-      [
-        { id: "first_new_budget", title: "Orçamento novo" },
-        { id: "first_other_doubts", title: "Outras dúvidas" },
-      ],
-      "início"
-    );
+    const txt =
+      "Só me confirma como você quer seguir:\n\n" +
+      "• Orçamento novo\n" +
+      "• Outras dúvidas";
+    return sendButtons(phone, txt, [
+      { id: "first_new_budget", title: "Orçamento novo" },
+      { id: "first_other_doubts", title: "Outras dúvidas" },
+    ], "início");
   }
 
-  if (session.stage === "handoff") return;
+  if (session.stage === "handoff") {
+    return;
+  }
 
   if (session.stage === "collect_ref_body_size") {
     const missing = [];
@@ -877,17 +898,6 @@ async function handleInbound(phone, inbound) {
     if (!session.data.sizeCm) missing.push("tamanho em cm");
 
     if (missing.length > 0) {
-      // ✅ anti-spam 20s (evita duplicar quando webhook repete)
-      const missingKey = missing.join("|");
-      const lastKey = session.data._lastMissingKey || "";
-      const lastAt = Number(session.data._lastMissingAt || 0);
-
-      if (missingKey === lastKey && nowMs() - lastAt < 20000) return;
-
-      session.data._lastMissingKey = missingKey;
-      session.data._lastMissingAt = nowMs();
-      scheduleSaveStore();
-
       const agentJson = await agentReply(session, "MISSING_INFO", { missing, message: inbound.message || "" });
       return applyAgentAction(phone, session, agentJson);
     }
@@ -919,15 +929,10 @@ async function handleInbound(phone, inbound) {
       scheduleSaveStore();
     } else {
       const txt = "Você quer ajustar algo na ideia antes do orçamento?";
-      return sendButtons(
-        phone,
-        txt,
-        [
-          { id: "edit_yes", title: "Quero ajustar" },
-          { id: "edit_no", title: "Está tudo certo" },
-        ],
-        "ajustes"
-      );
+      return sendButtons(phone, txt, [
+        { id: "edit_yes", title: "Quero ajustar" },
+        { id: "edit_no", title: "Está tudo certo" },
+      ], "ajustes");
     }
   }
 
@@ -949,11 +954,12 @@ async function handleInbound(phone, inbound) {
     const agentJson = await agentReply(session, "QUOTE_READY");
 
     const bullets = summarizeToBullets(session.data.imageSummary);
-    const preface = bullets
-      ? "Pelo que eu vi na sua referência, o projeto tem esses pontos principais:\n\n" +
-        `${bullets}\n\n` +
-        "Isso influencia direto no tempo de execução (principalmente em sombras, transições e acabamento) pra ficar limpo e com bom envelhecimento.\n\n"
-      : "Fechado.\n\n";
+    const preface =
+      bullets
+        ? "Pelo que eu vi na sua referência, o projeto tem esses pontos principais:\n\n" +
+          `${bullets}\n\n` +
+          "Isso influencia direto no tempo (sombras, transições e acabamento) pra ficar limpo e com bom envelhecimento.\n\n"
+        : "Fechado.\n\n";
 
     const quoteText =
       preface +
@@ -977,37 +983,41 @@ async function handleInbound(phone, inbound) {
     const t = norm(inbound.message);
     const id = inbound.buttonId;
 
-    const wants = id === "sched_go" || t.includes("agendar") || t.includes("quero") || t === "1";
+    const wants =
+      id === "sched_go" ||
+      t.includes("agendar") ||
+      t.includes("quero") ||
+      t === "1";
 
     const notNow =
-      id === "sched_no" || t.includes("agora nao") || t.includes("agora não") || t.includes("depois") || t === "2";
+      id === "sched_no" ||
+      t.includes("agora nao") ||
+      t.includes("agora não") ||
+      t.includes("depois") ||
+      t === "2";
 
     if (notNow) {
       const txt =
         "Fechado.\n\nQuando você quiser seguir com o agendamento, é só me chamar aqui que eu te mando as opções.";
       session.stage = "post_quote";
       scheduleSaveStore();
-      return sendText(phone, txt);
+      return sendTextOnce(phone, session, txt);
     }
 
     if (!wants) {
       const txt = "Quer que eu te mande opções de datas e horários agora?";
-      return sendButtons(
-        phone,
-        txt,
-        [
-          { id: "sched_go", title: "Quero agendar" },
-          { id: "sched_no", title: "Agora não" },
-        ],
-        "agenda"
-      );
+      return sendButtons(phone, txt, [
+        { id: "sched_go", title: "Quero agendar" },
+        { id: "sched_no", title: "Agora não" },
+      ], "agenda");
     }
 
     const scheduleButtons = generateScheduleButtons();
     session.stage = "await_schedule_pick";
     scheduleSaveStore();
 
-    const txt = "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
+    const txt =
+      "Show.\n\nSeparei algumas opções pra você escolher (ou me diz um horário específico):";
     return sendButtons(phone, txt, scheduleButtons, "horários");
   }
 
@@ -1024,7 +1034,7 @@ async function handleInbound(phone, inbound) {
 
       const txt =
         "Fechado.\n\nMe manda o dia e horário que você prefere (ex: terça 19h / sábado 15h) que eu tento encaixar na agenda.";
-      return sendText(phone, txt);
+      return sendTextOnce(phone, session, txt);
     } else {
       const scheduleButtons = generateScheduleButtons();
       const txt = "Escolhe uma opção por aqui, ou clica em “Outro horário”.";
@@ -1054,7 +1064,7 @@ async function handleInbound(phone, inbound) {
     session.stage = "await_receipt";
     scheduleSaveStore();
 
-    return sendText(phone, txt);
+    return sendTextOnce(phone, session, txt);
   }
 
   if (session.stage === "await_receipt") {
@@ -1073,11 +1083,11 @@ async function handleInbound(phone, inbound) {
         "• Evite sol forte na área.\n\n" +
         "Qualquer dúvida até o dia, me chama por aqui.";
       await notifyOwner(`✅ Comprovante recebido — ${phone}\nHorário: ${session.data.chosenSchedule}`);
-      return sendText(phone, txt);
+      return sendTextOnce(phone, session, txt);
     }
 
     const txt = "Pra confirmar a reserva, me manda a foto do comprovante aqui no Whats.";
-    return sendText(phone, txt);
+    return sendTextOnce(phone, session, txt);
   }
 
   if (session.stage === "post_quote") {
@@ -1088,15 +1098,10 @@ async function handleInbound(phone, inbound) {
       s2.stage = "await_first_choice";
       scheduleSaveStore();
       const txt = "Beleza.\n\nComo você quer seguir?";
-      return sendButtons(
-        phone,
-        txt,
-        [
-          { id: "first_new_budget", title: "Orçamento novo" },
-          { id: "first_other_doubts", title: "Outras dúvidas" },
-        ],
-        "início"
-      );
+      return sendButtons(phone, txt, [
+        { id: "first_new_budget", title: "Orçamento novo" },
+        { id: "first_other_doubts", title: "Outras dúvidas" },
+      ], "início");
     }
     return;
   }
@@ -1109,21 +1114,21 @@ async function handleInbound(phone, inbound) {
       s2.stage = "await_first_choice";
       scheduleSaveStore();
       const txt = "Como você quer seguir?";
-      return sendButtons(
-        phone,
-        txt,
-        [
-          { id: "first_new_budget", title: "Orçamento novo" },
-          { id: "first_other_doubts", title: "Outras dúvidas" },
-        ],
-        "início"
-      );
+      return sendButtons(phone, txt, [
+        { id: "first_new_budget", title: "Orçamento novo" },
+        { id: "first_other_doubts", title: "Outras dúvidas" },
+      ], "início");
     }
     return;
   }
 
-  const fb = "Pra eu te atender certinho:\n\n" + "• me manda a referência em imagem\n" + "• local no corpo\n" + "• tamanho em cm";
-  return sendText(phone, fb);
+  // ✅ fallback agora também respeita antiRepeat (para não triplicar)
+  const fb =
+    "Pra eu te atender certinho:\n\n" +
+    "• me manda a referência em imagem\n" +
+    "• local no corpo\n" +
+    "• tamanho em cm";
+  return sendTextOnce(phone, session, fb);
 }
 
 // -------------------- ROUTES --------------------
@@ -1148,10 +1153,17 @@ app.post("/", async (req, res) => {
     if (!inbound.phone) return;
     if (inbound.fromMe) return;
 
-    // ✅ idempotência (messageId OU hash fallback)
-    const dedupeKey = computeDedupeKey(inbound);
-    if (dedupeKey && wasProcessed(dedupeKey)) return;
-    if (dedupeKey) markProcessed(dedupeKey, inbound.phone);
+    // idempotência por messageId
+    if (inbound.messageId && wasProcessed(inbound.messageId)) return;
+    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
+
+    // ✅ fallback idempotência por fingerprint (quando messageId vem vazio ou muda em retry)
+    const fp = makeFingerprint(inbound);
+    if (!inbound.messageId) {
+      if (wasProcessedFp(fp)) return;
+      markProcessedFp(fp, inbound.phone);
+    }
+
     cleanupProcessed();
 
     await withPhoneLock(inbound.phone, async () => {
