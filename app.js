@@ -15,7 +15,7 @@
 import express from "express";
 import crypto from "crypto";
 import OpenAI from "openai";
-import fsp from "fs/promises";
+import fsp from "fs/promises";f
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -545,19 +545,7 @@ function parseInbound(body) {
     body?.data?.senderName ||
     body?.data?.pushName ||
     "";
-
-  const msg =
-    body?.message ||
-    body?.text?.message ||
-    body?.text ||
-    body?.Body ||
-    body?.data?.message ||
-    body?.data?.text ||
-    body?.data?.message?.conversation ||
-    body?.data?.message?.extendedTextMessage?.text ||
-    body?.message?.conversation ||
-    body?.message?.extendedTextMessage?.text ||
-    "";
+  const msg = pickTextCandidate(body) || "";
 
   const imageUrl = pickFirstString(
     body?.image?.imageUrl,
@@ -1145,6 +1133,14 @@ app.post("/", async (req, res) => {
 
     const inbound = parseInbound(req.body || {});
 
+    const rawText = pickTextCandidate(req.body || {});
+
+    if (rawText && !inbound.message) {
+      inbound.message = rawText.trim();
+      if (inbound.message) {
+        console.log("[PATCHED] message recovered from rawText");
+      }
+    }
     console.log("[INBOUND PARSED]", {
       phone: inbound.phone,
       fromMe: inbound.fromMe,
@@ -1158,6 +1154,13 @@ app.post("/", async (req, res) => {
     });
 
     if (isEmptyInbound(inbound)) {
+     const body = req.body || {};
+     console.log("[EMPTY INBOUND DIAG]", {
+        bodyKeys: Object.keys(body || {}),
+        dataKeys: Object.keys(body?.data || {}),
+        messageKeys: Object.keys(body?.data?.message || {}),
+        bodySnippet: JSON.stringify(body).slice(0, 600),
+      });
       console.log("[IGNORED] empty inbound event (no text/button/media)");
       return;
     }
