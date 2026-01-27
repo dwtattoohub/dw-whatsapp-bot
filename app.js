@@ -1,11 +1,12 @@
 // ============================================================
-// DW WhatsApp Bot — Jeezy Edition (Z-API + DW Premium Invisível)
-// ATUALIZAÇÕES (PRONTO):
-// 1) PRIMEIRO CONTATO: 2 opções -> "Orçamento novo" e "Falar comigo" (sem parecer bot)
-// 2) NOTIFICAÇÃO PRO SEU PESSOAL: quando cliente pedir "falar com você" (em botão ou texto)
-// 3) PERSISTÊNCIA JSON: sessões + idempotência (não perde ao reiniciar / evita duplicadas)
-// 4) IDPOTÊNCIA REAL: ignora reenvio do mesmo webhook (messageId)
-// 5) ANCORAGEM DW no orçamento (antes do preço), mantendo sua lógica de horas
+// DW WhatsApp Bot — Jeezy Edition (Z-API + AGENTE REAL + HANDOFF)
+// O QUE MUDA AQUI (do jeito que você pediu):
+// 1) QUEM ASSUME O ORÇAMENTO É O AGENTE (OpenAI) — não é “bot de stage” repetindo coisa
+// 2) PRIMEIRO CONTATO: 2 opções -> "Orçamento novo" e "Falar comigo" (sem parecer bot)
+// 3) "Falar comigo" = HANDOFF REAL: notifica seu número pessoal e o bot CALA (não responde mais)
+// 4) PERSISTÊNCIA JSON + IDPOTÊNCIA: sessões + ignorar webhook duplicado (messageId)
+// 5) ORÇAMENTO: só fecha preço quando tiver (referência + local + tamanho). Antes disso, agente conduz.
+// 6) SEM LIGAÇÃO DE VÍDEO (removido)
 // ============================================================
 
 import express from "express";
@@ -32,7 +33,7 @@ const ENV = {
   // OpenAI
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
 
-  // Google Calendar (opcional)
+  // Google Calendar (mantive flag, mas esse arquivo NÃO mexe na sua agenda sem você plugar GCAL)
   GCAL_ENABLED:
     String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "true" ||
     String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "verdadeiro",
@@ -45,6 +46,9 @@ const ENV = {
   // Persistência (JSON)
   STORE_PATH: process.env.STORE_PATH || "./dw_store.json",
   IDEMPOTENCY_TTL_HOURS: Number(process.env.IDEMPOTENCY_TTL_HOURS || 48),
+
+  // Slots (quando você plugar agenda de verdade)
+  OFFER_SLOTS_COUNT: Number(process.env.OFFER_SLOTS_COUNT || 3),
 };
 
 function missingEnvs() {
@@ -58,16 +62,38 @@ function missingEnvs() {
 // -------------------- OpenAI --------------------
 const openai = ENV.OPENAI_API_KEY ? new OpenAI({ apiKey: ENV.OPENAI_API_KEY }) : null;
 
+// ✅ System base (identidade + invisível)
 const BASE_SYSTEM =
   "Você é o DW Tattooer, tatuador profissional atendendo no WhatsApp (tom humano, direto e profissional). " +
-  "Regras: Nunca diga que é IA. Não assine. Não fale de preço/hora sem ser solicitado. " +
-  "Você trabalha com realismo preto e cinza (black & grey) + whip shading. " +
-  "Se o cliente quiser colorido, diga que você trabalha apenas black & grey.";
+  "Regras: NUNCA diga que é IA/bot/assistente. Não assine. Não cite 'sistema' nem 'automação'. " +
+  "Trabalha com realismo preto e cinza (black & grey) + whip shading. " +
+  "Se pedirem colorido, alinhe que você atende apenas black & grey. " +
+  "Não oferece ligação de vídeo. " +
+  "Sempre conduz com UMA pergunta prática por mensagem quando precisar avançar.";
+
+// ✅ Playbook do agente (baseado no seu PDF + seu funil)
+const SALES_PLAYBOOK =
+  "Playbook de vendas e atendimento:\n" +
+  "- O cliente no 1º contato está curioso e vulnerável: precisa sentir segurança e clareza.\n" +
+  "- Dor: normalizar, descrever como desconforto suportável e pedir a região.\n" +
+  "- Preço: não dar valor sem qualificar (referência + local + tamanho). Enquadrar valor (design exclusivo, higiene, técnica, durabilidade).\n" +
+  "- 'Está caro': não discutir preço, discutir valor e perguntar o que exatamente preocupa.\n" +
+  "- 'Preciso pensar': perguntar qual ponto falta para decidir e oferecer ajuda/referências.\n" +
+  "- Fechamento por alternativa: quando estiver pronto, oferecer opções (ex.: terça manhã ou quinta tarde).\n" +
+  "- Sempre levar para próximo passo: referência → local/tamanho → orçamento → agenda → sinal → comprovante.";
+
+// ✅ Prompt completo do agente (você pediu para eu te mandar separado também; está no final da resposta)
+const AGENT_SYSTEM = `${BASE_SYSTEM}\n\n${SALES_PLAYBOOK}\n\nRegras duras:\n` +
+  "- Uma mensagem por vez.\n" +
+  "- Sem textos longos.\n" +
+  "- Se faltar referência/local/tamanho: peça exatamente o que falta.\n" +
+  "- Se o cliente pedir 'falar comigo': acione handoff (sem insistir).\n" +
+  "- Se já tiver referência+local+tamanho: pode liberar orçamento (o código calcula) e perguntar se quer horários.\n";
 
 // -------------------- JSON Store (sessions + processed) --------------------
 const STORE = {
-  sessions: {}, // phone -> session
-  processed: {}, // msgId -> { at, phone }
+  sessions: {},   // phone -> session
+  processed: {},  // msgId -> { at, phone }
 };
 
 function nowMs() {
@@ -103,7 +129,7 @@ function scheduleSaveStore() {
     } catch (e) {
       console.error("[STORE SAVE ERROR]", e?.message || e);
     }
-  }, 350);
+  }, 250);
 }
 
 function cleanupProcessed() {
@@ -153,7 +179,7 @@ async function zapiSendText(phone, message) {
 }
 
 async function humanDelay() {
-  await new Promise((resolve) => setTimeout(resolve, 1200 + Math.random() * 800));
+  await new Promise((resolve) => setTimeout(resolve, 900 + Math.random() * 700));
 }
 
 async function sendText(phone, message) {
@@ -191,6 +217,7 @@ async function sendButtons(phone, text, buttons, label = "menu") {
     console.log("[SEND BUTTONS FAIL]", err?.message || err);
   }
 
+  // fallback texto (2 botões)
   await zapiSendText(
     phone,
     `${text}\n1) ${buttons[0]?.title || ""}\n2) ${buttons[1]?.title || ""}\nResponda 1 ou 2.`
@@ -267,7 +294,6 @@ function parseZapiInbound(body) {
     body?.data?.contact?.name ||
     "";
 
-  // messageId (idempotência)
   const messageId =
     body?.messageId ||
     body?.data?.messageId ||
@@ -279,7 +305,6 @@ function parseZapiInbound(body) {
     body?.message?.key?.id ||
     null;
 
-  // CAPTURA DO ID/TEXTO DO BOTÃO
   const bId =
     body?.buttonId ||
     body?.callback?.buttonId ||
@@ -315,7 +340,6 @@ function parseZapiInbound(body) {
     fromMe,
     contactName: String(contactName || "").trim(),
     messageId: messageId ? String(messageId) : null,
-
     buttonId: null,
     buttonTitle: null,
     messageType: "",
@@ -370,12 +394,9 @@ function askedPix(text) {
   return /pix|chave pix|qual o pix|me passa o pix/.test(t);
 }
 
-// Rota 2: falar direto com o DW (texto)
 function askedTalkToDw(text) {
   const t = norm(text);
-  return /falar com voce|falar com vc|falar contigo|falar direto|quero falar com voce|quero falar com vc|me chama|me chame|pode me chamar|me responde voce|e voce mesmo|prefiro falar com voce|quero falar com o dw|falar com o dw/.test(
-    t
-  );
+  return /falar comigo|falar com voce|falar com vc|falar contigo|falar direto|quero falar|prefiro falar|me chama voce|quero falar com o dw|falar com o dw/.test(t);
 }
 
 function parseSizeCm(text) {
@@ -426,11 +447,9 @@ function parseBodyPart(text) {
 function calcHoursAndPrice(sizeCm, complexityLevel) {
   const s = Number(sizeCm || 0);
   const base = s <= 12 ? 1.2 : s <= 18 ? 2 : s <= 25 ? 3 : 4;
-
   const multiplier = complexityLevel === "alta" ? 1.5 : complexityLevel === "media" ? 1.2 : 1.0;
 
   const hours = Math.max(1, base * multiplier);
-
   const firstHour = ENV.HOUR_FIRST;
   const nextHours = Math.max(0, hours - 1) * ENV.HOUR_NEXT;
   const finalPrice = Math.round(firstHour + nextHours);
@@ -444,7 +463,7 @@ function detectComplexityFromSummary(summary) {
   return "media";
 }
 
-// -------------------- Mensagens --------------------
+// -------------------- Mensagens fixas --------------------
 function msgAddress() {
   return "Claro.\n\n• Endereço: *Av. Mauá, 1308* — próximo à rodoviária.";
 }
@@ -454,7 +473,7 @@ function msgDorResposta() {
     "Entendo perfeitamente sua preocupação com a dor — é uma dúvida bem comum.\n" +
     "A sensação varia de pessoa pra pessoa e também depende da área.\n\n" +
     "A maioria descreve como um desconforto suportável (ardência/arranhão intenso), e eu trabalho num ritmo que minimiza isso, com pausas quando precisar.\n\n" +
-    "Se você me disser a região, eu te falo como costuma ser nela."
+    "Me diz em qual região você quer tatuar?"
   );
 }
 
@@ -469,7 +488,7 @@ function msgSoBlackGrey() {
 
 function msgAskNewBudgetBasics() {
   return (
-    "Fechou. Pra eu te passar um orçamento bem fiel, me manda:\n\n" +
+    "Fechado. Pra eu te passar um orçamento bem fiel, me manda:\n\n" +
     "• *referência em imagem* (print/foto)\n" +
     "• *onde no corpo* + *tamanho aproximado em cm*\n"
   );
@@ -483,23 +502,6 @@ function msgAskBodyAndSize() {
   );
 }
 
-function msgAskChangeQuestion() {
-  return "Você quer alterar algo na referência?";
-}
-
-function msgAskChangeDetails() {
-  return "Fechou. Me descreve rapidinho o que você quer adicionar/remover/ajustar (pode mandar em tópicos).";
-}
-
-function msgAnalysisAndAsk(imageSummary) {
-  return (
-    "Recebi a referência!\n\n" +
-    "Análise técnica:\n" +
-    (imageSummary ? `${imageSummary}\n\n` : "") +
-    msgAskBodyAndSize()
-  );
-}
-
 function msgQuoteHours(hours, total) {
   const h = Number(hours || 1);
   return (
@@ -510,12 +512,8 @@ function msgQuoteHours(hours, total) {
     "• Pix\n" +
     "• Débito\n" +
     "• Crédito em até 12x (+ acréscimo da máquina)\n\n" +
-    "Se quiser, eu já te mando opções de datas e horários."
+    "Você quer que eu te mande opções de datas e horários agora?"
   );
-}
-
-function msgAskSchedule() {
-  return "Você quer que eu te mande as próximas opções de datas e horários agora?";
 }
 
 function msgPixSinal() {
@@ -531,7 +529,6 @@ function msgPixSinal() {
 // -------------------- Image analysis (OpenAI) --------------------
 async function analyzeImageDetails(url) {
   if (!openai) return "";
-
   const resp = await openai.chat.completions.create({
     model: "gpt-4o",
     temperature: 0.2,
@@ -561,18 +558,49 @@ async function analyzeImageDetails(url) {
   return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// -------------------- Sessions (persistente em JSON) --------------------
+// -------------------- AGENTE (OpenAI) --------------------
+async function agentReply(session, inbound) {
+  if (!openai) return null;
+
+  const ctx = {
+    name: session.name || "",
+    stage: session.stage,
+    bodyPart: session.bodyPart || "",
+    sizeCm: session.sizeCm || null,
+    hasReference: Boolean(session.referenceImageUrl || inbound.imageUrl),
+    imageSummary: session.imageSummary || "",
+    changeNotes: session.changeNotes || "",
+    // IMPORTANTES (pra evitar loop)
+    missing: {
+      reference: !Boolean(session.referenceImageUrl || inbound.imageUrl),
+      bodyPart: !Boolean(session.bodyPart),
+      sizeCm: !Boolean(session.sizeCm),
+    },
+  };
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.35,
+    messages: [
+      { role: "system", content: AGENT_SYSTEM },
+      { role: "user", content: "Contexto (JSON):\n" + JSON.stringify(ctx) },
+      { role: "user", content: "Mensagem do cliente:\n" + (inbound.message || "") },
+    ],
+  });
+
+  return resp.choices?.[0]?.message?.content?.trim() || null;
+}
+
+// -------------------- Sessions --------------------
 function newSession() {
   return {
     stage: "start",
-    greeted: false,
-    greetedAt: null,
-    flowMode: null,
-    awaitingFirstContact: false,
-    firstContactChoiceAt: null,
-
-    // data
     name: "",
+
+    // handoff real (quando true, o bot não responde mais)
+    handoff: false,
+
+    // dados do orçamento
     bodyPart: "",
     sizeCm: null,
     referenceImageUrl: "",
@@ -584,6 +612,7 @@ function newSession() {
     estTotal: null,
 
     // flags
+    didIntro: false,
     awaitingBWAnswer: false,
 
     // anti-repeat
@@ -604,7 +633,7 @@ function resetSession(phone) {
   scheduleSaveStore();
 }
 
-// -------------------- Anti-repeat (simple) --------------------
+// -------------------- Anti-repeat --------------------
 function hash(s) {
   return crypto.createHash("md5").update(String(s)).digest("hex");
 }
@@ -616,7 +645,7 @@ function antiRepeat(session, text) {
   return false;
 }
 
-// -------------------- Buttons helpers --------------------
+// -------------------- Primeiro contato --------------------
 async function sendFirstContactButtons(phone, session, contactName) {
   const nm = safeName(contactName);
   const greet = nm ? `Oi, ${nm}!` : "Oi!";
@@ -628,40 +657,11 @@ async function sendFirstContactButtons(phone, session, contactName) {
   ];
 
   await sendButtons(phone, text, buttons, "início");
-
-  session.stage = "await_first_contact_buttons";
-  session.greeted = true;
-  session.greetedAt = Date.now();
-  session.awaitingFirstContact = true;
-  session.firstContactChoiceAt = Date.now();
+  session.didIntro = true;
+  session.stage = "await_first_contact";
   scheduleSaveStore();
 }
 
-async function askChangeButtons(phone, session) {
-  const text = msgAskChangeQuestion();
-  const buttons = [
-    { id: "CHG_YES", title: "Sim" },
-    { id: "CHG_NO", title: "Não" },
-  ];
-
-  await sendButtons(phone, text, buttons, "alteração");
-  session.stage = "await_change_confirm";
-  scheduleSaveStore();
-}
-
-async function askScheduleButtons(phone, session) {
-  const text = msgAskSchedule();
-  const buttons = [
-    { id: "SCHED_YES", title: "Sim" },
-    { id: "SCHED_NO", title: "Não" },
-  ];
-
-  await sendButtons(phone, text, buttons, "agenda");
-  session.stage = "await_schedule_confirm";
-  scheduleSaveStore();
-}
-
-// --------- decisões por texto do botão (quando não vem buttonId) ----------
 function decideFirstContactFromText(message) {
   const t = norm(message);
   if (t.includes("orcamento novo") || t === "1") return 1;
@@ -669,14 +669,23 @@ function decideFirstContactFromText(message) {
   return null;
 }
 
-function decideYesNoFromText(message) {
-  const t = norm(message);
-  if (t === "1" || /\bsim\b/.test(t)) return 1;
-  if (t === "2" || /\bnao\b|\bnão\b/.test(t)) return 2;
-  return null;
+// -------------------- HANDOFF REAL --------------------
+async function handoffToDw(phone, session, reason, lastMessage) {
+  session.handoff = true;
+  session.stage = "HANDOFF";
+  scheduleSaveStore();
+
+  const reply = "Fechado. Só um instante que já te respondo por aqui ✅";
+  if (!antiRepeat(session, reply)) await sendText(phone, reply);
+
+  await notifyOwner(
+    `📌 HANDOFF (${reason})\n` +
+      `Cliente: ${phone} (${session.name || "-"})\n` +
+      `Última msg: ${(lastMessage || "-").slice(0, 220)}`
+  );
 }
 
-// -------------------- Core flow --------------------
+// -------------------- Core flow (AGENTE) --------------------
 async function handleInbound(phone, inbound) {
   const session = getSession(phone);
 
@@ -699,33 +708,20 @@ async function handleInbound(phone, inbound) {
     preview: (message || "").slice(0, 120),
   });
 
-  // Rota 2: cliente pede falar direto com você em qualquer momento
-  if (askedTalkToDw(message)) {
-    const reply = "Claro. Me diz o que você tem em mente e onde no corpo seria, que eu já te respondo.";
-    if (!antiRepeat(session, reply)) await sendText(phone, reply);
+  // Se já está em handoff: cala
+  if (session.handoff) return;
 
-    await notifyOwner(
-      `📩 Cliente pediu pra falar direto com você: ${phone} (${session.name || "-"})\n` +
-        `Stage: ${session.stage}\n` +
-        `Msg: ${message.slice(0, 200)}`
-    );
-
-    session.stage = "talk_dw";
-    scheduleSaveStore();
-    return;
-  }
-
-  // comandos
+  // Reset
   if (/^reset$|^reiniciar$|^comecar novamente$|^começar novamente$/.test(lower)) {
     resetSession(phone);
     const s2 = getSession(phone);
-    const reply = "Atendimento reiniciado.\n\nMe manda a referência em imagem e me diz onde no corpo + tamanho em cm.";
+    const reply = "Atendimento reiniciado.";
     if (!antiRepeat(s2, reply)) await sendText(phone, reply);
     await sendFirstContactButtons(phone, s2, s2.name || "");
     return;
   }
 
-  // address/pain quick intents
+  // Pedidos rápidos
   if (askedAddress(message)) {
     const reply = msgAddress();
     if (!antiRepeat(session, reply)) await sendText(phone, reply);
@@ -737,7 +733,13 @@ async function handleInbound(phone, inbound) {
     return;
   }
 
-  // color gating
+  // Se o cliente pediu falar com você em qualquer momento:
+  if (askedTalkToDw(message) || buttonId === "first_talk_dw") {
+    await handoffToDw(phone, session, "cliente pediu falar com você", message);
+    return;
+  }
+
+  // Color gating
   if (!session.awaitingBWAnswer && detectColorIntent(message)) {
     session.awaitingBWAnswer = true;
     scheduleSaveStore();
@@ -763,48 +765,31 @@ async function handleInbound(phone, inbound) {
     }
   }
 
-  const isFreshStart = !session.stage || session.stage === "start";
-  if (isFreshStart) {
+  // PRIMEIRO CONTATO
+  if (!session.didIntro || session.stage === "start") {
     await sendFirstContactButtons(phone, session, session.name || "");
     return;
   }
 
-  // 1) awaiting first contact
-  if (session.stage === "await_first_contact_buttons") {
+  // Escolha do menu (se não veio buttonId)
+  if (session.stage === "await_first_contact") {
     let choice = null;
-
-    // via buttonId
     if (buttonId === "first_new_budget") choice = 1;
     if (buttonId === "first_talk_dw") choice = 2;
-
-    // via texto do botão / fallback
     if (!choice) choice = decideFirstContactFromText(message);
 
-    // 1) Orçamento novo (automático)
-    if (choice === 1) {
-      session.flowMode = "NEW_BUDGET";
-      session.awaitingFirstContact = false;
-      session.firstContactChoiceAt = Date.now();
-      session.stage = "collect_reference";
-      scheduleSaveStore();
-
-      const reply = msgAskNewBudgetBasics();
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
+    if (choice === 2) {
+      await handoffToDw(phone, session, "cliente escolheu falar comigo", message);
       return;
     }
 
-    // 2) Falar comigo (alerta no seu pessoal)
-    if (choice === 2) {
-      session.flowMode = "TALK_DW";
-      session.awaitingFirstContact = false;
-      session.firstContactChoiceAt = Date.now();
-      session.stage = "talk_dw";
+    // orçamento novo -> entra no modo AGENTE
+    if (choice === 1) {
+      session.stage = "AGENT_BUDGET";
       scheduleSaveStore();
 
-      const reply = "Claro. Me diz o que você tem em mente e onde no corpo seria, que eu já te direciono certinho.";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-
-      await notifyOwner(`📩 Cliente pediu pra falar direto com você: ${phone} (${session.name || "-"})`);
+      const start = msgAskNewBudgetBasics();
+      if (!antiRepeat(session, start)) await sendText(phone, start);
       return;
     }
 
@@ -813,178 +798,105 @@ async function handleInbound(phone, inbound) {
     return;
   }
 
-  // 2) collect reference (need image)
-  if (session.stage === "collect_reference") {
-    if (!hasImage) {
-      const reply = "Quando puder, me manda a *referência em imagem* (print/foto).";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
+  // -------------------- MODO AGENTE (ORÇAMENTO) --------------------
+  if (session.stage === "AGENT_BUDGET") {
+    // Captura dados (sem travar)
+    if (hasImage) {
+      session.referenceImageUrl = inbound.imageUrl;
+      scheduleSaveStore();
+
+      // análise técnica opcional
+      const summary = await analyzeImageDetails(inbound.imageUrl);
+      session.imageSummary = summary;
+      scheduleSaveStore();
+    }
+
+    const maybeBody = parseBodyPart(message);
+    const maybeSize = parseSizeCm(message);
+    if (maybeBody) session.bodyPart = maybeBody;
+    if (maybeSize) session.sizeCm = maybeSize;
+    scheduleSaveStore();
+
+    // Se já tem referência + body + size -> fecha orçamento
+    if (session.referenceImageUrl && session.bodyPart && session.sizeCm) {
+      const complexity = detectComplexityFromSummary(session.imageSummary || "");
+      const estimate = calcHoursAndPrice(session.sizeCm, complexity);
+      session.estHours = estimate.hours;
+      session.estTotal = estimate.finalPrice;
+      session.stage = "POST_QUOTE";
+      scheduleSaveStore();
+
+      const quote = msgQuoteHours(session.estHours, session.estTotal);
+      if (!antiRepeat(session, quote)) await sendText(phone, quote);
       return;
     }
 
-    session.referenceImageUrl = inbound.imageUrl;
-    session.stage = "collect_body_size";
-    scheduleSaveStore();
+    // Senão: agente conduz (sem repetição)
+    const reply = await agentReply(session, inbound);
 
-    const summary = await analyzeImageDetails(inbound.imageUrl);
-    session.imageSummary = summary;
-    scheduleSaveStore();
+    // fallback se OpenAI não estiver configurado
+    const fallback = msgAskNewBudgetBasics();
 
-    const msg = msgAnalysisAndAsk(summary);
+    const out = reply || fallback;
+    if (!antiRepeat(session, out)) await sendText(phone, out);
+    return;
+  }
+
+  // -------------------- Pós orçamento (sim/não) + Pix --------------------
+  if (session.stage === "POST_QUOTE") {
+    // se pedir pix
+    if (askedPix(message)) {
+      const pix = msgPixSinal();
+      if (!antiRepeat(session, pix)) await sendText(phone, pix);
+      session.stage = "AWAIT_RECEIPT";
+      scheduleSaveStore();
+      return;
+    }
+
+    // heurística simples: se ele disser “sim / quero / pode / agenda”
+    if (/\b(sim|quero|pode|manda|agendar|agenda|vamos|fechado)\b/.test(lower)) {
+      // aqui você vai plugar agenda de verdade depois.
+      // por enquanto, joga pro handoff de confirmação (pra não prometer hora ocupada)
+      await notifyOwner(
+        `📅 Cliente quer agendar (precisa confirmar): ${phone}\n` +
+          `Peça: ${session.bodyPart} ${session.sizeCm}cm | ≈ ${session.estHours}h | R$ ${Number(session.estTotal).toFixed(0)}`
+      );
+      const msg = "Fechado ✅ Me manda sua preferência de dia/horário (ex: 15/01 16:00) que eu confirmo certinho.";
+      if (!antiRepeat(session, msg)) await sendText(phone, msg);
+      session.stage = "MANUAL_SCHEDULE";
+      scheduleSaveStore();
+      return;
+    }
+
+    // se disser não
+    if (/\b(nao|não|depois|vou ver|mais pra frente)\b/.test(lower)) {
+      const msg = "Tranquilo. Quando quiser seguir, é só me chamar aqui ✅";
+      if (!antiRepeat(session, msg)) await sendText(phone, msg);
+      return;
+    }
+
+    // agente pode tratar objeção pós-valor também
+    const reply = await agentReply(session, inbound);
+    if (reply && !antiRepeat(session, reply)) await sendText(phone, reply);
+    return;
+  }
+
+  if (session.stage === "MANUAL_SCHEDULE") {
+    // se pedir pix/sinal
+    if (askedPix(message) || /\b(sinal|pix|pagar|pagamento)\b/.test(lower)) {
+      const pix = msgPixSinal();
+      if (!antiRepeat(session, pix)) await sendText(phone, pix);
+      session.stage = "AWAIT_RECEIPT";
+      scheduleSaveStore();
+      return;
+    }
+
+    const msg = "Perfeito. Me manda o dia/horário que você quer e eu confirmo o melhor disponível.";
     if (!antiRepeat(session, msg)) await sendText(phone, msg);
     return;
   }
 
-  // 3) collect body + size
-  if (session.stage === "collect_body_size") {
-    const maybeBody = parseBodyPart(message);
-    const maybeSize = parseSizeCm(message);
-
-    if (maybeBody) session.bodyPart = maybeBody;
-    if (maybeSize) session.sizeCm = maybeSize;
-
-    if (hasImage) {
-      session.referenceImageUrl = inbound.imageUrl;
-      const summary = await analyzeImageDetails(inbound.imageUrl);
-      session.imageSummary = summary;
-    }
-    scheduleSaveStore();
-
-    if (!session.bodyPart || !session.sizeCm) {
-      const reply = msgAskBodyAndSize();
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      return;
-    }
-
-    const complexity = detectComplexityFromSummary(session.imageSummary);
-    const estimate = calcHoursAndPrice(session.sizeCm, complexity);
-    session.estHours = estimate.hours;
-    session.estTotal = estimate.finalPrice;
-
-    const before = "Fechado. Vou montar seu orçamento com essas infos.";
-    if (!antiRepeat(session, before)) await sendText(phone, before);
-
-    await askChangeButtons(phone, session);
-    return;
-  }
-
-  // 4) change confirm
-  if (session.stage === "await_change_confirm") {
-    let choice = null;
-    if (buttonId === "CHG_YES") choice = 1;
-    if (buttonId === "CHG_NO") choice = 2;
-    if (!choice) choice = decideYesNoFromText(message);
-
-    if (choice === 1) {
-      session.stage = "collect_change_notes";
-      scheduleSaveStore();
-      const reply = msgAskChangeDetails();
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      return;
-    }
-
-    if (choice === 2) {
-      session.changeNotes = "";
-      session.stage = "send_quote";
-      scheduleSaveStore();
-    } else {
-      const retry = "Só confirma: quer alterar algo? (Sim/Não)";
-      if (!antiRepeat(session, retry)) await sendText(phone, retry);
-      return;
-    }
-  }
-
-  // 5) collect change notes
-  if (session.stage === "collect_change_notes") {
-    if (hasImage) {
-      session.referenceImageUrl = inbound.imageUrl;
-      const summary = await analyzeImageDetails(inbound.imageUrl);
-      session.imageSummary = summary;
-    }
-    if (message) {
-      session.changeNotes = (session.changeNotes ? session.changeNotes + "\n" : "") + message;
-    }
-
-    const complexity = detectComplexityFromSummary(session.imageSummary);
-    const estimate = calcHoursAndPrice(session.sizeCm, complexity);
-    session.estHours = estimate.hours;
-    session.estTotal = estimate.finalPrice;
-    scheduleSaveStore();
-
-    const ack = "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.";
-    if (!antiRepeat(session, ack)) await sendText(phone, ack);
-
-    session.stage = "send_quote";
-    scheduleSaveStore();
-  }
-
-  // 6) quote
-  if (session.stage === "send_quote") {
-    const quote = msgQuoteHours(session.estHours, session.estTotal);
-    if (!antiRepeat(session, quote)) await sendText(phone, quote);
-
-    await askScheduleButtons(phone, session);
-    return;
-  }
-
-  // 7) schedule confirm
-  if (session.stage === "await_schedule_confirm") {
-    let choice = null;
-    if (buttonId === "SCHED_YES") choice = 1;
-    if (buttonId === "SCHED_NO") choice = 2;
-    if (!choice) choice = decideYesNoFromText(message);
-
-    if (choice === 1) {
-      const reply = "Fechado ✅ Me manda sua preferência de dia/horário (ex: 15/01 16:00) que eu verifico e te confirmo.";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      session.stage = "manual_schedule";
-      scheduleSaveStore();
-
-      await notifyOwner(
-        `📅 Cliente quer agendar: ${phone} | peça: ${session.bodyPart} ${session.sizeCm}cm | ≈ ${session.estHours}h | R$ ${Number(
-          session.estTotal
-        ).toFixed(0)}`
-      );
-      return;
-    }
-
-    if (choice === 2) {
-      const reply = "Tranquilo. Quando quiser seguir, é só me chamar aqui que eu te mando as opções de agenda.";
-      if (!antiRepeat(session, reply)) await sendText(phone, reply);
-      session.stage = "pos_orcamento";
-      scheduleSaveStore();
-      return;
-    }
-
-    const retry = "Só confirma: quer que eu mande opções de datas? (Sim/Não)";
-    if (!antiRepeat(session, retry)) await sendText(phone, retry);
-    return;
-  }
-
-  // 8) manual schedule -> pix
-  if (session.stage === "manual_schedule") {
-    if (/\b(confirmado|fechado|ok|beleza)\b/.test(lower)) {
-      const pix = msgPixSinal();
-      if (!antiRepeat(session, pix)) await sendText(phone, pix);
-      session.stage = "await_receipt";
-      scheduleSaveStore();
-      return;
-    }
-
-    if (askedPix(message)) {
-      const pix = msgPixSinal();
-      if (!antiRepeat(session, pix)) await sendText(phone, pix);
-      session.stage = "await_receipt";
-      scheduleSaveStore();
-      return;
-    }
-
-    const reply = "Perfeito. Me manda o dia/horário que você quer e eu confirmo o melhor disponível.";
-    if (!antiRepeat(session, reply)) await sendText(phone, reply);
-    return;
-  }
-
-  // 9) receipt
-  if (session.stage === "await_receipt") {
+  if (session.stage === "AWAIT_RECEIPT") {
     if (hasImage) {
       const reply =
         "Comprovante recebido ✅\n\n" +
@@ -993,7 +905,7 @@ async function handleInbound(phone, inbound) {
         "• Beba bastante água.\n" +
         "• Evite álcool no dia anterior.\n" +
         "• Se alimente bem antes de vir.\n" +
-        "• Se puder, usar creme hidratante na região nos dias anteriores ajuda bastante.";
+        "• Se puder, hidratar a região nos dias anteriores ajuda bastante.";
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       session.stage = "finalizado";
       scheduleSaveStore();
@@ -1006,7 +918,7 @@ async function handleInbound(phone, inbound) {
     return;
   }
 
-  // fallback
+  // fallback geral (se cair fora)
   const fallback =
     "Pra eu te atender certinho, me manda a *referência em imagem* e me diz *onde no corpo + tamanho em cm*.";
   if (!antiRepeat(session, fallback)) await sendText(phone, fallback);
@@ -1023,6 +935,7 @@ app.get("/health", (req, res) => {
     hasPix: Boolean(ENV.PIX_KEY),
     gcalEnabled: ENV.GCAL_ENABLED,
     storePath: ENV.STORE_PATH,
+    openai: Boolean(ENV.OPENAI_API_KEY),
   });
 });
 
@@ -1035,7 +948,7 @@ app.post("/", async (req, res) => {
     if (!inbound.phone) return;
     if (inbound.fromMe) return;
 
-    // Idempotência (reenvio do mesmo evento)
+    // Idempotência
     if (inbound.messageId && wasProcessed(inbound.messageId)) return;
     if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
     cleanupProcessed();
