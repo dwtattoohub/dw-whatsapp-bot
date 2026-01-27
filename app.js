@@ -1,15 +1,18 @@
 // ============================================================
-// DW WhatsApp Bot — Jeezy Edition (RESET LIMPO + FUNÇÕES CHAVE)
-// FIXES:
-// 1) BOTÕES: /send-button-list -> /send-buttons -> fallback texto
-// 2) CAPTURA DO CLIQUE: aceita múltiplos formatos de buttonId/listReply
-// 3) SEM REPETIÇÃO: ao receber imagem, manda 1 mensagem só (análise + pedir local/tamanho)
-// 4) ORÇAMENTO POR HORAS: 1ª hora R$130, demais R$120 (estimativa por tamanho + complexidade)
+// DW WhatsApp Bot — Jeezy Edition (Z-API + DW Premium Invisível)
+// ATUALIZAÇÕES (PRONTO):
+// 1) PRIMEIRO CONTATO: 2 opções -> "Orçamento novo" e "Falar comigo" (sem parecer bot)
+// 2) NOTIFICAÇÃO PRO SEU PESSOAL: quando cliente pedir "falar com você" (em botão ou texto)
+// 3) PERSISTÊNCIA JSON: sessões + idempotência (não perde ao reiniciar / evita duplicadas)
+// 4) IDPOTÊNCIA REAL: ignora reenvio do mesmo webhook (messageId)
+// 5) ANCORAGEM DW no orçamento (antes do preço), mantendo sua lógica de horas
 // ============================================================
 
 import express from "express";
 import crypto from "crypto";
 import OpenAI from "openai";
+import fs from "fs/promises";
+import path from "path";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -35,9 +38,13 @@ const ENV = {
     String(process.env.GCAL_ENABLED || process.env.GCAL_ATIVADO || "").toLowerCase() === "verdadeiro",
   GCAL_TZ: process.env.GCAL_TZ || "America/Sao_Paulo",
 
-  // Preço por hora (regra nova)
+  // Preço por hora
   HOUR_FIRST: Number(process.env.HOUR_FIRST || 130),
   HOUR_NEXT: Number(process.env.HOUR_NEXT || 120),
+
+  // Persistência (JSON)
+  STORE_PATH: process.env.STORE_PATH || "./dw_store.json",
+  IDEMPOTENCY_TTL_HOURS: Number(process.env.IDEMPOTENCY_TTL_HOURS || 48),
 };
 
 function missingEnvs() {
@@ -56,6 +63,70 @@ const BASE_SYSTEM =
   "Regras: Nunca diga que é IA. Não assine. Não fale de preço/hora sem ser solicitado. " +
   "Você trabalha com realismo preto e cinza (black & grey) + whip shading. " +
   "Se o cliente quiser colorido, diga que você trabalha apenas black & grey.";
+
+// -------------------- JSON Store (sessions + processed) --------------------
+const STORE = {
+  sessions: {}, // phone -> session
+  processed: {}, // msgId -> { at, phone }
+};
+
+function nowMs() {
+  return Date.now();
+}
+
+async function loadStore() {
+  try {
+    const raw = await fs.readFile(ENV.STORE_PATH, "utf-8");
+    const data = JSON.parse(raw);
+    if (data && typeof data === "object") {
+      STORE.sessions = data.sessions || {};
+      STORE.processed = data.processed || {};
+    }
+  } catch {
+    // first run
+  }
+}
+
+let saveTimer = null;
+function scheduleSaveStore() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    try {
+      const dir = path.dirname(ENV.STORE_PATH);
+      if (dir && dir !== ".") await fs.mkdir(dir, { recursive: true }).catch(() => {});
+      await fs.writeFile(
+        ENV.STORE_PATH,
+        JSON.stringify({ sessions: STORE.sessions, processed: STORE.processed }, null, 2),
+        "utf-8"
+      );
+    } catch (e) {
+      console.error("[STORE SAVE ERROR]", e?.message || e);
+    }
+  }, 350);
+}
+
+function cleanupProcessed() {
+  const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
+  const cut = nowMs() - ttl;
+  for (const [id, v] of Object.entries(STORE.processed)) {
+    if (!v?.at || v.at < cut) delete STORE.processed[id];
+  }
+}
+
+function wasProcessed(msgId) {
+  if (!msgId) return false;
+  const v = STORE.processed[msgId];
+  if (!v?.at) return false;
+  const ttl = ENV.IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000;
+  return v.at >= nowMs() - ttl;
+}
+
+function markProcessed(msgId, phone) {
+  if (!msgId) return;
+  STORE.processed[msgId] = { at: nowMs(), phone };
+  scheduleSaveStore();
+}
 
 // -------------------- Z-API helpers --------------------
 async function zapiFetch(path, payload) {
@@ -134,12 +205,6 @@ async function notifyOwner(text) {
   } catch {}
 }
 
-async function handoffToManual(phone, session, reason, lastMessage) {
-  const reply = msgAskContinueBudget();
-  if (!antiRepeat(session, reply)) await sendText(phone, reply);
-  await notifyOwner(`📌 Handoff manual (${reason}): ${phone} | msg: ${lastMessage || "-"}`);
-}
-
 // -------------------- Normalização inbound --------------------
 function getIncomingText(payload) {
   if (!payload) return "";
@@ -202,7 +267,19 @@ function parseZapiInbound(body) {
     body?.data?.contact?.name ||
     "";
 
-  // CAPTURA DO ID/TEXTO DO BOTÃO (vários formatos possíveis)
+  // messageId (idempotência)
+  const messageId =
+    body?.messageId ||
+    body?.data?.messageId ||
+    body?.id ||
+    body?.data?.id ||
+    body?.message?.id ||
+    body?.data?.message?.id ||
+    body?.data?.key?.id ||
+    body?.message?.key?.id ||
+    null;
+
+  // CAPTURA DO ID/TEXTO DO BOTÃO
   const bId =
     body?.buttonId ||
     body?.callback?.buttonId ||
@@ -237,6 +314,8 @@ function parseZapiInbound(body) {
     imageMime: String(imageMime || "image/jpeg"),
     fromMe,
     contactName: String(contactName || "").trim(),
+    messageId: messageId ? String(messageId) : null,
+
     buttonId: null,
     buttonTitle: null,
     messageType: "",
@@ -291,6 +370,14 @@ function askedPix(text) {
   return /pix|chave pix|qual o pix|me passa o pix/.test(t);
 }
 
+// Rota 2: falar direto com o DW (texto)
+function askedTalkToDw(text) {
+  const t = norm(text);
+  return /falar com voce|falar com vc|falar contigo|falar direto|quero falar com voce|quero falar com vc|me chama|me chame|pode me chamar|me responde voce|e voce mesmo|prefiro falar com voce|quero falar com o dw|falar com o dw/.test(
+    t
+  );
+}
+
 function parseSizeCm(text) {
   const t = norm(text);
   let m = t.match(/(\d{1,2})\s*(cm|centimetros|centimetro)\b/);
@@ -340,8 +427,7 @@ function calcHoursAndPrice(sizeCm, complexityLevel) {
   const s = Number(sizeCm || 0);
   const base = s <= 12 ? 1.2 : s <= 18 ? 2 : s <= 25 ? 3 : 4;
 
-  const multiplier =
-    complexityLevel === "alta" ? 1.5 : complexityLevel === "media" ? 1.2 : 1.0;
+  const multiplier = complexityLevel === "alta" ? 1.5 : complexityLevel === "media" ? 1.2 : 1.0;
 
   const hours = Math.max(1, base * multiplier);
 
@@ -359,12 +445,6 @@ function detectComplexityFromSummary(summary) {
 }
 
 // -------------------- Mensagens --------------------
-function msgSaudacaoPrimeiroContato(name) {
-  const nm = safeName(name);
-  const greet = nm ? `Oi, ${nm}!` : "Oi!";
-  return `${greet} Aqui é o DW Tattooer — especialista em realismo preto e cinza e whip shading.\n\nPra te direcionar certinho, escolha uma opção abaixo:`;
-}
-
 function msgAddress() {
   return "Claro.\n\n• Endereço: *Av. Mauá, 1308* — próximo à rodoviária.";
 }
@@ -389,18 +469,9 @@ function msgSoBlackGrey() {
 
 function msgAskNewBudgetBasics() {
   return (
-    "Show. Pra eu te passar um orçamento bem fiel, me manda:\n\n" +
+    "Fechou. Pra eu te passar um orçamento bem fiel, me manda:\n\n" +
     "• *referência em imagem* (print/foto)\n" +
     "• *onde no corpo* + *tamanho aproximado em cm*\n"
-  );
-}
-
-function msgAskContinueBudget() {
-  return (
-    "Fechado. Como você já tem um orçamento em andamento, me manda uma mensagem com:\n\n" +
-    "• o que já foi combinado\n" +
-    "• e a última referência\n\n" +
-    "que eu continuo daqui."
   );
 }
 
@@ -432,6 +503,7 @@ function msgAnalysisAndAsk(imageSummary) {
 function msgQuoteHours(hours, total) {
   const h = Number(hours || 1);
   return (
+    "Eu trabalho com criação autoral e encaixe real no corpo, em *black & grey* com *whip shading*, pra ficar bonito hoje e envelhecer bem.\n\n" +
     `Pelo tamanho e complexidade do trabalho, o investimento fica em *R$ ${Number(total).toFixed(0)}*.\n` +
     `Estimativa profissional: cerca de *${h.toFixed(1)}h* de execução.\n\n` +
     "Formas de pagamento:\n" +
@@ -489,9 +561,7 @@ async function analyzeImageDetails(url) {
   return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// -------------------- Sessions (in-memory) --------------------
-const sessions = new Map();
-
+// -------------------- Sessions (persistente em JSON) --------------------
 function newSession() {
   return {
     stage: "start",
@@ -515,16 +585,23 @@ function newSession() {
 
     // flags
     awaitingBWAnswer: false,
+
+    // anti-repeat
+    lastSentHash: null,
   };
 }
 
 function getSession(phone) {
-  if (!sessions.has(phone)) sessions.set(phone, newSession());
-  return sessions.get(phone);
+  if (!STORE.sessions[phone]) {
+    STORE.sessions[phone] = newSession();
+    scheduleSaveStore();
+  }
+  return STORE.sessions[phone];
 }
 
 function resetSession(phone) {
-  sessions.set(phone, newSession());
+  STORE.sessions[phone] = newSession();
+  scheduleSaveStore();
 }
 
 // -------------------- Anti-repeat (simple) --------------------
@@ -535,23 +612,29 @@ function antiRepeat(session, text) {
   const h = hash(text);
   if (session.lastSentHash === h) return true;
   session.lastSentHash = h;
+  scheduleSaveStore();
   return false;
 }
 
 // -------------------- Buttons helpers --------------------
 async function sendFirstContactButtons(phone, session, contactName) {
-  const text = msgSaudacaoPrimeiroContato(contactName);
+  const nm = safeName(contactName);
+  const greet = nm ? `Oi, ${nm}!` : "Oi!";
+  const text = `${greet}\nMe diz como você quer seguir por aqui:`;
+
   const buttons = [
     { id: "first_new_budget", title: "Orçamento novo" },
-    { id: "first_continue_budget", title: "Já tenho orçamento" },
+    { id: "first_talk_dw", title: "Falar comigo" },
   ];
 
-  await sendButtons(phone, text, buttons, "primeiro_contato");
+  await sendButtons(phone, text, buttons, "início");
 
   session.stage = "await_first_contact_buttons";
   session.greeted = true;
   session.greetedAt = Date.now();
   session.awaitingFirstContact = true;
+  session.firstContactChoiceAt = Date.now();
+  scheduleSaveStore();
 }
 
 async function askChangeButtons(phone, session) {
@@ -561,8 +644,9 @@ async function askChangeButtons(phone, session) {
     { id: "CHG_NO", title: "Não" },
   ];
 
-  await sendButtons(phone, text, buttons, "alteracao");
+  await sendButtons(phone, text, buttons, "alteração");
   session.stage = "await_change_confirm";
+  scheduleSaveStore();
 }
 
 async function askScheduleButtons(phone, session) {
@@ -574,19 +658,14 @@ async function askScheduleButtons(phone, session) {
 
   await sendButtons(phone, text, buttons, "agenda");
   session.stage = "await_schedule_confirm";
+  scheduleSaveStore();
 }
 
 // --------- decisões por texto do botão (quando não vem buttonId) ----------
 function decideFirstContactFromText(message) {
   const t = norm(message);
   if (t.includes("orcamento novo") || t === "1") return 1;
-  if (
-    t.includes("ja tenho orcamento") ||
-    t.includes("tenho orcamento") ||
-    t.includes("orcamento em andamento") ||
-    t === "2"
-  )
-    return 2;
+  if (t.includes("falar comigo") || t.includes("falar com") || t === "2") return 2;
   return null;
 }
 
@@ -607,7 +686,10 @@ async function handleInbound(phone, inbound) {
   const hasImage = Boolean(inbound.imageUrl);
   const name = safeName(inbound.contactName);
 
-  if (name && !session.name) session.name = name;
+  if (name && !session.name) {
+    session.name = name;
+    scheduleSaveStore();
+  }
 
   console.log("[IN]", {
     phone,
@@ -617,13 +699,28 @@ async function handleInbound(phone, inbound) {
     preview: (message || "").slice(0, 120),
   });
 
+  // Rota 2: cliente pede falar direto com você em qualquer momento
+  if (askedTalkToDw(message)) {
+    const reply = "Claro. Me diz o que você tem em mente e onde no corpo seria, que eu já te respondo.";
+    if (!antiRepeat(session, reply)) await sendText(phone, reply);
+
+    await notifyOwner(
+      `📩 Cliente pediu pra falar direto com você: ${phone} (${session.name || "-"})\n` +
+        `Stage: ${session.stage}\n` +
+        `Msg: ${message.slice(0, 200)}`
+    );
+
+    session.stage = "talk_dw";
+    scheduleSaveStore();
+    return;
+  }
+
   // comandos
   if (/^reset$|^reiniciar$|^comecar novamente$|^começar novamente$/.test(lower)) {
     resetSession(phone);
     const s2 = getSession(phone);
     const reply = "Atendimento reiniciado.\n\nMe manda a referência em imagem e me diz onde no corpo + tamanho em cm.";
     if (!antiRepeat(s2, reply)) await sendText(phone, reply);
-    // após reset, já manda botões de primeiro contato (pra não ficar solto)
     await sendFirstContactButtons(phone, s2, s2.name || "");
     return;
   }
@@ -643,6 +740,7 @@ async function handleInbound(phone, inbound) {
   // color gating
   if (!session.awaitingBWAnswer && detectColorIntent(message)) {
     session.awaitingBWAnswer = true;
+    scheduleSaveStore();
     const reply = msgSoBlackGrey();
     if (!antiRepeat(session, reply)) await sendText(phone, reply);
     return;
@@ -650,11 +748,13 @@ async function handleInbound(phone, inbound) {
   if (session.awaitingBWAnswer) {
     if (/\b(sim|aceito|pode|fechado|ok|bora)\b/.test(lower)) {
       session.awaitingBWAnswer = false;
+      scheduleSaveStore();
     } else if (/\b(nao|não|quero colorido|prefiro colorido)\b/.test(lower)) {
       const reply =
         "Entendi.\n\nComo eu trabalho exclusivamente com *black & grey*, não vou conseguir te atender no colorido do jeito que você quer.\n\nSe decidir fazer em preto e cinza, é só me chamar.";
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       session.stage = "finalizado";
+      scheduleSaveStore();
       return;
     } else {
       const reply = "Só confirma pra mim: você topa fazer em *preto e cinza*? (Sim/Não)";
@@ -664,7 +764,6 @@ async function handleInbound(phone, inbound) {
   }
 
   const isFreshStart = !session.stage || session.stage === "start";
-
   if (isFreshStart) {
     await sendFirstContactButtons(phone, session, session.name || "");
     return;
@@ -676,32 +775,40 @@ async function handleInbound(phone, inbound) {
 
     // via buttonId
     if (buttonId === "first_new_budget") choice = 1;
-    if (buttonId === "first_continue_budget") choice = 2;
+    if (buttonId === "first_talk_dw") choice = 2;
 
-    // via texto do botão (quando o Whats manda só texto)
+    // via texto do botão / fallback
     if (!choice) choice = decideFirstContactFromText(message);
 
+    // 1) Orçamento novo (automático)
     if (choice === 1) {
       session.flowMode = "NEW_BUDGET";
       session.awaitingFirstContact = false;
       session.firstContactChoiceAt = Date.now();
       session.stage = "collect_reference";
+      scheduleSaveStore();
+
       const reply = msgAskNewBudgetBasics();
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       return;
     }
 
+    // 2) Falar comigo (alerta no seu pessoal)
     if (choice === 2) {
-      session.flowMode = "IN_PROGRESS";
+      session.flowMode = "TALK_DW";
       session.awaitingFirstContact = false;
       session.firstContactChoiceAt = Date.now();
-      session.stage = "manual_continue";
-      await handoffToManual(phone, session, "cliente com orçamento em andamento", message);
+      session.stage = "talk_dw";
+      scheduleSaveStore();
+
+      const reply = "Claro. Me diz o que você tem em mente e onde no corpo seria, que eu já te direciono certinho.";
+      if (!antiRepeat(session, reply)) await sendText(phone, reply);
+
+      await notifyOwner(`📩 Cliente pediu pra falar direto com você: ${phone} (${session.name || "-"})`);
       return;
     }
 
-    if (session.firstContactChoiceAt && Date.now() - session.firstContactChoiceAt < 30000) return;
-    const retry = "Só pra eu te direcionar certinho: *Orçamento novo* ou *Já tenho orçamento*?";
+    const retry = "Só me confirma: *Orçamento novo* ou *Falar comigo*?";
     if (!antiRepeat(session, retry)) await sendText(phone, retry);
     return;
   }
@@ -716,10 +823,11 @@ async function handleInbound(phone, inbound) {
 
     session.referenceImageUrl = inbound.imageUrl;
     session.stage = "collect_body_size";
+    scheduleSaveStore();
 
-    // IA: análise detalhada (sem repetir mensagens)
     const summary = await analyzeImageDetails(inbound.imageUrl);
     session.imageSummary = summary;
+    scheduleSaveStore();
 
     const msg = msgAnalysisAndAsk(summary);
     if (!antiRepeat(session, msg)) await sendText(phone, msg);
@@ -734,12 +842,12 @@ async function handleInbound(phone, inbound) {
     if (maybeBody) session.bodyPart = maybeBody;
     if (maybeSize) session.sizeCm = maybeSize;
 
-    // se mandou imagem de novo, atualiza referência + meta
     if (hasImage) {
       session.referenceImageUrl = inbound.imageUrl;
       const summary = await analyzeImageDetails(inbound.imageUrl);
       session.imageSummary = summary;
     }
+    scheduleSaveStore();
 
     if (!session.bodyPart || !session.sizeCm) {
       const reply = msgAskBodyAndSize();
@@ -747,7 +855,6 @@ async function handleInbound(phone, inbound) {
       return;
     }
 
-    // pronto -> pergunta alteração (buttons)
     const complexity = detectComplexityFromSummary(session.imageSummary);
     const estimate = calcHoursAndPrice(session.sizeCm, complexity);
     session.estHours = estimate.hours;
@@ -769,6 +876,7 @@ async function handleInbound(phone, inbound) {
 
     if (choice === 1) {
       session.stage = "collect_change_notes";
+      scheduleSaveStore();
       const reply = msgAskChangeDetails();
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       return;
@@ -777,6 +885,7 @@ async function handleInbound(phone, inbound) {
     if (choice === 2) {
       session.changeNotes = "";
       session.stage = "send_quote";
+      scheduleSaveStore();
     } else {
       const retry = "Só confirma: quer alterar algo? (Sim/Não)";
       if (!antiRepeat(session, retry)) await sendText(phone, retry);
@@ -795,16 +904,17 @@ async function handleInbound(phone, inbound) {
       session.changeNotes = (session.changeNotes ? session.changeNotes + "\n" : "") + message;
     }
 
-    // re-estima com base na nova referência/complexidade
     const complexity = detectComplexityFromSummary(session.imageSummary);
     const estimate = calcHoursAndPrice(session.sizeCm, complexity);
     session.estHours = estimate.hours;
     session.estTotal = estimate.finalPrice;
+    scheduleSaveStore();
 
     const ack = "Anotado ✅ Vou considerar esses ajustes e já sigo pro orçamento.";
     if (!antiRepeat(session, ack)) await sendText(phone, ack);
 
     session.stage = "send_quote";
+    scheduleSaveStore();
   }
 
   // 6) quote
@@ -827,6 +937,8 @@ async function handleInbound(phone, inbound) {
       const reply = "Fechado ✅ Me manda sua preferência de dia/horário (ex: 15/01 16:00) que eu verifico e te confirmo.";
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       session.stage = "manual_schedule";
+      scheduleSaveStore();
+
       await notifyOwner(
         `📅 Cliente quer agendar: ${phone} | peça: ${session.bodyPart} ${session.sizeCm}cm | ≈ ${session.estHours}h | R$ ${Number(
           session.estTotal
@@ -839,6 +951,7 @@ async function handleInbound(phone, inbound) {
       const reply = "Tranquilo. Quando quiser seguir, é só me chamar aqui que eu te mando as opções de agenda.";
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       session.stage = "pos_orcamento";
+      scheduleSaveStore();
       return;
     }
 
@@ -853,6 +966,7 @@ async function handleInbound(phone, inbound) {
       const pix = msgPixSinal();
       if (!antiRepeat(session, pix)) await sendText(phone, pix);
       session.stage = "await_receipt";
+      scheduleSaveStore();
       return;
     }
 
@@ -860,6 +974,7 @@ async function handleInbound(phone, inbound) {
       const pix = msgPixSinal();
       if (!antiRepeat(session, pix)) await sendText(phone, pix);
       session.stage = "await_receipt";
+      scheduleSaveStore();
       return;
     }
 
@@ -881,6 +996,7 @@ async function handleInbound(phone, inbound) {
         "• Se puder, usar creme hidratante na região nos dias anteriores ajuda bastante.";
       if (!antiRepeat(session, reply)) await sendText(phone, reply);
       session.stage = "finalizado";
+      scheduleSaveStore();
       await notifyOwner(`💸 Comprovante recebido: ${phone}`);
       return;
     }
@@ -906,12 +1022,12 @@ app.get("/health", (req, res) => {
     hasOwner: Boolean(ENV.OWNER_PHONE),
     hasPix: Boolean(ENV.PIX_KEY),
     gcalEnabled: ENV.GCAL_ENABLED,
+    storePath: ENV.STORE_PATH,
   });
 });
 
 // ✅ Webhook principal
 app.post("/", async (req, res) => {
-  // responde 200 IMEDIATO
   res.status(200).json({ ok: true });
 
   try {
@@ -919,14 +1035,31 @@ app.post("/", async (req, res) => {
     if (!inbound.phone) return;
     if (inbound.fromMe) return;
 
+    // Idempotência (reenvio do mesmo evento)
+    if (inbound.messageId && wasProcessed(inbound.messageId)) return;
+    if (inbound.messageId) markProcessed(inbound.messageId, inbound.phone);
+    cleanupProcessed();
+
     await handleInbound(inbound.phone, inbound);
   } catch (e) {
     console.error("[WEBHOOK ERROR]", e?.message || e);
   }
 });
 
-app.listen(ENV.PORT, () => {
-  const miss = missingEnvs();
-  console.log("🚀 DW BOT ONLINE port", ENV.PORT);
-  if (miss.length) console.log("⚠️ Missing ENV:", miss.join(", "));
+// -------------------- Boot --------------------
+async function boot() {
+  await loadStore();
+  cleanupProcessed();
+  console.log("✅ Store carregado:", { sessions: Object.keys(STORE.sessions).length });
+
+  app.listen(ENV.PORT, () => {
+    const miss = missingEnvs();
+    console.log("🚀 DW BOT ONLINE port", ENV.PORT);
+    if (miss.length) console.log("⚠️ Missing ENV:", miss.join(", "));
+  });
+}
+
+boot().catch((e) => {
+  console.error("❌ BOOT ERROR", e?.message || e);
+  process.exit(1);
 });
